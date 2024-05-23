@@ -1,9 +1,4 @@
-
-from pathlib import Path
-import sqlite3
-
-
-db_schema = """
+title_akas_table_schema = """
 CREATE TABLE title_akas (
     titleId TEXT NOT NULL,
     ordering INTEGER NOT NULL,
@@ -16,7 +11,9 @@ CREATE TABLE title_akas (
     PRIMARY KEY (titleId, ordering),
     FOREIGN KEY (titleId) REFERENCES title_basics (tconst)
 );
+"""
 
+title_basics_table_schema = """
 CREATE TABLE title_basics (
     tconst TEXT PRIMARY KEY,
     titleType TEXT,
@@ -28,14 +25,18 @@ CREATE TABLE title_basics (
     runtimeMinutes INTEGER,
     genres TEXT
 );
+"""
 
+title_crew_table_schema = """
 CREATE TABLE title_crew (
     tconst TEXT PRIMARY KEY,
     directors TEXT,
     writers TEXT,
     FOREIGN KEY (tconst) REFERENCES title_basics (tconst)
 );
+"""
 
+title_episode_table_schema = """
 CREATE TABLE title_episode (
     tconst TEXT PRIMARY KEY,
     parentTconst TEXT,
@@ -44,7 +45,9 @@ CREATE TABLE title_episode (
     FOREIGN KEY (tconst) REFERENCES title_basics (tconst),
     FOREIGN KEY (parentTconst) REFERENCES title_basics (tconst)
 );
+"""
 
+title_principals_table_schema = """
 CREATE TABLE title_principals (
     tconst TEXT NOT NULL,
     ordering INTEGER NOT NULL,
@@ -56,14 +59,18 @@ CREATE TABLE title_principals (
     FOREIGN KEY (tconst) REFERENCES title_basics (tconst),
     FOREIGN KEY (nconst) REFERENCES name_basics (nconst)
 );
+"""
 
+title_ratings_table_schema = """
 CREATE TABLE title_ratings (
     tconst TEXT PRIMARY KEY,
     averageRating REAL,
     numVotes INTEGER,
     FOREIGN KEY (tconst) REFERENCES title_basics (tconst)
 );
+"""
 
+name_basics_table_schema = """
 CREATE TABLE name_basics (
     nconst TEXT PRIMARY KEY,
     primaryName TEXT,
@@ -72,10 +79,9 @@ CREATE TABLE name_basics (
     primaryProfession TEXT,
     knownForTitles TEXT
 );
- 
 """
 
-search_db_schema = """
+search_movies_table_schema = """
 CREATE TABLE search_movies (
     embeddingId INTEGER,
     tconst TEXT PRIMARY KEY,
@@ -87,7 +93,9 @@ CREATE TABLE search_movies (
     isAdult INTEGER,
     runtimeMinutes INTEGER
 );
+"""
 
+search_shows_table_schema = """
 CREATE TABLE search_shows (
     embeddingId INTEGER,
     tconst TEXT PRIMARY KEY,
@@ -100,7 +108,9 @@ CREATE TABLE search_shows (
     isAdult INTEGER,
     runtimeMinutes INTEGER
 );
+"""
 
+search_episodes_table_schema = """
 CREATE TABLE search_episodes (
     embeddingId INTEGER,
     tconst TEXT PRIMARY KEY,
@@ -111,21 +121,24 @@ CREATE TABLE search_episodes (
     episodeNumber INTEGER,
     isAdult INTEGER -- from parent
 );
+"""
 
+search_characters_table_schema = """
 CREATE TABLE search_characters (
     embeddingId INTEGER,
     tconst TEXT,
     ordering INTEGER,
-    PRIMARY KEY (tconst, ordering),
     nconst TEXT,
     title TEXT,
     name TEXT,
     character TEXT,
     category TEXT,
-    job TEXT
-    
+    job TEXT,
+    PRIMARY KEY (tconst, ordering)
 );
+"""
 
+search_people_table_schema = """
 CREATE TABLE search_people (
     embeddingId INTEGER,
     nconst TEXT PRIMARY KEY,
@@ -135,12 +148,5 @@ CREATE TABLE search_people (
     primaryProfession TEXT,
     knownForTitles TEXT
 );
+"""
 
-CREATE TABLE entities (
-    embeddingId INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    tconst TEXT,
-    ncounst TEXT
-    
-);"""

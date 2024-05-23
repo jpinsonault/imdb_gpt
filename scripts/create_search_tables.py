@@ -1,26 +1,13 @@
+import json
 from pathlib import Path
 import sqlite3
 import sys
-from db.database_schema import search_db_schema
+import db.database_schemas as schemas
+from config import project_config
+from tqdm import tqdm
+import simplejson
 
-def create_db(db_path):
-    """Create a new database at db_path"""
-    db = sqlite3.connect(db_path)
-    db.executescript(search_db_schema)
-    return db
-
-
-def create_search_tables(conn):
-    print("Dropping search tables...")
-    conn.executescript("""
-        DROP TABLE IF EXISTS search_movies;
-        DROP TABLE IF EXISTS search_shows;
-        DROP TABLE IF EXISTS search_episodes;
-        DROP TABLE IF EXISTS search_characters;
-        DROP TABLE IF EXISTS search_people;
-        DROP TABLE IF EXISTS search_;
-    """)
-    conn.commit()
+from scripts import utils
 
 
 def populate_search_movies(conn):
@@ -41,6 +28,9 @@ def populate_search_movies(conn):
     """
     
     print("Populating search_movies table...")
+    conn.execute("""DROP TABLE IF EXISTS search_movies;""")
+    conn.execute(schemas.search_movies_table_schema)
+    
     conn.execute(query)
     conn.commit()
 
@@ -64,6 +54,9 @@ def populate_search_shows(conn):
     """
     
     print("Populating search_shows table...")
+    conn.execute("""DROP TABLE IF EXISTS search_shows;""")
+    conn.execute(schemas.search_shows_table_schema)
+    
     conn.execute(query)
     conn.commit()
 
@@ -84,15 +77,25 @@ def populate_search_episodes(conn):
     """
     
     print("Populating search_episodes table...")
+    conn.execute("""DROP TABLE IF EXISTS search_episodes;""")
+    conn.execute(schemas.search_episodes_table_schema)
+    
     conn.execute(query)
     conn.commit()
 
+import json
+import sqlite3
+
 def populate_search_characters(conn):
-    query = """
-    INSERT INTO search_characters (tconst, nconst, title, name, character, category, job)
+    # Drop the existing table and recreate it
+    print("Populating search_characters table...")
+    conn.execute("""DROP TABLE IF EXISTS search_characters;""")
+    conn.execute(schemas.search_characters_table_schema)
+
+    # Define the select query
+    select_query = """
     SELECT 
         p.tconst,
-        p.ordering,
         p.nconst,
         b.primaryTitle,
         n.primaryName,
@@ -101,12 +104,46 @@ def populate_search_characters(conn):
         p.job
     FROM title_principals p
     JOIN title_basics b ON p.tconst = b.tconst
-    JOIN name_basics n ON p.nconst = n.nconst;
+    JOIN name_basics n ON p.nconst = n.nconst
+    WHERE p.characters IS NOT NULL;
     """
+
+    # Define the insert query
+    insert_query = """
+    INSERT INTO search_characters (tconst, nconst, title, name, character, category, job)
+    VALUES (?, ?, ?, ?, ?, ?, ?);
+    """
+
+    print("Querying search_characters table...")
+    cursor = conn.cursor()
+    cursor.execute(select_query)
+
+    batch_size = 1000000  # Adjust the batch size as needed
+    batch = []
     
-    print("Populating search_characters table...")
-    conn.execute(query)
+    
+    total_rows = conn.execute("SELECT COUNT(*) FROM title_principals WHERE characters IS NOT NULL;").fetchone()[0]
+
+    for row in tqdm(cursor, total=total_rows, desc="Processing title_principals"):
+        tconst, nconst, title, name, characters_json, category, job = row
+        try:
+            characters = simplejson.loads(characters_json)
+            for character in characters:
+                batch.append((tconst, nconst, title, name, character, category, job))
+                if len(batch) >= batch_size:
+                    conn.executemany(insert_query, batch)
+                    batch.clear()
+        except Exception as e:
+            print(f"Malformed JSON or incorrect format in tconst {tconst}: {characters_json}")
+
+    # Insert any remaining items in the batch
+    if batch:
+        conn.executemany(insert_query, batch)
+
     conn.commit()
+    cursor.close()
+
+
 
 def populate_search_people(conn):
     query = """
@@ -122,23 +159,207 @@ def populate_search_people(conn):
     """
     
     print("Populating search_people table...")
+    conn.execute("""DROP TABLE IF EXISTS search_people;""")
+    conn.execute(schemas.search_people_table_schema)
+    
     conn.execute(query)
     conn.commit()
 
+def check_principle_character_json(conn):
+    # load all characters
+    query = """
+    SELECT tconst, characters
+    FROM title_principals
+    WHERE characters <> '[]';
+    """
+    
+    characters = conn.execute(query).fetchall()
+    
+    # check if all characters are valid JSON arrays of strings or empty arrays
+    for tconst, character_json in tqdm(characters):
+        try:
+            character_list = simplejson.loads(character_json)
 
+            if not isinstance(character_list, list):
+                raise ValueError("Not a list")
+
+            if not all(isinstance(item, str) for item in character_list):
+                raise ValueError("List elements are not strings")
+
+        except Exception as e:
+            print(f"Malformed JSON or incorrect format in tconst {tconst}: {character_json}")
+            print(f"Error: {e}")
+            break
+    else:
+        print("All character entries are valid JSON arrays of strings or empty arrays")
+
+
+
+def create_alphabet(db_path, max_entity_length):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    unique_chars = set()
+
+    print("Querying titles and names...")
+
+    num_movies = conn.execute("SELECT COUNT(*) FROM search_movies;").fetchone()[0]
+    cursor.execute("""SELECT title FROM search_movies""")
+    
+    for row in tqdm(cursor, desc="Processing search_movies", total=num_movies):
+        text = row[0]
+        if len(text) <= max_entity_length:
+            if text.startswith('1966-1988: Kieś'):
+                print(f"found it {text}")
+            unique_chars.update(text)
+            
+    num_shows = conn.execute("SELECT COUNT(*) FROM search_shows;").fetchone()[0]
+    cursor.execute("""SELECT title FROM search_shows""")
+    
+    for row in tqdm(cursor, desc="Processing search_shows", total=num_shows):
+        text = row[0]
+        if len(text) <= max_entity_length:
+            if text.startswith('1966-1988: Kieś'):
+                print(f"found it {text}")
+            unique_chars.update(text)
+            
+    num_episodes = conn.execute("SELECT COUNT(*) FROM search_episodes;").fetchone()[0]
+    cursor.execute("""SELECT title FROM search_episodes""")
+
+    for row in tqdm(cursor, desc="Processing search_episodes", total=num_episodes):
+        text = row[0]
+        if len(text) <= max_entity_length:
+            if text.startswith('1966-1988: Kieś'):
+                print(f"found it {text}")
+            unique_chars.update(text)
+
+    num_characters = conn.execute("SELECT COUNT(*) FROM search_characters;").fetchone()[0]
+    cursor.execute("""SELECT name FROM search_characters""")
+
+    for row in tqdm(cursor, desc="Processing search_characters", total=num_characters):
+        text = row[0]
+        if len(text) <= max_entity_length:
+            if text.startswith('1966-1988: Kieś'):
+                print(f"found it {text}")
+            unique_chars.update(text)
+            
+    # Convert the set of characters to a sorted list
+    alphabet = sorted(unique_chars)
+    
+    print(f"Alphabet: {alphabet}")
+    print(f"{len(alphabet)} characters")
+
+    # Insert the alphabet into the alphabet table
+    alphabet_json = json.dumps(alphabet)
+    conn.execute("DELETE FROM alphabet")  # Clear existing data
+    conn.execute("INSERT INTO alphabet (characters) VALUES (?)", (alphabet_json,))
+
+    conn.commit()
+    conn.close()
+
+
+def create_entity_vectors_table(conn):
+    print("Creating entity_vectors table. This takes a while...")
+    progress = tqdm(total=5, desc="Creating entity_vectors table")
+    conn.execute("""DROP TABLE IF EXISTS entity_vectors;""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS entity_vectors (
+    vectorId INTEGER PRIMARY KEY AUTOINCREMENT,
+    entityName TEXT UNIQUE NOT NULL
+    );""")
+    conn.commit()
+    
+    progress.desc = "Inserting entities from search_movies"
+    progress.update(0)
+    query = """
+    INSERT INTO entity_vectors (entityName)
+    SELECT DISTINCT LOWER(title)
+    FROM search_movies
+    WHERE title IS NOT NULL
+    ON CONFLICT(entityName) DO NOTHING;
+    """
+    
+    conn.execute(query)
+    conn.commit()
+    
+    progress.desc = "Inserting entities from search_shows"
+    progress.update(1)
+    query = """
+    INSERT INTO entity_vectors (entityName)
+    SELECT DISTINCT LOWER(title)
+    FROM search_shows
+    WHERE title IS NOT NULL
+    ON CONFLICT(entityName) DO NOTHING;
+    """
+
+    conn.execute(query)
+    conn.commit()
+
+    progress.desc = "Inserting entities from search_episodes"
+    progress.update(1)
+    query = """
+    INSERT INTO entity_vectors (entityName)
+    SELECT DISTINCT LOWER(title)
+    FROM search_episodes
+    WHERE title IS NOT NULL
+    ON CONFLICT(entityName) DO NOTHING;
+    """
+
+    conn.execute(query)
+    conn.commit()
+    
+    progress.desc = "Inserting entities from search_characters"
+    progress.update(1)
+    query = """
+    INSERT INTO entity_vectors (entityName)
+    SELECT DISTINCT LOWER(name)
+    FROM search_characters
+    WHERE name IS NOT NULL
+    ON CONFLICT(entityName) DO NOTHING;
+    """
+
+    conn.execute(query)
+    conn.commit()
+    
+    progress.desc = "Inserting entities from search_people"
+    progress.update(1)
+    query = """
+    INSERT INTO entity_vectors (entityName)
+    SELECT DISTINCT LOWER(name)
+    FROM search_people
+    WHERE name IS NOT NULL
+    ON CONFLICT(entityName) DO NOTHING;
+    """
+
+    conn.execute(query)
+    conn.commit()
+
+    progress.close()
+
+        
 if __name__ == '__main__':
-    data_dir = Path(sys.argv[1])
+    data_dir = Path(project_config['data_dir'])
+    max_entity_length = project_config['entities']['max_entity_length']
     db_path = data_dir / 'imdb.db'
+    
+    utils.verify_destructive(message="This will delete the existing database. Are you sure you want to continue?")
     
     # Connect to the SQLite database
     conn = sqlite3.connect(db_path)
     
-    create_search_tables(conn)
-    populate_search_movies(conn)
-    populate_search_shows(conn)
-    populate_search_episodes(conn)
-    populate_search_characters(conn)
-    populate_search_people(conn)
+    tables = {
+        # 'search_movies': populate_search_movies,
+        # 'search_shows': populate_search_shows,
+        # 'search_episodes': populate_search_episodes,
+        # 'search_characters': populate_search_characters,
+        # 'search_people': populate_search_people,
+    }
+    
+    for table, populate_table in tables.items():
+        populate_table(conn)
+        
+    create_entity_vectors_table(conn)
+        
+    create_alphabet(db_path, max_entity_length)
 
     # Close the database connection
     conn.close()

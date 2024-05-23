@@ -1,9 +1,12 @@
 from pathlib import Path
 from annoy import AnnoyIndex
 import numpy as np
+from scripts import utils
 from train_imdb_autoencoder import SPECIAL_PAD, save_corpus_stats, try_load_model, TokenProcessor, get_corpus_stats
 from tqdm import tqdm
 from tensorflow.keras.models import Model
+
+
 
 
 def save_embeddings(model, token_processor: TokenProcessor, corpus_file_path, embeddings_path):
@@ -63,7 +66,9 @@ def search_similar_entities(query, token_processor, model, annoy_index_path, ent
 if __name__ == '__main__':
     corpus_file_path = Path("./entities.txt")
     stats_file_path = Path("./corpus_stats.json")
-
+    
+    utils.verify_destructive("This will destroy the vector database. Are you sure?")
+    
     max_input_length = 96
     
     alphabet, counts = get_corpus_stats(stats_file_path)

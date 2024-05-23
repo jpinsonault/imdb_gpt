@@ -1,5 +1,7 @@
 from datetime import datetime
+from functools import partial
 import json
+import sqlite3
 import sys
 import traceback
 from typing import List
@@ -18,6 +20,8 @@ from tensorflow.keras.layers import Input, Embedding, MultiHeadAttention, LayerN
 from tensorflow.keras.models import Model
 from tensorflow.keras import backend as K
 from config import project_config
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 tf_version = tf.__version__
 
@@ -32,14 +36,22 @@ class TokenProcessor:
         self.mask_percentage = mask_percentage
 
     def tokenize(self, input_string):
+        if len(input_string) > self.max_input_length:
+            raise ValueError(
+                f"Input string is longer than max input length of {self.max_input_length}: {input_string}")
         input_indices = [self.char_to_index[char] for char in input_string]
        
         # Pad the input to max_input_length using zeros
         total_pad = self.max_input_length - len(input_indices)
-        num_to_pad_left = random.randint(0, total_pad)
+        num_to_pad_left = random.randint(0, total_pad)  
         num_to_pad_right = total_pad - num_to_pad_left
        
         input_indices = [self.char_to_index[SPECIAL_PAD]]*num_to_pad_left + input_indices + [self.char_to_index[SPECIAL_PAD]]*num_to_pad_right
+        
+        if len(input_indices) != self.max_input_length:
+            raise ValueError(
+                f"Input string is unexpected length: {input_string}: {len(input_indices)}")
+            
         return np.array(input_indices)
 
     def indices_to_string(self, indices):
@@ -55,19 +67,18 @@ def main(args):
 
 
 def character_autoencoder_training():
-    data_dir                = Path(project_config['data_dir'])
-    corpus_file_path        = data_dir / 'entities.txt'
-    corpus_stats_file_path  = data_dir / 'corpus_stats.json'
+    data_dir                = Path(project_config['docker_data_dir_mount'])
+    db_path                 = data_dir / 'imdb.db'
     max_input_length        = project_config['entities']['max_entity_length']
     batch_size              = project_config['search_autoencoder']['batch_size']
     character_embedding_dim = project_config['search_autoencoder']['character_embedding_dim']
     latent_dim              = project_config['search_autoencoder']['latent_dim']
 
-    save_corpus_stats(corpus_file_path)
-
-    print_corpus_stats(corpus_stats_file_path)
-
-    alphabet, counts = get_corpus_stats(corpus_stats_file_path)
+    alphabet = get_alphabet(db_path)
+    print(f"Alphabet contains {len(alphabet)} characters")
+    from pprint import pprint
+    pprint(alphabet)
+    
     alphabet = [SPECIAL_PAD] + alphabet
 
     char_to_index = {char: index for index, char in enumerate(alphabet)}
@@ -84,8 +95,7 @@ def character_autoencoder_training():
                                      num_blocks_per_resolution=num_blocks_per_resolution)
    
 
-    model_path = "models/imdb_autoencoder.h5"
-    model_path = data_dir / model_path
+    model_path = data_dir / "models" / "imdb_autoencoder.h5"
     loaded_model = try_load_model(model_path)
 
     # compare the two models and if there's a difference, use the new model because
@@ -102,7 +112,7 @@ def character_autoencoder_training():
     print("\n> compiling model\n")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=0.0001),
-        loss=masked_categorical_crossentropy,
+        loss=partial(masked_categorical_crossentropy, char_to_index),
         metrics=["accuracy"],
     )
 
@@ -115,7 +125,7 @@ def character_autoencoder_training():
         mask_percentage=masked_percentage,
     )
 
-    dataset = tf.data.Dataset.from_generator(lambda: autoencoder_batch_generator(corpus_file_path, batch_size, token_processor),
+    dataset = tf.data.Dataset.from_generator(lambda: autoencoder_batch_generator(db_path, batch_size, token_processor),
                                              output_types=(tf.int32, tf.float32),
                                              output_shapes=((batch_size, max_input_length, ),
                                                             (batch_size, max_input_length, len(char_to_index))))
@@ -123,7 +133,7 @@ def character_autoencoder_training():
     save_frequency = 50
 
     save_model_by_batch_callback = keras.callbacks.ModelCheckpoint(
-        filepath=model_path,
+        filepath=str(model_path),
         save_best_only=False,
         monitor="loss",
         save_freq=save_frequency,
@@ -131,7 +141,7 @@ def character_autoencoder_training():
     )
 
     save_model_callback = keras.callbacks.ModelCheckpoint(
-        filepath=model_path,
+        filepath=str(model_path),
         save_best_only=False,
         monitor="loss",
         verbose=1
@@ -140,7 +150,7 @@ def character_autoencoder_training():
     logs_dir = Path("logs") / datetime.now().strftime("%Y%m%d-%H%M%S")
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    reconstruct_callback = ReconstructCallback(corpus_file_path, token_processor, num_samples=10, frequency=save_frequency)
+    reconstruct_callback = ReconstructCallback(db_path, token_processor, num_samples=10, frequency=save_frequency)
 
     tensorboard_callback = keras.callbacks.TensorBoard(
         log_dir=str(logs_dir), histogram_freq=1)
@@ -161,7 +171,7 @@ def character_autoencoder_training():
 
     model.fit(dataset, epochs=3, callbacks=[
         learning_rate_callback,
-        reconstruct_callback,
+        # reconstruct_callback,
         save_model_callback,
         save_model_by_batch_callback,
         tensorboard_callback
@@ -172,10 +182,6 @@ def gelu_activation(x):
     return tf.keras.activations.gelu(x, approximate=True)
 
 def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, latent_dim, num_blocks_per_resolution):
-    leaky_relu = lambda x: tf.nn.leaky_relu(x, alpha=0.01)
-    
-    gelu = lambda x: tf.keras.activations.gelu(x, approximate=True)
-
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name="embedding")(inputs)
 
@@ -276,54 +282,86 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, lat
     return model
 
 
-def autoencoder_batch_generator(corpus_file_path, batch_size, token_processor: TokenProcessor):
+class AutoencoderDataset(Dataset):
+    def __init__(self, db_path, token_processor: TokenProcessor, max_input_length):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self.token_processor = token_processor
+        self.max_input_length = max_input_length
+        self.char_to_index = token_processor.char_to_index
+
+        print("Entity Batch Generator: Fetching entity names from entity_vectors table...")
+        self.cursor.execute("SELECT entityName FROM entity_vectors WHERE LENGTH(entityName) < ?", (self.max_input_length,))
+        self.entities = [row[0].strip() for row in self.cursor.fetchall()]
+
+    def __len__(self):
+        return len(self.entities)
+
+    def __getitem__(self, idx):
+        entity_name = self.entities[idx]
+        input_string_token_indices = self.token_processor.tokenize(entity_name)
+
+        x = np.zeros(self.max_input_length, dtype=np.int32)
+        y = np.zeros((self.max_input_length, len(self.char_to_index)), dtype=np.float32)
+
+        x[:] = input_string_token_indices
+        for idx, token_index in enumerate(input_string_token_indices):
+            y[idx, token_index] = 1
+
+        return torch.tensor(x), torch.tensor(y)
+
+    def close(self):
+        self.conn.close()
+
+def autoencoder_batch_generator(db_path, batch_size, token_processor: TokenProcessor, SPECIAL_PAD='PAD'):
+    # Set up batches
     x_batch = np.zeros((batch_size, token_processor.max_input_length), dtype=np.int32)
     y_batch = np.zeros((batch_size, token_processor.max_input_length, len(token_processor.char_to_index)), dtype=np.float32)  
 
+    # Database connection
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Initialize batch index
     batch_index = 0
 
-    with open(corpus_file_path, 'r') as file:
-        for line in file:
-            line = line.strip()
-           
-            # Skip empty lines
-            if not line:
-                continue
-            
-            try:
-                # Process each line as a separate training example
-                total_pad = token_processor.max_input_length - len(line)
-                num_to_pad_left = random.randint(0, total_pad)
-                num_to_pad_right = total_pad - num_to_pad_left
-                line = SPECIAL_PAD * num_to_pad_left + line + SPECIAL_PAD * num_to_pad_right
+    query = "SELECT entityName FROM entity_vectors WHERE LENGTH(entityName) < ?"
+    cursor.execute(query, (token_processor.max_input_length,))
+    
+    print("Entity Batch Generator: Fetching entity names from entity_vectors table...")
+    for entity_name in cursor.fetchall():
+        entity_name = entity_name[0].strip()
+        
+        if len(entity_name) > token_processor.max_input_length or len(entity_name) == 0:
+            print(f"Skipping entity name: {entity_name}")
+            # continue
 
-                input_string_token_indices = token_processor.tokenize(line)[0]
+        try:
+            input_string_token_indices = token_processor.tokenize(entity_name)
 
-                x_batch[batch_index] = input_string_token_indices
-                for idx, token_index in enumerate(input_string_token_indices):
-                    y_batch[batch_index, idx, token_index] = 1
+            x_batch[batch_index] = input_string_token_indices
+            for idx, token_index in enumerate(input_string_token_indices):
+                y_batch[batch_index, idx, token_index] = 1
 
-                batch_index += 1
+            batch_index += 1
 
-                if batch_index == batch_size:
-                    batch_index = 0
-                    yield x_batch, y_batch
-                    x_batch = np.zeros((batch_size, token_processor.max_input_length), dtype=np.int32)
-                    y_batch = np.zeros((batch_size, token_processor.max_input_length, len(token_processor.char_to_index)), dtype=np.float32)
-            except Exception as e:
-                # print the exception
-                traceback.print_exc()
-                exc_type, exc_obj, exc_tb = sys.exc_info()
-                print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
+            if batch_index == batch_size:
+                batch_index = 0
+                yield x_batch, y_batch
+                x_batch = np.zeros((batch_size, token_processor.max_input_length), dtype=np.int32)
+                y_batch = np.zeros((batch_size, token_processor.max_input_length, len(token_processor.char_to_index)), dtype=np.float32)
+        except Exception as e:
+            traceback.print_exc()
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
+            print(f"Failed to process entity name: {entity_name}")
+            exit(1)
 
-                print(f"Failed to process line: {line}")
-                continue
+    # Close the database connection
+    conn.close()
+    
 
-    # Yield remaining batch if it's not empty
-    # if batch_index > 0:
-        # yield x_batch[:batch_index], y_batch[:batch_index]
-
-def masked_categorical_crossentropy(y_true, y_pred):
+def masked_categorical_crossentropy(char_to_index, y_true, y_pred):
     # Identify padding tokens (which should have reduced weight)
     padding_mask = K.cast(K.equal(K.argmax(y_true, axis=-1), char_to_index[SPECIAL_PAD]), K.floatx())
 
@@ -340,8 +378,8 @@ def masked_categorical_crossentropy(y_true, y_pred):
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, corpus_file_path, token_processor: TokenProcessor, num_samples, frequency):
-        self.corpus_file_path = corpus_file_path
+    def __init__(self, db_path, token_processor: TokenProcessor, num_samples, frequency):
+        self.db_path = db_path
         self.token_processor = token_processor
         self.num_samples = num_samples
         self.frequency = frequency
@@ -349,15 +387,23 @@ class ReconstructCallback(keras.callbacks.Callback):
     def on_batch_end(self, epoch, logs=None):
         if epoch % self.frequency != 0:
             return
-       
-        print(f"\nReconstruction examples at the end of epoch {epoch}:")
-        with open(self.corpus_file_path, 'r') as file:
-            lines = file.readlines()
 
-        selected_lines = random.sample(lines, self.num_samples)
-        for line in selected_lines:
-            original = line.strip()
+        # Database connection
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Fetch a random sample of entity names
+        cursor.execute(f"SELECT entityName FROM entity_vectors ORDER BY RANDOM() LIMIT {self.num_samples}")
+        selected_rows = cursor.fetchall()
+
+        conn.close()
+
+        print(f"\nReconstruction examples at the end of epoch {epoch}:")
+
+        for row in selected_rows:
+            original = row[0].strip()
             tokenized = self.token_processor.tokenize(original)
+            print(f"shape of tokenized: {tokenized.shape}")
             prediction = self.model.predict(tokenized, verbose=0)
             reconstructed = self.token_processor.indices_to_string(np.argmax(prediction, axis=-1)[0])
 
@@ -376,7 +422,7 @@ def are_models_same(model1, model2):
 
 
 def try_load_model(model_path: Path):
-    model_path.mkdir(parents=True, exist_ok=True)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         custom_objects = {
            "DepthwiseConv1D": DepthwiseConv1D,
@@ -490,33 +536,29 @@ def get_corpus_stats(corpus_stats_filename):
     return corpus_stats["alphabet"], corpus_stats["character_counts"]
 
 
-def save_corpus_stats(corpus_file):
-    """Create a json file that describes the alphabet and character counts for the corpus"""
-    character_counts = defaultdict(int)
-    
-    print(f"Analyzing corpus file {corpus_file}")
+def get_alphabet(db_path):
+    # Connect to the SQLite database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-    with open(corpus_file, "r", encoding="utf-8") as file:
-        for line in tqdm(file, desc="Counting characters"):
-            line = line.strip()
+    # Query the alphabet table
+    cursor.execute("SELECT characters FROM alphabet")
 
-            # Skip empty lines
-            if not line:
-                continue
+    # Fetch the result
+    result = cursor.fetchone()
 
-            for char in line:
-                character_counts[char] += 1
-                
-    all_chars = sorted(character_counts.keys())
+    # Close the database connection
+    conn.close()
 
-    # save json file
-    with open("corpus_stats.json", "w") as f:
-        stats = {
-            "alphabet": all_chars,
-            "character_counts": character_counts
-        }
+    if result:
+        # Parse the JSON field to get the list of characters
 
-        json.dump(stats, f)
+        alphabet = json.loads(result[0])
+        alphabet = [chr(ord(c)) for c in alphabet]
+        return alphabet
+    else:
+        # Return an empty list if no data is found
+        return []       
 
 
 if __name__ == "__main__":
