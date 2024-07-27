@@ -141,7 +141,7 @@ def character_llm_training():
         initial_lr=starting_lr,
         min_lr=starting_lr / 50,
         secondary_period=1000,
-        secondary_amplitude_ratio=0.5
+        secondary_amplitude_ratio=0.01
     )
 
     model.fit(
