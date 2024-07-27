@@ -54,6 +54,7 @@ def character_llm_training():
     num_epochs = project_config['llm']['epochs']
     languages = project_config['llm'].get('languages', None)
     book_ids = project_config['llm'].get('book_ids', None)
+    num_books = project_config['llm'].get('num_books', None)
     book_ids = None
 
     alphabet = get_alphabet(languages=languages, book_ids=book_ids)
@@ -93,7 +94,6 @@ def character_llm_training():
 
     model.summary()
 
-    num_books = 100
     gututenberg_dataset = load_gutenberg_dataset(languages=languages, book_ids=book_ids)
     tf_dataset = create_tf_dataset(gututenberg_dataset, num_books, char_to_index, input_length, batch_size)
 
@@ -133,7 +133,7 @@ def character_llm_training():
         ]
     )
 
-    steps_per_epoch = calculate_steps_per_epoch(languages, input_length, batch_size, book_ids)
+    steps_per_epoch = calculate_steps_per_epoch(languages, input_length, batch_size, num_books, book_ids)
 
     starting_lr = 0.0002
     cosine_lr_scheduler = CosineLearningRateSchedulerWithSecondaryOscillation(
@@ -597,9 +597,9 @@ class ReconstructCallback(keras.callbacks.Callback):
 
 
 
-def calculate_steps_per_epoch(languages, max_input_length, batch_size, book_ids=None, cache_file='dataset_size_cache.json'):
+def calculate_steps_per_epoch(languages, max_input_length, batch_size, num_books, book_ids=None, cache_file='dataset_size_cache.json'):
     # Check if we have a cached size
-    cache_key = f"{','.join(sorted(languages or []))}-{','.join(sorted(book_ids or []))}"
+    cache_key = f"{','.join(sorted(languages or []))}-{','.join(sorted(book_ids or []))}-{num_books}"
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
@@ -613,7 +613,7 @@ def calculate_steps_per_epoch(languages, max_input_length, batch_size, book_ids=
 
     total_windows = 0
 
-    for book in tqdm(dataset, desc="Calculating windows", unit="book"):
+    for book in tqdm(islice(dataset, num_books), desc="Calculating windows", unit="book"):
         text_length = len(book['text'])
         # Calculate the number of windows in this book
         book_windows = max(0, (text_length - max_input_length) + 1)
