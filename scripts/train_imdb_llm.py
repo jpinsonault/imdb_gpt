@@ -93,8 +93,9 @@ def character_llm_training():
 
     model.summary()
 
+    num_books = 100
     gututenberg_dataset = load_gutenberg_dataset(languages=languages, book_ids=book_ids)
-    tf_dataset = create_tf_dataset(gututenberg_dataset, char_to_index, input_length, batch_size)
+    tf_dataset = create_tf_dataset(gututenberg_dataset, num_books, char_to_index, input_length, batch_size)
 
     save_model_callback = keras.callbacks.ModelCheckpoint(
         filepath=str(model_path),
@@ -255,11 +256,14 @@ def remove_excessive_whitespace(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
+
+from itertools import islice
+def create_tf_dataset(dataset, num_books, char_to_index, max_input_length, batch_size):
     token_processor = TokenProcessor(char_to_index, max_input_length)
 
     def generate_samples():
-        for book in dataset:
+        # take a subset of the dataset
+        for book in islice(dataset, num_books):
             text = preprocess_text(book['text'])
             tokenized = token_processor.tokenize(text)
             try:
