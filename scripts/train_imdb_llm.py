@@ -410,7 +410,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         global_query = create_global_query(x, character_embedding_dim)
         most_recent_token = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(most_recent_token)
-        most_recent_token += global_query
+        most_recent_token *= global_query
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token])
 
         x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
