@@ -139,7 +139,7 @@ def character_llm_training():
     cosine_lr_scheduler = CosineLearningRateScheduler(
         total_batches=steps_per_epoch,
         initial_lr=starting_lr,
-        min_lr=starting_lr / 50
+        min_lr=starting_lr
     )
 
     model.fit(
@@ -412,6 +412,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         global_query = Reshape((1, character_embedding_dim))(global_query)
         most_recent_token = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
         most_recent_token += global_query
+        # most_recent_token = LayerNormalization()(most_recent_token)
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token])
 
         x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
