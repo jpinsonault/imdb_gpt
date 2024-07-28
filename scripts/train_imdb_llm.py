@@ -433,7 +433,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         queried_values = Multiply(name=n('ASA_queried_values'))([final_values, final_query])
         queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('ASA_output_projection'))(queried_values)
         queried_values = LayerNormalization()(queried_values)
-        weights = Conv1D(filters=1, kernel_size=1, padding='same', activation=None)(queried_values)
+        weights = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid')(queried_values)
         weights = Softmax(axis=1)(weights)
         queried_values = Multiply()([queried_values, weights])
         
