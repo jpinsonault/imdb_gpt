@@ -393,6 +393,10 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
     embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
     embedding = embedding_layer(inputs)
+    most_recent_char = embedding[:, -1, :]
+
+    # dropout the embedding
+    embedding = Dropout(0.1)(embedding)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
 
@@ -401,7 +405,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(x)
     x = LayerNormalization()(x)
 
-    most_recent_char = embedding[:, -1, :]
     most_recent_token = Reshape((1, character_embedding_dim))(x[:, -1, :])
     x *= most_recent_token
 
