@@ -128,8 +128,13 @@ def character_llm_training():
 
     learning_rate_callback = ScheduledLearningRateCallback(
         schedule=[
-            (0, 0.0001),
-            (1, 0.00001),
+            (0, 0.0002),
+            (1, 0.0001),
+            (2, 0.00005),
+            (3, 0.00002),
+            (4, 0.00001),
+            (5, 0.000005),
+            (6, 0.000002),
         ]
     )
 
@@ -147,7 +152,7 @@ def character_llm_training():
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
         callbacks=[
-            cosine_lr_scheduler,
+            learning_rate_callback,
             save_model_callback,
             commit_changes_to_git_callback,
             tensorboard_callback,
@@ -387,7 +392,7 @@ def ff_layer(character_embedding_dim, activation):
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=8):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
@@ -422,7 +427,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x += residual_conv
     x += positional_encoding
 
-    num_reductions = 4
+    num_reductions = 8
     reductions = []
     for i in range(num_reductions):
         most_recent_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
@@ -806,7 +811,6 @@ class ScheduledLearningRateCallback(keras.callbacks.Callback):
                         new_learning_rate)
                 elif hasattr(self.model.optimizer, "lr"):
                     self.model.optimizer.lr.assign(new_learning_rate)
-                print(f"Setting learning rate to {new_learning_rate}")
                 break
 
 
