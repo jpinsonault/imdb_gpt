@@ -408,7 +408,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     for i in range(num_blocks):
         x = Add(name=n("in_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(most_recent_token)
+        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
+        global_query = create_global_query(x, character_embedding_dim)
+
+        combined = Concatenate()([global_query, most_recent_token_projection])
+        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(combined)
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
