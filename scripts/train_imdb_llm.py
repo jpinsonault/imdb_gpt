@@ -354,14 +354,20 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
         head_outputs = []
         for i in range(num_heads):
             head_input_sequence = split_inputs[i]
+
+            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(head_input_sequence)
             global_query = create_global_query(head_input_sequence, head_dim)
-            key_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(head_input_sequence)
-            queried_keys = key_tokens * global_query
 
-            head_outputs.append(queried_keys)
+            queried_values = value_tokens * global_query
 
-        queried_keys = Concatenate(name=n("combine_heads"))(head_outputs)
-        output_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(queried_keys)
+            output_mask = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid')(queried_values)
+            output_mask = Softmax(axis=1)(output_mask)
+
+            queried_values = Multiply(name=n("apply_attention_output_mask"))([queried_values, output_mask])
+            head_outputs.append(queried_values)
+
+        queried_values = Concatenate(name=n("combine_heads"))(head_outputs)
+        output_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(queried_values)
 
         output_tokens = Add(name=n("add_and_norm"))([output_tokens, input_sequence])
         output_tokens = LayerNormalization()(output_tokens)
@@ -409,10 +415,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         x = Add(name=n("in_positional_encoding"))([x, positional_encoding])
 
         most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
-        global_query = create_global_query(x, character_embedding_dim)
-
-        combined = Concatenate()([global_query, most_recent_token_projection])
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(combined)
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
@@ -432,14 +434,14 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         final_query *= most_recent_projection
 
         final_keys = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation)(x)
-        queried_keys = Multiply(name=n('ASA_queried_keys'))([final_keys, final_query])
-        queried_keys = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n('ASA_output_projection'))(queried_keys)
-        queried_keys = LayerNormalization()(queried_keys)
-        weights = Conv1D(filters=1, kernel_size=1, padding='same', activation=activation)(queried_keys)
+        queried_values = Multiply(name=n('ASA_queried_values'))([final_keys, final_query])
+        queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n('ASA_output_projection'))(queried_values)
+        queried_values = LayerNormalization()(queried_values)
+        weights = Conv1D(filters=1, kernel_size=1, padding='same', activation=activation)(queried_values)
         weights = Softmax(axis=1)(weights)
-        queried_keys = Multiply()([queried_keys, weights])
+        queried_values = Multiply()([queried_values, weights])
         
-        final_sum = ReduceSum(axis=1, keepdims=True)(queried_keys)
+        final_sum = ReduceSum(axis=1, keepdims=True)(queried_values)
         final_sum = Reshape((character_embedding_dim,))(final_sum)
         reduction = Dense(character_embedding_dim, use_bias=False, activation=None)(final_sum)
         reductions.append(reduction)
