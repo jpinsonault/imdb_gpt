@@ -26,6 +26,6 @@ project_config = {
         'batch_size'             : 1024,
         'languages'              : ['en'],
         'book_ids'               : ['3207-0'],
-        'num_books'              : 10,
+        'num_books'              : 1,
     },
 }
