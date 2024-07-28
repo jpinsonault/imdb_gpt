@@ -400,7 +400,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     # down to 1/4 of the original length
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(embedding)
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(x)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, strides=1, padding='same', activation=None)(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=1, strides=1, padding='same', activation=activation)(x)
     x = LayerNormalization()(x)
 
     most_recent_token = Reshape((1, character_embedding_dim))(x[:, -1, :])
@@ -416,7 +416,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
-        x = Add(name=n("out_positional_encoding"))([x, -positional_encoding])
+        # x = Add(name=n("out_positional_encoding"))([x, -positional_encoding])
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation())(first_residual)
     x += residual_conv
