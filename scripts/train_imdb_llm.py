@@ -136,12 +136,10 @@ def character_llm_training():
     steps_per_epoch = calculate_steps_per_epoch(languages, input_length, batch_size, num_books, book_ids)
 
     starting_lr = 0.0002
-    cosine_lr_scheduler = CosineLearningRateSchedulerWithSecondaryOscillation(
+    cosine_lr_scheduler = CosineLearningRateScheduler(
         total_batches=steps_per_epoch * num_epochs,
         initial_lr=starting_lr,
-        min_lr=starting_lr / 50,
-        secondary_period=1000,
-        secondary_amplitude_ratio=0.01
+        min_lr=starting_lr / 50
     )
 
     model.fit(
@@ -775,27 +773,17 @@ def try_load_model(model_path: Path):
         return None
 
 
-class CosineLearningRateSchedulerWithSecondaryOscillation(tf.keras.callbacks.Callback):
-    def __init__(self, total_batches, initial_lr, min_lr=1e-6, secondary_period=1000, secondary_amplitude_ratio=0.1):
-        super().__init__()
+class CosineLearningRateScheduler(tf.keras.callbacks.Callback):
+    def __init__(self, total_batches, initial_lr, min_lr=1e-6):
+        super(CosineLearningRateScheduler, self).__init__()
         self.total_batches = total_batches
         self.initial_lr = initial_lr
         self.min_lr = min_lr
-        self.secondary_period = secondary_period
-        self.secondary_amplitude_ratio = secondary_amplitude_ratio
 
     def on_batch_end(self, batch, logs=None):
-        # Compute the primary cosine learning rate
-        primary_lr = self.min_lr + 0.5 * (self.initial_lr - self.min_lr) * (1 + math.cos(math.pi * batch / self.total_batches))
-        # Compute the secondary oscillation
-        secondary_lr = self.secondary_amplitude_ratio * 0.5 * (self.initial_lr - self.min_lr) * (1 + math.cos(2 * math.pi * batch / self.secondary_period))
-        # Sum the primary and secondary learning rates
-        new_lr = primary_lr + secondary_lr
-        # Set the new learning rate
+        # Compute the cosine learning rate
+        new_lr = self.min_lr + 0.5 * (self.initial_lr - self.min_lr) * (1 + math.cos(math.pi * batch / self.total_batches))
         self.model.optimizer.learning_rate.assign(new_lr)
-
-        if batch % 10 == 0:
-            print(f" - Setting learning rate to {new_lr}")
         
 
 class ScheduledLearningRateCallback(keras.callbacks.Callback):
