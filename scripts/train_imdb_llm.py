@@ -535,15 +535,15 @@ class ReconstructCallback(keras.callbacks.Callback):
             print(f"\nBatch {batch} Autoencoder Outputs:\n")
             self._print_predictions()
 
-def _get_random_sequence(self):
-    chunk = next(iter(self.dataset.take(1)))
-    text = chunk.numpy().decode('utf-8')
-    if len(text) > self.max_input_length:
-        start = np.random.randint(0, len(text) - self.max_input_length)
-        return text[start:start+self.max_input_length]
-    return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
-    def _tokenize(self, sequence):
-        return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
+    def _get_random_sequence(self):
+        chunk = next(iter(self.dataset.take(1)))
+        text = chunk.numpy().decode('utf-8')
+        if len(text) > self.max_input_length:
+            start = np.random.randint(0, len(text) - self.max_input_length)
+            return text[start:start+self.max_input_length]
+        return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
+        def _tokenize(self, sequence):
+            return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
 
     def _select_top_character(self, predictions):
         return np.argmax(predictions)
