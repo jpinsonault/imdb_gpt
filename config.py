@@ -24,8 +24,6 @@ project_config = {
         'epochs'                 : 16,
         'character_embedding_dim': 128,
         'batch_size'             : 1024,
-        'languages'              : ['en'],
-        'book_ids'               : ['3207-0'],
-        'num_books'              : 8,
+        'dataset_text_file'      : 'TinyStoriesV2-GPT4-train.txt',
     },
 }

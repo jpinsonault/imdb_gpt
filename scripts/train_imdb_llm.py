@@ -52,12 +52,11 @@ def character_llm_training():
     batch_size = project_config['llm']['batch_size']
     character_embedding_dim = project_config['llm']['character_embedding_dim']
     num_epochs = project_config['llm']['epochs']
-    languages = project_config['llm'].get('languages', None)
-    book_ids = project_config['llm'].get('book_ids', None)
-    num_books = project_config['llm'].get('num_books', None)
-    book_ids = None
 
-    alphabet = get_alphabet(languages=languages, book_ids=book_ids)
+    dataset_text_file = project_config['llm'].get('dataset_text_file', None)
+    dataset_text_file = data_dir / dataset_text_file
+
+    alphabet = get_alphabet(dataset_text_file)
     print_project_config(project_config)
 
     print(f"Alphabet size: {len(alphabet)}")
@@ -94,8 +93,8 @@ def character_llm_training():
 
     model.summary()
 
-    gututenberg_dataset = load_gutenberg_dataset(languages=languages, book_ids=book_ids)
-    tf_dataset = create_tf_dataset(gututenberg_dataset, num_books, char_to_index, input_length, batch_size)
+    dataset = load_text_file_dataset(dataset_text_file)
+    tf_dataset = create_tf_dataset(dataset, char_to_index, input_length, batch_size)
 
     save_model_callback = keras.callbacks.ModelCheckpoint(
         filepath=str(model_path),
@@ -112,8 +111,7 @@ def character_llm_training():
         num_samples=5,
         frequency=1000,
         gen_length=max(50, input_length//4),
-        languages=languages,
-        book_ids=book_ids,
+        text_file=dataset_text_file
     )
 
     now_int = int(datetime.now().timestamp())
@@ -138,7 +136,7 @@ def character_llm_training():
         ]
     )
 
-    steps_per_epoch = calculate_steps_per_epoch(languages, input_length, batch_size, num_books, book_ids)
+    steps_per_epoch = calculate_steps_per_epoch(dataset_text_file, input_length, batch_size)
 
     starting_lr = 0.0002
     cosine_lr_scheduler = CosineLearningRateScheduler(
@@ -241,6 +239,22 @@ def load_gutenberg_dataset(languages=None, book_ids=None):
     
     return concatenated_dataset
 
+
+def load_text_file_dataset(file_path, chunk_size=1024 * 1024):  # 1MB chunks
+    def generate_chunks():
+        with open(file_path, 'r', encoding='utf-8') as file:
+            while True:
+                chunk = file.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    return tf.data.Dataset.from_generator(
+        generate_chunks,
+        output_types=tf.string,
+        output_shapes=()
+    )
+
 def preprocess_text(text):
     text = remove_gutenberg_headers_footers(text)
     text = remove_excessive_whitespace(text)
@@ -261,36 +275,26 @@ def remove_excessive_whitespace(text):
 
 
 from itertools import islice
-def create_tf_dataset(dataset, num_books, char_to_index, max_input_length, batch_size):
+def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
     token_processor = TokenProcessor(char_to_index, max_input_length)
 
-    def generate_samples():
-        # take a subset of the dataset
-        for book in islice(dataset, num_books):
-            text = preprocess_text(book['text'])
-            tokenized = token_processor.tokenize(text)
-            try:
-                for i in range(len(tokenized) - 2):
-                    input_sequence = tokenized[i:i+max_input_length]
-                    if len(input_sequence) < max_input_length:
-                        input_sequence = np.pad(input_sequence, (0, max_input_length - len(input_sequence)), 
-                                                mode='constant', constant_values=char_to_index[SPECIAL_PAD])
-                    elif len(input_sequence) > max_input_length:
-                        input_sequence = input_sequence[:max_input_length]
-                    target = tokenized[i+max_input_length]
-                    yield input_sequence, target
-            except Exception as e:
-                print(f"Error processing book: {e}")
-                continue
+    def generate_samples(text_chunk):
+        text = preprocess_text(text_chunk.numpy().decode('utf-8'))
+        tokenized = token_processor.tokenize(text)
+        for i in range(len(tokenized) - max_input_length):
+            input_sequence = tokenized[i:i+max_input_length]
+            target = tokenized[i+max_input_length]
+            yield input_sequence, target
 
     def generator():
-        for x, y in generate_samples():
-            yield x, tf.one_hot(y, depth=len(char_to_index))
+        for chunk in dataset:
+            yield from generate_samples(chunk)
 
     return tf.data.Dataset.from_generator(
         generator,
-        output_types=(tf.int32, tf.float32),
-        output_shapes=((max_input_length,), (len(char_to_index),))
+        output_types=(tf.int32, tf.int32),
+        output_shapes=((max_input_length,), ())
+    ).map(lambda x, y: (x, tf.one_hot(y, depth=len(char_to_index)))
     ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
@@ -405,7 +409,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     # down to 1/4 of the original length
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(embedding)
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(x)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, strides=1, padding='same', activation=activation)(x)
     x = LayerNormalization()(x)
 
     most_recent_token = Reshape((1, character_embedding_dim))(x[:, -1, :])
@@ -513,13 +516,13 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, languages=None, book_ids=None, temperature=1.0, gen_length=25):
+    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, text_file, temperature=1.0, gen_length=25):
         self.char_to_index = char_to_index
         self.index_to_char = index_to_char
         self.max_input_length = max_input_length
         self.num_samples = num_samples
         self.frequency = frequency
-        self.dataset = load_gutenberg_dataset(languages, book_ids)
+        self.dataset = load_text_file_dataset(text_file)
         self.temperature = temperature
         self.gen_length = gen_length
 
@@ -532,15 +535,13 @@ class ReconstructCallback(keras.callbacks.Callback):
             print(f"\nBatch {batch} Autoencoder Outputs:\n")
             self._print_predictions()
 
-    def _get_random_sequence(self):
-        random_index = np.random.randint(0, len(self.dataset))
-        example = self.dataset[random_index]
-        text = example['text']
-        if len(text) > self.max_input_length:
-            start = np.random.randint(0, len(text) - self.max_input_length)
-            return text[start:start+self.max_input_length]
-        return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
-
+def _get_random_sequence(self):
+    chunk = next(iter(self.dataset.take(1)))
+    text = chunk.numpy().decode('utf-8')
+    if len(text) > self.max_input_length:
+        start = np.random.randint(0, len(text) - self.max_input_length)
+        return text[start:start+self.max_input_length]
+    return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
     def _tokenize(self, sequence):
         return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
 
@@ -601,10 +602,8 @@ class ReconstructCallback(keras.callbacks.Callback):
             return f"\033[30;41m{char}\033[0m"  # Red background, black text
 
 
-
-def calculate_steps_per_epoch(languages, max_input_length, batch_size, num_books, book_ids=None, cache_file='dataset_size_cache.json'):
-    # Check if we have a cached size
-    cache_key = f"{','.join(sorted(languages or []))}-{','.join(sorted(book_ids or []))}-{num_books}"
+def calculate_steps_per_epoch(file_path: Path, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
+    cache_key = f"file_{hashlib.md5(str(file_path).encode()).hexdigest()}"
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
@@ -613,16 +612,15 @@ def calculate_steps_per_epoch(languages, max_input_length, batch_size, num_books
                 print(f"Using cached total windows: {total_windows}")
                 return total_windows // batch_size
 
-    # Load the Gutenberg dataset
-    dataset = load_gutenberg_dataset(languages, book_ids)
+    dataset = load_text_file_dataset(file_path)
 
     total_windows = 0
 
-    for book in tqdm(islice(dataset, num_books), desc="Calculating windows", unit="book"):
-        text_length = len(book['text'])
-        # Calculate the number of windows in this book
-        book_windows = max(0, (text_length - max_input_length) + 1)
-        total_windows += book_windows
+    for chunk in tqdm(dataset, desc="Calculating windows", unit="chunk"):
+        text_length = len(chunk.numpy().decode('utf-8'))
+        # Calculate the number of windows in this chunk
+        chunk_windows = max(0, (text_length - max_input_length) + 1)
+        total_windows += chunk_windows
 
     # Cache the result
     if os.path.exists(cache_file):
@@ -637,16 +635,15 @@ def calculate_steps_per_epoch(languages, max_input_length, batch_size, num_books
 
     steps_per_epoch = total_windows // batch_size
 
-    print(f"Total windows across all books: {total_windows}")
+    print(f"Total windows across all chunks: {total_windows}")
     print(f"Batch size: {batch_size}")
     print(f"Steps per epoch: {steps_per_epoch}")
 
     return steps_per_epoch
 
 
-
-def get_alphabet(cache_file: str = 'overall_unique_chars.json', languages=None, book_ids=None) -> Set[str]:
-    cache_key = f"{','.join(sorted(languages or []))}-{','.join(sorted(book_ids or []))}"
+def get_alphabet(file_path: Path, cache_file: str = 'overall_unique_chars.json') -> Set[str]:
+    cache_key = f"file_{hashlib.md5(str(file_path).encode()).hexdigest()}"
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
@@ -656,11 +653,11 @@ def get_alphabet(cache_file: str = 'overall_unique_chars.json', languages=None, 
                 alphabet.update([SPECIAL_PAD, SPECIAL_START, SPECIAL_END])
                 return alphabet
 
-    dataset = load_gutenberg_dataset(languages, book_ids)
+    dataset = load_text_file_dataset(file_path)
     
     alphabet = set()
-    for example in tqdm(dataset, desc="Processing dataset", unit="book"):
-        alphabet.update(set(example["text"]))
+    for chunk in tqdm(dataset, desc="Processing dataset", unit="chunk"):
+        alphabet.update(set(chunk.numpy().decode('utf-8')))
 
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
