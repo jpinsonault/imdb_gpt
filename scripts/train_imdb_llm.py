@@ -396,7 +396,7 @@ def ff_layer(character_embedding_dim, activation):
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=8):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
@@ -430,7 +430,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x += residual_conv
     x += positional_encoding
 
-    num_reductions = 8
+    num_reductions = 4
     reductions = []
     for i in range(num_reductions):
         most_recent_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
