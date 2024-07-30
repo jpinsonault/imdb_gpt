@@ -348,7 +348,7 @@ def sinusoidal_encoding(input_length, embedding_dim):
 def create_global_query(input_sequence, character_embedding_dim):
     query_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('query_tokens'))(input_sequence)
     query_weights = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid', name=n('query_weights'))(query_tokens)
-    query_weights = Softmax(axis=1)(query_weights)
+    query_weights = Softmax(axis=1, name=n('query_weights_softmax'))(query_weights)
 
     global_query = ReduceSum(axis=1, keepdims=True, name=n('global_query'))(query_tokens * query_weights)
     return global_query
@@ -405,7 +405,7 @@ def ff_layer(character_embedding_dim, activation):
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=8):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
