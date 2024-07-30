@@ -422,15 +422,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = LayerNormalization()(x)
 
     most_recent_token = Reshape((1, character_embedding_dim))(x[:, -1, :])
-    x *= most_recent_token
 
     first_residual = x
 
     for i in range(num_blocks):
         x = Add(name=n("in_positional_encoding"))([x, positional_encoding])
-
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
-        x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(input_length//4, character_embedding_dim, activation, num_heads=4)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
