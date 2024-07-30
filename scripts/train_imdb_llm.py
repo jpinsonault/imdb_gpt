@@ -451,15 +451,15 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         reduction = Dense(character_embedding_dim, use_bias=False, activation=None)(final_sum)
         reductions.append(reduction)
 
-    reductions = Stack(axis=1)(reductions)  # Shape: (batch_size, num_reductions, character_embedding_dim)
+    reductions = Stack(axis=1)(reductions)
 
     # Generate weights for the reductions
-    weights = Dense(num_reductions, activation='softmax')(Flatten()(most_recent_token))
-    weights = Reshape((num_reductions, 1))(weights)  # Shape: (batch_size, num_reductions, 1)
+    weights = Dense(num_reductions, activation='softmax')(Flatten()(most_recent_char))
+    weights = Reshape((num_reductions, 1))(weights)
 
     # Apply weights to reductions and sum
     weighted_reductions = Multiply(name=n("reductions_moe_weighting"))([reductions, weights])
-    final_reduction = ReduceSum(axis=1)(weighted_reductions)  # Shape: (batch_size, character_embedding_dim)
+    final_reduction = ReduceSum(axis=1)(weighted_reductions)
 
     x = Dense(character_embedding_dim*8, activation=activation)(final_reduction)
     x = LayerNormalization()(x)
