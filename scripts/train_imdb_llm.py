@@ -349,6 +349,7 @@ def create_global_query(input_sequence, character_embedding_dim):
     query_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('query_tokens'))(input_sequence)
     query_weights = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid', name=n('query_weights'))(query_tokens)
     query_weights = Softmax(axis=1)(query_weights)
+
     global_query = ReduceSum(axis=1, keepdims=True, name=n('global_query'))(query_tokens * query_weights)
     return global_query
 
@@ -360,12 +361,20 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
 
         split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1))(input_sequence)
 
+        last_token = input_sequence[:, -1, :]
+        last_token = Reshape((1, character_embedding_dim))(last_token)
+
         head_outputs = []
         for i in range(num_heads):
             head_input_sequence = split_inputs[i]
 
-            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(head_input_sequence)
-            global_query = create_global_query(head_input_sequence, head_dim)
+            learned_positional_mask = Dense(input_length, activation=None)(last_token)
+            learned_positional_mask = Softmax(name=n('learned_positional_mask'))(learned_positional_mask)
+
+            masked_input_sequence = head_input_sequence * learned_positional_mask
+
+            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
+            global_query = create_global_query(masked_input_sequence, head_dim)
 
             queried_values = value_tokens * global_query
 
@@ -402,7 +411,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
     embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
     embedding = embedding_layer(inputs)
-    most_recent_char = embedding[:, -1, :]
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
 
@@ -422,9 +430,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
 
-        x = additive_self_attention(input_length, character_embedding_dim, activation, num_heads=4)(x)
+        x = additive_self_attention(input_length//4, character_embedding_dim, activation, num_heads=4)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
-        # x = Add(name=n("out_positional_encoding"))([x, -positional_encoding])
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation())(first_residual)
     x += residual_conv
@@ -435,17 +442,20 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     for i in range(num_reductions):
         most_recent_projection = Dense(character_embedding_dim, use_bias=False, activation=None)(most_recent_token)
 
-        final_query = create_global_query(x, character_embedding_dim)
+        learned_positional_mask = Dense(input_length//4, activation=None)(most_recent_token)
+        learned_positional_mask = Reshape((input_length//4, 1))(learned_positional_mask)
+        learned_positional_mask = Softmax(axis=1, name=n('learned_positional_mask'))(learned_positional_mask)
+
+        masked_input_sequence = x * learned_positional_mask
+
+        final_query = create_global_query(masked_input_sequence, character_embedding_dim)
         final_query *= most_recent_projection
 
-        final_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(x)
-        queried_values = Multiply(name=n('ASA_queried_values'))([final_values, final_query])
+        value_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
+        queried_values = Multiply(name=n('ASA_queried_values'))([value_tokens, final_query])
         queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('ASA_output_projection'))(queried_values)
         queried_values = LayerNormalization()(queried_values)
-        weights = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid')(queried_values)
-        weights = Softmax(axis=1)(weights)
-        queried_values = Multiply()([queried_values, weights])
-        
+
         final_sum = ReduceSum(axis=1, keepdims=True)(queried_values)
         final_sum = Reshape((character_embedding_dim,))(final_sum)
         reduction = Dense(character_embedding_dim, use_bias=False, activation=None)(final_sum)
@@ -453,19 +463,12 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     reductions = Stack(axis=1)(reductions)
 
-    # Generate weights for the reductions
-    weights = Dense(num_reductions, activation='softmax')(Flatten()(most_recent_char))
-    weights = Reshape((num_reductions, 1))(weights)
-
-    # Apply weights to reductions and sum
-    weighted_reductions = Multiply(name=n("reductions_moe_weighting"))([reductions, weights])
-    final_reduction = ReduceSum(axis=1)(weighted_reductions)
-
-    x = Dense(character_embedding_dim*8, activation=activation)(final_reduction)
+    x = Dense(character_embedding_dim*8, activation=activation)(Flatten()(reductions))
     x = LayerNormalization()(x)
     x = Dense(character_embedding_dim, activation=None)(x)
+    most_recent_token = Reshape((character_embedding_dim,))(most_recent_token)
 
-    x += most_recent_char
+    x += most_recent_token
 
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True))(x)
 
