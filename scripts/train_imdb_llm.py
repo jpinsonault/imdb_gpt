@@ -347,10 +347,8 @@ def sinusoidal_encoding(input_length, embedding_dim):
 
 def create_global_query(input_sequence, character_embedding_dim):
     query_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('query_tokens'))(input_sequence)
-    query_weights = Conv1D(filters=1, kernel_size=1, padding='same', activation='sigmoid', name=n('query_weights'))(query_tokens)
-    query_weights = Softmax(axis=1, name=n('query_weights_softmax'))(query_weights)
-
-    global_query = ReduceSum(axis=1, keepdims=True, name=n('global_query'))(query_tokens * query_weights)
+    global_query = ReduceSum(axis=1, keepdims=True, name=n('global_query'))(query_tokens)
+    
     return global_query
 
 
@@ -375,17 +373,17 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
 
             masked_input_sequence = head_input_sequence * positional_mask
 
+            global_token = ReduceSum(axis=1, keepdims=True, name=n('global_token'))(masked_input_sequence)
+            
             value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
-            global_query = create_global_query(masked_input_sequence, head_dim)
 
-            queried_values = value_tokens * global_query
+            queried_tokens = value_tokens * global_token
 
-            head_outputs.append(queried_values)
+            head_outputs.append(queried_tokens)
 
-        queried_values = Concatenate(name=n("combine_heads"))(head_outputs)
-        output_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(queried_values)
+        queried_tokens = Concatenate(name=n("combine_heads"))(head_outputs)
 
-        output_tokens = Add(name=n("add_and_norm"))([output_tokens, input_sequence])
+        output_tokens = Add(name=n("add_and_norm"))([queried_tokens, input_sequence])
         output_tokens = LayerNormalization()(output_tokens)
     
         return output_tokens
@@ -407,7 +405,7 @@ def ff_layer(character_embedding_dim, activation):
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=8):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
