@@ -368,10 +368,12 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
         for i in range(num_heads):
             head_input_sequence = split_inputs[i]
 
-            learned_positional_mask = Dense(input_length, activation=None)(last_token)
-            learned_positional_mask = Softmax(name=n('learned_positional_mask'))(learned_positional_mask)
+            last_token_positional_mask = Dense(input_length, activation=None)(last_token)
+            tokenwise_positional_mask = Dense(input_length, activation=None)(head_input_sequence)
 
-            masked_input_sequence = head_input_sequence * learned_positional_mask
+            positional_mask = Softmax(name=n('last_token_mask'))(last_token_positional_mask + tokenwise_positional_mask)
+
+            masked_input_sequence = head_input_sequence * positional_mask
 
             value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
             global_query = create_global_query(masked_input_sequence, head_dim)
