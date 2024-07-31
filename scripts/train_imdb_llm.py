@@ -351,7 +351,7 @@ def create_combined_positional_mask(input_sequence):
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
     tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
 
-    positional_mask = Softmax(name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
+    positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
     return positional_mask
 
 def create_global_token(input_sequence, character_embedding_dim):
