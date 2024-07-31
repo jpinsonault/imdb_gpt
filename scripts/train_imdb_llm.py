@@ -357,7 +357,10 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
 
         head_dim = character_embedding_dim // num_heads
 
-        split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1))(input_sequence)
+        if num_heads == 1:
+            split_inputs = [input_sequence]
+        else:
+            split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1))(input_sequence)
 
         last_token = input_sequence[:, -1, :]
         last_token = Reshape((1, character_embedding_dim))(last_token)
@@ -367,7 +370,8 @@ def additive_self_attention(input_length, character_embedding_dim, activation, n
             head_input_sequence = split_inputs[i]
 
             last_token_positional_mask = Dense(input_length, activation=None)(last_token)
-            tokenwise_positional_mask = Dense(input_length, activation=None)(head_input_sequence)
+            last_token_positional_mask = Reshape((input_length, 1))(last_token_positional_mask)
+            tokenwise_positional_mask = Dense(1, activation=None)(head_input_sequence)
 
             positional_mask = Softmax(name=n('last_token_mask'))(last_token_positional_mask + tokenwise_positional_mask)
 
@@ -432,7 +436,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(most_recent_token)
         x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
 
-        x = additive_self_attention(input_length//4, character_embedding_dim, activation, num_heads=4)(x)
+        x = additive_self_attention(input_length//4, character_embedding_dim, activation, num_heads=1)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation())(first_residual)
