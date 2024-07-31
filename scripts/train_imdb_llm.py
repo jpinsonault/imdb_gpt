@@ -322,12 +322,11 @@ def create_name_generator():
     def generate_unique_name(name: str) -> str:
         name_counts[name] += 1
         count = name_counts[name]
-        return f"{name}{count}"
+        return f"{name}_{count}"
 
     return generate_unique_name
 
 n = create_name_generator()
-
 
 def sinusoidal_encoding(input_length, embedding_dim):
     positions = tf.range(input_length - 1, -1, -1, dtype=tf.float32)
@@ -344,24 +343,22 @@ def sinusoidal_encoding(input_length, embedding_dim):
     
     return pos_encoding
 
-
 def create_combined_positional_mask(input_sequence):
-    last_token = Reshape((1, input_sequence.shape[-1]))(input_sequence[:, -1, :])
+    last_token = Reshape((1, input_sequence.shape[-1]), name=n("reshape_last_token"))(input_sequence[:, -1, :])
     input_length = input_sequence.shape[1]
 
-    last_token_positional_mask = Dense(input_length, activation=None)(last_token)
-    last_token_positional_mask = Reshape((input_length, 1))(last_token_positional_mask)
-    tokenwise_positional_mask = Dense(1, activation=None)(input_sequence)
+    last_token_positional_mask = Dense(input_length, activation=None, name=n("dense_last_token_positional_mask"))(last_token)
+    last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
+    tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
 
-    positional_mask = Softmax(name=n('last_token_mask'))(last_token_positional_mask + tokenwise_positional_mask)
+    positional_mask = Softmax(name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
     return positional_mask
 
 def create_global_token(input_sequence, character_embedding_dim):
-    query_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('query_tokens'))(input_sequence)
-    global_token = ReduceSum(axis=1, keepdims=True, name=n('global_query'))(query_tokens)
+    query_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_query_tokens"))(input_sequence)
+    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens)
     
     return global_token
-
 
 def additive_self_attention(character_embedding_dim, num_heads):
     def apply_attention(input_sequence):
@@ -371,10 +368,10 @@ def additive_self_attention(character_embedding_dim, num_heads):
         if num_heads == 1:
             split_inputs = [input_sequence]
         else:
-            split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1))(input_sequence)
+            split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(input_sequence)
 
         last_token = input_sequence[:, -1, :]
-        last_token = Reshape((1, character_embedding_dim))(last_token)
+        last_token = Reshape((1, character_embedding_dim), name=n("reshape_last_token_attention"))(last_token)
 
         head_outputs = []
         for i in range(num_heads):
@@ -384,103 +381,98 @@ def additive_self_attention(character_embedding_dim, num_heads):
 
             masked_input_sequence = head_input_sequence * positional_mask
             
-            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
+            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_value_tokens_{i}"))(masked_input_sequence)
             global_token = create_global_token(masked_input_sequence, head_dim)
 
             queried_tokens = value_tokens * global_token
 
             head_outputs.append(queried_tokens)
 
-        queried_tokens = Concatenate(name=n("combine_heads"))(head_outputs)
+        queried_tokens = Concatenate(name=n("concatenate_heads"))(head_outputs)
 
-        output_tokens = Add(name=n("add_and_norm"))([queried_tokens, input_sequence])
-        output_tokens = LayerNormalization()(output_tokens)
+        output_tokens = Add(name=n("add_and_norm_attention"))([queried_tokens, input_sequence])
+        output_tokens = LayerNormalization(name=n("layer_norm_attention"))(output_tokens)
     
         return output_tokens
     
     return apply_attention
 
-
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
-        x = Conv1D(filters=character_embedding_dim*4, kernel_size=1, padding='same', activation=activation)(input_sequence)
-        x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(x)
-        x = Add(name=n("skip_around_ff"))([x, input_sequence])
-        x = LayerNormalization()(x)
+        x = Conv1D(filters=character_embedding_dim*4, kernel_size=1, padding='same', activation=activation, name=n("conv_ff_1"))(input_sequence)
+        x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_ff_2"))(x)
+        x = Add(name=n("add_ff"))([x, input_sequence])
+        x = LayerNormalization(name=n("layer_norm_ff"))(x)
         return x
 
     return apply_ff_layer
 
-
-######################################################################################################################################
-#-------------------------------------------------------------------------------------------------------------------------------------
-
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
     activation = 'leaky_relu'
 
-    inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32)
-    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
+    inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
+    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name=n("embedding_layer"))
     embedding = embedding_layer(inputs)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
 
-    # down to 1/4 of the original length
-    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(embedding)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None)(x)
-    x = LayerNormalization()(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
+    x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
-    most_recent_token = Reshape((1, character_embedding_dim))(x[:, -1, :])
+    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
 
-    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(most_recent_token)
-    x *= projection
+    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(most_recent_token)
+    x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
 
     for i in range(num_blocks):
-        x = Add(name=n("in_positional_encoding"))([x, positional_encoding])
+        x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation())(most_recent_token)
-        x = Multiply(name=n("merge_most_recent_token"))([x, most_recent_token_projection])
+        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
+        x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(character_embedding_dim, num_heads=4)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
-    residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation())(first_residual)
-    x += residual_conv
-    x += positional_encoding
+    residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
+    x = Add(name=n("add_residual_conv"))([x, residual_conv])
+    x = Add(name=n("add_positional_encoding_2"))([x, positional_encoding])
 
     num_reductions = 4
     reductions = []
     for i in range(num_reductions):
         positional_mask = create_combined_positional_mask(x)
-        masked_input_sequence = x * positional_mask
+        masked_input_sequence = Multiply(name=n("multiply_masked_input_sequence"))([x, positional_mask])
 
         final_query = create_global_token(masked_input_sequence, character_embedding_dim)
-        value_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
+        value_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_value_tokens_reduction_{i}"))(masked_input_sequence)
 
-        queried_values = Multiply(name=n('ASA_queried_values'))([value_tokens, final_query])
-        queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('ASA_output_projection'))(queried_values)
-        queried_values = LayerNormalization()(queried_values)
+        queried_values = Multiply(name=n('multiply_queried_values'))([value_tokens, final_query])
+        queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('conv_output_projection'))(queried_values)
+        queried_values = LayerNormalization(name=n("layer_norm_queried_values"))(queried_values)
 
-        final_sum = ReduceSum(axis=1, keepdims=True)(queried_values)
-        final_sum = Reshape((character_embedding_dim,))(final_sum)
-        reduction = Dense(character_embedding_dim, use_bias=False, activation=None)(final_sum)
+        final_sum = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_final"))(queried_values)
+        final_sum = Reshape((character_embedding_dim,), name=n("reshape_final_sum"))(final_sum)
+        reduction = Dense(character_embedding_dim, use_bias=False, activation=None, name=n("dense_reduction"))(final_sum)
         reductions.append(reduction)
 
-    reductions = Stack(axis=1)(reductions)
+    reductions = Lambda(lambda x: tf.stack(x, axis=1), name=n("stack_reductions"))(reductions)
 
-    x = Dense(character_embedding_dim*8, activation=activation)(Flatten()(reductions))
-    x = LayerNormalization()(x)
-    x = Dense(character_embedding_dim, activation=None)(x)
-    most_recent_token = Reshape((character_embedding_dim,))(most_recent_token)
+    x = Flatten(name=n("flatten_reductions"))(reductions)
+    x = Dense(character_embedding_dim*8, activation=activation, name=n("dense_final_1"))(x)
+    x = LayerNormalization(name=n("layer_norm_final"))(x)
+    x = Dense(character_embedding_dim, activation=None, name=n("dense_final_2"))(x)
+    most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
-    x += most_recent_token
+    x = Add(name=n("add_most_recent_token"))([x, most_recent_token])
 
-    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True))(x)
+    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
 
-    x = Softmax()(x)
+    x = Softmax(name=n("softmax_output"))(x)
 
-    model = tf.keras.Model(inputs=inputs, outputs=x)
+    model = tf.keras.Model(inputs=inputs, outputs=x, name="KermitLanguageModel")
     return model
 
 
