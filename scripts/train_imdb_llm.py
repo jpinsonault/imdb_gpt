@@ -440,16 +440,20 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Add(name=n("add_residual_conv"))([x, residual_conv])
     x = Add(name=n("add_positional_encoding_2"))([x, positional_encoding])
 
+    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
+
     num_reductions = 4
     reductions = []
     for i in range(num_reductions):
         positional_mask = create_combined_positional_mask(x)
         masked_input_sequence = Multiply(name=n("multiply_masked_input_sequence"))([x, positional_mask])
-
+        
         final_query = create_global_token(masked_input_sequence, character_embedding_dim)
         value_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_value_tokens_reduction_{i}"))(masked_input_sequence)
 
-        queried_values = Multiply(name=n('multiply_queried_values'))([value_tokens, final_query])
+        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
+
+        queried_values = Multiply(name=n('multiply_queried_values'))([value_tokens, final_query, most_recent_token_projection])
         queried_values = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n('conv_output_projection'))(queried_values)
         queried_values = LayerNormalization(name=n("layer_norm_queried_values"))(queried_values)
 
