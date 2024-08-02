@@ -206,39 +206,6 @@ class NextTokenAccuracy(tf.keras.metrics.Metric):
         self.total.assign(0.)
         self.count.assign(0.)
 
-def load_gutenberg_dataset(languages=None, book_ids=None):
-    """
-    Load the Gutenberg dataset for specified languages and book IDs.
-    
-    Args:
-    languages (list): List of language codes to include. If None, all languages are included.
-    book_ids (list): List of book IDs to include. If None, all books are included.
-    
-    Returns:
-    dataset: A filtered and concatenated dataset.
-    """
-    dataset = load_dataset("manu/project_gutenberg")
-    
-    if languages is None:
-        languages = list(dataset.keys())
-    else:
-        languages = [lang for lang in languages if lang in dataset.keys()]
-        if not languages:
-            raise ValueError("No valid languages specified.")
-    
-    filtered_datasets = []
-    for lang in languages:
-        lang_dataset = dataset[lang]
-        if book_ids:
-            lang_dataset = lang_dataset.filter(lambda example: example['id'] in book_ids)
-        filtered_datasets.append(lang_dataset)
-    
-    concatenated_dataset = concatenate_datasets(filtered_datasets)
-    print(f"Loaded Gutenberg dataset for languages: {', '.join(languages)}")
-    print(f"Total number of books: {len(concatenated_dataset)}")
-    
-    return concatenated_dataset
-
 
 def load_text_file_dataset(file_path, chunk_size=1024 * 1024):  # 1MB chunks
     def generate_chunks():
@@ -256,18 +223,9 @@ def load_text_file_dataset(file_path, chunk_size=1024 * 1024):  # 1MB chunks
     )
 
 def preprocess_text(text):
-    text = remove_gutenberg_headers_footers(text)
     text = remove_excessive_whitespace(text)
     return text
 
-def remove_gutenberg_headers_footers(text):
-    # Remove headers
-    header_regex = r"\*\*\* START OF (THE|THIS) PROJECT GUTENBERG EBOOK .* \*\*\*"
-    text = re.split(header_regex, text, 1)[-1]
-    # Remove footers
-    footer_regex = r"\*\*\* END OF (THE|THIS) PROJECT GUTENBERG EBOOK .* \*\*\*"
-    text = re.split(footer_regex, text, 1)[0]
-    return text
 
 def remove_excessive_whitespace(text):
     text = re.sub(r'\s+', ' ', text)
@@ -377,20 +335,23 @@ def additive_self_attention(character_embedding_dim, num_heads):
         for i in range(num_heads):
             head_input_sequence = split_inputs[i]
             
-            positional_mask = create_combined_positional_mask(input_sequence)
-
-            masked_input_sequence = head_input_sequence * positional_mask
+            input_positional_mask = create_combined_positional_mask(head_input_sequence)
+            masked_input_sequence = head_input_sequence * input_positional_mask
             
-            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_value_tokens_{i}"))(masked_input_sequence)
             global_token = create_global_token(masked_input_sequence, head_dim)
 
-            queried_tokens = value_tokens * global_token
+            queried_tokens = head_input_sequence * global_token
 
-            head_outputs.append(queried_tokens)
+            output_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_output_tokens_{i}"))(queried_tokens)
+            output_positional_mask = create_combined_positional_mask(output_tokens)
 
-        queried_tokens = Concatenate(name=n("concatenate_heads"))(head_outputs)
+            output_tokens = queried_tokens * output_positional_mask
 
-        output_tokens = Add(name=n("add_and_norm_attention"))([queried_tokens, input_sequence])
+            head_outputs.append(output_tokens)
+
+        head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
+
+        output_tokens = Add(name=n("add_and_norm_attention"))([head_outputs, input_sequence])
         output_tokens = LayerNormalization(name=n("layer_norm_attention"))(output_tokens)
     
         return output_tokens
@@ -406,6 +367,11 @@ def ff_layer(character_embedding_dim, activation):
         return x
 
     return apply_ff_layer
+
+
+######################################################################################################################################
+#-------------------------------------------------------------------------------------------------------------------------------------
+#.....................................................................................................................................
 
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4):
     activation = 'leaky_relu'
@@ -445,8 +411,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     num_reductions = 4
     reductions = []
     for i in range(num_reductions):
-        positional_mask = create_combined_positional_mask(x)
-        masked_input_sequence = Multiply(name=n("multiply_masked_input_sequence"))([x, positional_mask])
+        input_positional_mask = create_combined_positional_mask(x)
+        masked_input_sequence = Multiply(name=n("multiply_masked_input_sequence"))([x, input_positional_mask])
         
         final_query = create_global_token(masked_input_sequence, character_embedding_dim)
         value_tokens = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_value_tokens_reduction_{i}"))(masked_input_sequence)
@@ -480,6 +446,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     return model
 
 
+#......................................................................................................................................
 #-------------------------------------------------------------------------------------------------------------------------------------
 ######################################################################################################################################
 
