@@ -301,15 +301,21 @@ def sinusoidal_encoding(input_length, embedding_dim):
     
     return pos_encoding
 
-def create_combined_positional_mask(input_sequence):
+def create_combined_positional_mask(input_sequence, context_token=None):
     last_token = Reshape((1, input_sequence.shape[-1]), name=n("reshape_last_token"))(input_sequence[:, -1, :])
+
     input_length = input_sequence.shape[1]
 
     last_token_positional_mask = Dense(input_length, activation=None, name=n("dense_last_token_positional_mask"))(last_token)
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
     tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
 
-    positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
+    if context_token is not None:
+        context_token_positional_mask = Dense(input_length, activation=None, name=n("dense_context_token_positional_mask"))(context_token)
+        positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask + context_token_positional_mask)
+    else:
+        positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
+
     return positional_mask
 
 def create_global_token(input_sequence, character_embedding_dim):
@@ -333,14 +339,14 @@ def additive_self_attention(character_embedding_dim, num_heads):
 
         head_outputs = []
         for i in range(num_heads):
-            head_input_sequence = split_inputs[i]
+            head_input_tokens = split_inputs[i]
             
-            input_positional_mask = create_combined_positional_mask(head_input_sequence)
-            masked_input_sequence = head_input_sequence * input_positional_mask
+            input_positional_mask = create_combined_positional_mask(head_input_tokens)
+            masked_input_sequence = head_input_tokens * input_positional_mask
             
             global_token = create_global_token(masked_input_sequence, head_dim)
 
-            queried_tokens = head_input_sequence * global_token
+            queried_tokens = masked_input_sequence * global_token
 
             output_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_output_tokens_{i}"))(queried_tokens)
 
