@@ -341,16 +341,16 @@ def additive_self_attention(character_embedding_dim, num_heads):
         for i in range(num_heads):
             head_input_tokens = split_inputs[i]
             
-            input_positional_mask = create_combined_positional_mask(head_input_tokens)
+            input_positional_mask = create_combined_positional_mask(head_input_tokens)            
+
             masked_input_sequence = head_input_tokens * input_positional_mask
-            
-            global_token = create_global_token(masked_input_sequence, head_dim)
 
-            queried_tokens = masked_input_sequence * global_token
+            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
+            global_query = create_global_token(masked_input_sequence, head_dim)
 
-            output_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n(f"conv_output_tokens_{i}"))(queried_tokens)
+            queried_values = value_tokens * global_query
 
-            head_outputs.append(output_tokens)
+            head_outputs.append(queried_values)
 
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
 
