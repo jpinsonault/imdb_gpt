@@ -358,15 +358,7 @@ def additive_self_attention(character_embedding_dim, num_heads):
                 queried_tokens, conv_weights = x
                 return tf.einsum('bij,bjk->bik', queried_tokens, conv_weights)
 
-            value_tokens = Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(queried_tokens.shape[1], head_dim))([queried_tokens, conv_weights])
-
-            output_positional_mask = create_combined_positional_mask(queried_tokens)
-
-            channel_masks = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation='sigmoid', name=n("conv_channel_masks"))(queried_tokens)
-            channel_masks = Softmax(axis=1, name=n("softmax_channel_masks"))(channel_masks)
-
-            output_tokens = value_tokens * channel_masks
-            output_tokens = output_tokens * output_positional_mask
+            output_tokens = Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(queried_tokens.shape[1], head_dim))([queried_tokens, conv_weights])
 
             head_outputs.append(output_tokens)
 
