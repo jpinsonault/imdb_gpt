@@ -324,9 +324,9 @@ def create_global_token(input_sequence, character_embedding_dim):
     
     return global_token
 
+
 def additive_self_attention(character_embedding_dim, num_heads):
     def apply_attention(input_sequence):
-
         head_dim = character_embedding_dim // num_heads
 
         if num_heads == 1:
@@ -345,7 +345,20 @@ def additive_self_attention(character_embedding_dim, num_heads):
             global_query = create_global_token(masked_input_tokens, head_dim)
 
             queried_tokens = head_input_tokens * global_query
-            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(queried_tokens)
+            tf.print(f"queried_tokens: {queried_tokens.shape}")
+            
+            # Generate convolutional weights from the global token
+            weights_dim = head_dim * head_input_tokens.shape[-1]
+            tf.print(f"weights_dim: {weights_dim}, head_dim: {head_dim}, head_input_tokens.shape[-1]: {head_input_tokens.shape[-1]}")
+            conv_weights = Dense(weights_dim, activation=None, name=n("dense_conv_weights"))(global_query)
+            conv_weights = Reshape((head_input_tokens.shape[-1], head_dim), name=n("reshape_conv_weights"))(conv_weights)
+            
+            # Apply the einsum operation using the generated weights
+            def dynamic_einsum(x):
+                queried_tokens, conv_weights = x
+                return tf.einsum('bij,bjk->bik', queried_tokens, conv_weights)
+
+            value_tokens = Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(queried_tokens.shape[1], head_dim))([queried_tokens, conv_weights])
 
             output_positional_mask = create_combined_positional_mask(queried_tokens)
 
@@ -365,7 +378,11 @@ def additive_self_attention(character_embedding_dim, num_heads):
         return output_tokens
     
     return apply_attention
-
+    return apply_attention
+    
+    return apply_attention
+    
+    return apply_attention
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
         x = Conv1D(filters=character_embedding_dim*4, kernel_size=1, padding='same', activation=activation, name=n("conv_ff_1"))(input_sequence)
