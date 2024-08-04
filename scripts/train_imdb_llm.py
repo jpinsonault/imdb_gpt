@@ -301,7 +301,7 @@ def sinusoidal_encoding(input_length, embedding_dim):
     
     return pos_encoding
 
-def create_combined_positional_mask(input_sequence, context_token=None):
+def create_combined_positional_mask(input_sequence):
     last_token = Reshape((1, input_sequence.shape[-1]), name=n("reshape_last_token"))(input_sequence[:, -1, :])
 
     input_length = input_sequence.shape[1]
@@ -310,11 +310,7 @@ def create_combined_positional_mask(input_sequence, context_token=None):
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
     tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
 
-    if context_token is not None:
-        context_token_positional_mask = Dense(input_length, activation=None, name=n("dense_context_token_positional_mask"))(context_token)
-        positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask + context_token_positional_mask)
-    else:
-        positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
+    positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
 
     return positional_mask
 
@@ -370,11 +366,8 @@ def additive_self_attention(character_embedding_dim, num_heads):
         return output_tokens
     
     return apply_attention
-    return apply_attention
-    
-    return apply_attention
-    
-    return apply_attention
+
+
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
         x = Conv1D(filters=character_embedding_dim*4, kernel_size=1, padding='same', activation=activation, name=n("conv_ff_1"))(input_sequence)
