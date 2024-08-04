@@ -334,23 +334,28 @@ def additive_self_attention(character_embedding_dim, num_heads):
         else:
             split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(input_sequence)
 
-        last_token = input_sequence[:, -1, :]
-        last_token = Reshape((1, character_embedding_dim), name=n("reshape_last_token_attention"))(last_token)
-
         head_outputs = []
         for i in range(num_heads):
             head_input_tokens = split_inputs[i]
             
             input_positional_mask = create_combined_positional_mask(head_input_tokens)            
 
-            masked_input_sequence = head_input_tokens * input_positional_mask
+            masked_input_tokens = head_input_tokens * input_positional_mask
 
-            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(masked_input_sequence)
-            global_query = create_global_token(masked_input_sequence, head_dim)
+            global_query = create_global_token(masked_input_tokens, head_dim)
 
-            queried_values = value_tokens * global_query
+            queried_tokens = head_input_tokens * global_query
+            value_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None)(queried_tokens)
 
-            head_outputs.append(queried_values)
+            output_positional_mask = create_combined_positional_mask(queried_tokens)
+
+            channel_masks = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation='sigmoid', name=n("conv_channel_masks"))(queried_tokens)
+            channel_masks = Softmax(axis=1, name=n("softmax_channel_masks"))(channel_masks)
+
+            output_tokens = value_tokens * channel_masks
+            output_tokens = output_tokens * output_positional_mask
+
+            head_outputs.append(output_tokens)
 
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
 
