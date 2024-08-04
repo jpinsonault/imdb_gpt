@@ -321,6 +321,19 @@ def create_global_token(input_sequence, character_embedding_dim):
     return global_token
 
 
+def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
+    input_dim = input_tokens.shape[-1]
+
+    conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
+    conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
+
+    def dynamic_einsum(x):
+        input_tokens, conv_weights = x
+        return tf.einsum('bij,bjk->bik', input_tokens, conv_weights)
+    
+    return Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(input_tokens.shape[1], output_dim))([input_tokens, conv_weights])
+
+
 def additive_self_attention(character_embedding_dim, num_heads):
     def apply_attention(input_sequence):
         head_dim = character_embedding_dim // num_heads
@@ -343,18 +356,7 @@ def additive_self_attention(character_embedding_dim, num_heads):
             queried_tokens = head_input_tokens * global_query
             tf.print(f"queried_tokens: {queried_tokens.shape}")
             
-            # Generate convolutional weights from the global token
-            weights_dim = head_dim * head_input_tokens.shape[-1]
-            tf.print(f"weights_dim: {weights_dim}, head_dim: {head_dim}, head_input_tokens.shape[-1]: {head_input_tokens.shape[-1]}")
-            conv_weights = Dense(weights_dim, activation=None, name=n("dense_conv_weights"))(global_query)
-            conv_weights = Reshape((head_input_tokens.shape[-1], head_dim), name=n("reshape_conv_weights"))(conv_weights)
-            
-            # Apply the einsum operation using the generated weights
-            def dynamic_einsum(x):
-                queried_tokens, conv_weights = x
-                return tf.einsum('bij,bjk->bik', queried_tokens, conv_weights)
-
-            output_tokens = Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(queried_tokens.shape[1], head_dim))([queried_tokens, conv_weights])
+            output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
 
             head_outputs.append(output_tokens)
 
