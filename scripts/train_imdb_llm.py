@@ -308,8 +308,7 @@ def create_combined_positional_mask(input_sequence):
 
     last_token_positional_mask = Dense(input_length, activation=None, name=n("dense_last_token_positional_mask"))(last_token)
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
-
-    tokenwise_positional_mask = dynamic_1x1_convolution(input_sequence, last_token, output_dim=1)
+    tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
 
     positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
 
@@ -324,8 +323,6 @@ def create_global_token(input_sequence, character_embedding_dim):
 
 def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
     input_dim = input_tokens.shape[-1]
-
-    tf.print(f"shapes: {input_tokens.shape}, {context_token.shape}, input_dim: {input_dim}, output_dim: {output_dim}")
 
     conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
     conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
@@ -356,7 +353,7 @@ def additive_self_attention(character_embedding_dim, num_heads):
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
-            queried_tokens = head_input_tokens * global_query
+            queried_tokens = masked_input_tokens * global_query
             tf.print(f"queried_tokens: {queried_tokens.shape}")
             
             output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
