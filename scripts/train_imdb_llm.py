@@ -325,6 +325,8 @@ def create_global_token(input_sequence, character_embedding_dim):
 def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
     input_dim = input_tokens.shape[-1]
 
+    tf.print(f"shapes: {input_tokens.shape}, {context_token.shape}")
+
     conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
     conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
 
