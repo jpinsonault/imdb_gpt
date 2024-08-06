@@ -324,7 +324,7 @@ def create_global_token(input_sequence, token_dim):
 def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
     input_dim = input_tokens.shape[-1]
 
-    conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
+    conv_weights = Dense(input_dim * output_dim, activation=SinActivation(), name=n("dense_conv_weights"))(context_token)
     conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
 
     def dynamic_einsum(x):
@@ -434,7 +434,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         queried_tokens = head_input_tokens * global_query
         
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
+        most_recent_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
         output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=most_recent_token_projection, output_dim=head_dim)
         global_query = create_global_token(output_tokens, head_dim)
 
