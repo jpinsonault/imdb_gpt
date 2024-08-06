@@ -444,7 +444,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     # head_outputs = Reshape((1, character_embedding_dim), name=n("reshape_heads"))(head_outputs)
     most_recent_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
 
-    self_attended_output = dynamic_1x1_convolution(head_outputs, most_recent_token_projection, character_embedding_dim)
+    self_attended_output = dynamic_1x1_convolution(head_outputs, head_outputs, character_embedding_dim)
+    self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
