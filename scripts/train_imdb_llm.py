@@ -362,7 +362,6 @@ def additive_self_attention(character_embedding_dim, num_heads):
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
 
         output_tokens = Add(name=n("add_and_norm_attention"))([head_outputs, input_sequence])
-        output_tokens = LayerNormalization(name=n("layer_norm_attention"))(output_tokens)
     
         return output_tokens
     
