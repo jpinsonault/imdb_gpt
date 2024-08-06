@@ -326,6 +326,7 @@ def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
 
     conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
     conv_weights = LayerNormalization(name=n("layer_norm_conv_weights"))(conv_weights)
+    conv_weights *= 2
     conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
 
     def dynamic_einsum(x):
