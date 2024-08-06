@@ -354,7 +354,6 @@ def additive_self_attention(character_embedding_dim, num_heads):
             global_query = create_global_token(masked_input_tokens, head_dim)
 
             queried_tokens = masked_input_tokens * global_query
-            tf.print(f"queried_tokens: {queried_tokens.shape}")
             
             output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
 
@@ -433,8 +432,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         global_query = create_global_token(masked_input_tokens, head_dim)
 
-        queried_tokens = masked_input_tokens * global_query
-        tf.print(f"queried_tokens: {queried_tokens.shape}")
+        queried_tokens = head_input_tokens * global_query
         
         output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
         global_query = create_global_token(output_tokens, head_dim)
@@ -442,6 +440,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         head_outputs.append(global_query)
 
     head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
+    # head_outputs = Reshape((1, character_embedding_dim), name=n("reshape_heads"))(head_outputs)w
 
     x = Flatten(name=n("flatten_reductions"))(head_outputs)
     x = Dense(character_embedding_dim*8, activation=activation, name=n("dense_final_1"))(x)
