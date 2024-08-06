@@ -444,14 +444,10 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     # head_outputs = Reshape((1, character_embedding_dim), name=n("reshape_heads"))(head_outputs)
 
     self_attended_output = dynamic_1x1_convolution(head_outputs, head_outputs, character_embedding_dim)
-
-    x = Flatten(name=n("flatten_reductions"))(self_attended_output)
-    x = Dense(character_embedding_dim*8, activation=activation, name=n("dense_final_1"))(x)
-    x = LayerNormalization(name=n("layer_norm_final"))(x)
-    x = Dense(character_embedding_dim, activation=None, name=n("dense_final_2"))(x)
+    self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
-    x = Add(name=n("add_most_recent_token"))([x, most_recent_token])
+    x = Add(name=n("add_most_recent_token"))([self_attended_output, most_recent_token])
 
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
 
