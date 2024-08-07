@@ -356,7 +356,6 @@ def dynamic_self_attention_with_heads(input_vector, num_heads):
 
     weight_matrix = Concatenate(axis=-1)(head_weights)
     weight_matrix = Reshape((input_dim, input_dim))(weight_matrix)
-    weight_matrix = Permute((2, 1))(weight_matrix)
 
     reshaped_input = Reshape((1, input_dim))(input_vector)
     output = CustomDense()([reshaped_input, weight_matrix])
