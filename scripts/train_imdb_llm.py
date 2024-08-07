@@ -350,7 +350,7 @@ def dynamic_self_attention_with_heads(input_vector, num_heads):
         head_weights = Dense(head_dim * input_dim, activation=None, name=n("dense_head_weights"))(head_input)
         return head_weights
 
-    head_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name="lambda_split_heads")(input_vector)
+    head_inputs = [Dense(head_dim, activation=None, name=n("dense_head_input"))(input_vector) for _ in range(num_heads)]
 
     head_weights = [generate_head_weights(head_input) for head_input in head_inputs]
 
