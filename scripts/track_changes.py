@@ -65,9 +65,6 @@ def generate_commit_message(diff, recent_commits, file_contents, folder_name) ->
     File contents:
     {file_contents_str}
 
-    Recent commit history:
-    {commit_history_str}
-
     Git diff: {diff}
     """
 
