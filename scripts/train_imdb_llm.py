@@ -382,11 +382,9 @@ def additive_self_attention(character_embedding_dim, num_heads):
             masked_input_tokens = head_input_tokens * input_positional_mask
 
             global_query = create_global_token(masked_input_tokens, head_dim)
-            global_query = Reshape((head_dim,), name=n("reshape_global_query"))(global_query)
-            global_query = dynamic_self_attention(global_query, hidden_dim=head_dim)
-            global_query = Reshape((1, head_dim), name=n("reshape_global_query_2"))(global_query)
 
             global_context = Dense(head_dim, use_bias=True, activation='leaky_relu', name=n("dense_global_context"))(Concatenate(name=n("concatenate_global_context"))([global_query, last_token]))
+            global_context = dynamic_self_attention(global_context, hidden_dim=head_dim)
 
             queried_tokens = masked_input_tokens * global_query
             
