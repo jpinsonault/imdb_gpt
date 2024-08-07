@@ -433,7 +433,7 @@ def ff_layer(character_embedding_dim, activation):
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=8):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=4):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
@@ -495,14 +495,13 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
     self_attended_output = dynamic_self_attention(head_outputs, hidden_dim=character_embedding_dim//2)
-    self_attended_output = Activation('leaky_relu', name=n("leaky_relu_self_attention"))(self_attended_output)
-    self_attended_output = LayerNormalization(name=n("layer_norm_self_attention"))(self_attended_output)
-    self_attended_output = dynamic_self_attention(self_attended_output, hidden_dim=character_embedding_dim//2)
-    self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
-    self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
+
+    output = Dense(character_embedding_dim*8, activation=activation, name=n("dense_output"))(self_attended_output)
+    output = Dense(character_embedding_dim, activation=None, name=n("dense_output_final"))(output)
+
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
-    x = Add(name=n("add_most_recent_token"))([self_attended_output, most_recent_token])
+    x = Add(name=n("add_most_recent_token"))([output, most_recent_token])
 
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
 
