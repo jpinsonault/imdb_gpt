@@ -501,7 +501,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
 
-    self_attended_output = dynamic_self_attention_with_heads(head_outputs, num_heads=4)
+    self_attended_output = dynamic_self_attention_with_heads(head_outputs, num_heads=1)
     print(self_attended_output.shape)
     self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
