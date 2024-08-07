@@ -346,6 +346,8 @@ def additive_self_attention(character_embedding_dim, num_heads):
         head_outputs = []
         for i in range(num_heads):
             head_input_tokens = split_inputs[i]
+
+            last_token = Reshape((1, head_dim), name=n("reshape_last_token"))(head_input_tokens[:, -1, :])
             
             input_positional_mask = create_combined_positional_mask(head_input_tokens)            
 
@@ -353,9 +355,11 @@ def additive_self_attention(character_embedding_dim, num_heads):
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
+            global_context = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_global_context"))(Concatenate(name=n("concatenate_global_context"))([global_query, last_token]))
+
             queried_tokens = masked_input_tokens * global_query
             
-            output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
+            output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_context, output_dim=head_dim)
 
             head_outputs.append(output_tokens)
 
@@ -442,6 +446,9 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     # head_outputs = Reshape((1, character_embedding_dim), name=n("reshape_heads"))(head_outputs)
+
+
+    ## TODO try this without the sin activation as context for the dynamic 1x1 convolution
     most_recent_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
 
     self_attended_output = dynamic_1x1_convolution(head_outputs, head_outputs, character_embedding_dim)
