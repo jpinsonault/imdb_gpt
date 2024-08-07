@@ -361,6 +361,24 @@ def dynamic_self_attention(input_vector, hidden_dim):
 
     return output
 
+def attention_cross_attention(input_vector, context_vector, hidden_dim):
+    vector_dim = input_vector.shape[-1]
+    
+    def generate_weights(context_vec):
+        weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(context_vec)
+        return weights
+    
+    reduced_context = Dense(hidden_dim, activation=None, name=n("dense_reduced_context"))(context_vector)
+    weight_matrix = generate_weights(reduced_context)
+
+    weight_matrix = Reshape((vector_dim, vector_dim))(weight_matrix)
+
+    reshaped_input = Reshape((1, vector_dim))(input_vector)
+    output = Lambda(lambda x: tf.matmul(x[0], x[1]), name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
+    output = Reshape((vector_dim,), name=n("attention_output"))(output)
+
+    return output
+
 
 def additive_self_attention(character_embedding_dim, num_heads):
     def apply_attention(input_sequence):
@@ -384,7 +402,10 @@ def additive_self_attention(character_embedding_dim, num_heads):
             global_query = create_global_token(masked_input_tokens, head_dim)
 
             global_context = Dense(head_dim, use_bias=True, activation='leaky_relu', name=n("dense_global_context"))(Concatenate(name=n("concatenate_global_context"))([global_query, last_token]))
+            residual_global_context = global_context
             global_context = dynamic_self_attention(global_context, hidden_dim=head_dim)
+            global_context = Add(name=n("add_global_context"))([global_context, residual_global_context])
+
 
             queried_tokens = masked_input_tokens * global_query
             
