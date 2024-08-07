@@ -433,7 +433,7 @@ def ff_layer(character_embedding_dim, activation):
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=8):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=4):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
