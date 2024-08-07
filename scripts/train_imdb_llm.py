@@ -346,36 +346,21 @@ def dynamic_self_attention_with_heads(input_vector, num_heads):
     input_dim = input_vector.shape[-1]
     head_dim = input_dim // num_heads
     
-    print(f"Input vector shape: {input_vector.shape}")
-    print(f"Input dimension: {input_dim}")
-    print(f"Number of heads: {num_heads}")
-    print(f"Dimension per head: {head_dim}")
-
     def generate_head_weights(head_input):
-        print(f"Head input shape: {head_input.shape}")
         head_weights = Dense(head_dim * input_dim, activation=None, name=n("dense_head_weights"))(head_input)
-        print(f"Head weights shape: {head_weights.shape}")
         return head_weights
 
     head_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name="lambda_split_heads")(input_vector)
-    print(f"Head inputs length: {len(head_inputs)}")
-    for i, head_input in enumerate(head_inputs):
-        print(f"Head input {i} shape: {head_input.shape}")
 
     head_weights = [generate_head_weights(head_input) for head_input in head_inputs]
-    for i, head_weight in enumerate(head_weights):
-        print(f"Head weight {i} shape: {head_weight.shape}")
 
     weight_matrix = Concatenate(axis=-1)(head_weights)
-    print(f"Weight matrix shape after concatenation: {weight_matrix.shape}")
-
     weight_matrix = Reshape((input_dim, input_dim))(weight_matrix)
-    print(f"Weight matrix shape after reshaping: {weight_matrix.shape}")
+    weight_matrix = Permute((2, 1))(weight_matrix)
 
     reshaped_input = Reshape((1, input_dim))(input_vector)
     output = CustomDense()([reshaped_input, weight_matrix])
     output = Reshape((input_dim,), name=n("self_attention_output"))(output)
-    print(f"Output shape: {output.shape}")
 
     return output
 
@@ -501,7 +486,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
 
-    self_attended_output = dynamic_self_attention_with_heads(head_outputs, num_heads=1)
+    self_attended_output = dynamic_self_attention_with_heads(head_outputs, num_heads=4)
     print(self_attended_output.shape)
     self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
