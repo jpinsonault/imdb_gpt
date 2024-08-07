@@ -349,8 +349,7 @@ def dynamic_self_attention(input_vector, reduced_dim):
         weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(input_vec)
         return weights
     
-    reduced_input = Dense(reduced_dim, activation=None, name=n("dense_reduced_input"))(input_vector)
-    reduced_input = LayerNormalization(name=n("layer_norm_reduced_input"))(reduced_input)
+    reduced_input = Dense(reduced_dim, activation=SinActivation(), name=n("dense_reduced_input"))(input_vector)
 
     weight_matrix = generate_weights(reduced_input)
 
