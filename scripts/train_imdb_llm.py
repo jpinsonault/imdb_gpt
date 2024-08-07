@@ -350,6 +350,7 @@ def dynamic_self_attention(input_vector, reduced_dim):
         return weights
     
     reduced_input = Dense(reduced_dim, activation=None, name=n("dense_reduced_input"))(input_vector)
+    reduced_input = LayerNormalization(name=n("layer_norm_reduced_input"))(reduced_input)
 
     weight_matrix = generate_weights(reduced_input)
 
@@ -462,6 +463,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         masked_input_tokens = head_input_tokens * input_positional_mask
 
         global_query = create_global_token(masked_input_tokens, head_dim)
+        # global_query = dynamic_self_attention(global_query, reduced_dim=head_dim)
 
         queried_tokens = head_input_tokens * global_query
         
@@ -475,9 +477,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-
     self_attended_output = dynamic_self_attention(head_outputs, reduced_dim=character_embedding_dim//2)
-    print(self_attended_output.shape)
     self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
