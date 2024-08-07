@@ -495,6 +495,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
     self_attended_output = dynamic_self_attention(head_outputs, hidden_dim=character_embedding_dim//2)
+    self_attended_output = Activation('leaky_relu', name=n("leaky_relu_self_attention"))(self_attended_output)
+    self_attended_output = dynamic_self_attention(self_attended_output, hidden_dim=character_embedding_dim//2)
     self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
