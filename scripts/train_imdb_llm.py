@@ -342,33 +342,24 @@ class CustomDense(Layer):
         return tf.matmul(inputs, weight_matrix)
 
 
-def dynamic_self_attention_with_heads(input_vector, num_heads):
-    input_dim = input_vector.shape[-1]
-    head_dim = input_dim // num_heads
+def dynamic_self_attention(input_vector, reduced_dim):
+    vector_dim = input_vector.shape[-1]
     
-    def generate_head_weights(head_input):
-        head_weights = Dense(head_dim * input_dim, activation=None, name=n("dense_head_weights"))(head_input)
-        return head_weights
+    def generate_weights(input_vec):
+        weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(input_vec)
+        return weights
+    
+    reduced_input = Dense(reduced_dim, activation=None, name=n("dense_reduced_input"))(input_vector)
 
-    head_inputs = [Dense(head_dim, activation=None, name=n("dense_head_input"))(input_vector) for _ in range(num_heads)]
+    weight_matrix = generate_weights(reduced_input)
 
-    head_weights = [generate_head_weights(head_input) for head_input in head_inputs]
+    weight_matrix = Reshape((vector_dim, vector_dim))(weight_matrix)
 
-    weight_matrix = Concatenate(axis=-1)(head_weights)
-    weight_matrix = Reshape((input_dim, input_dim))(weight_matrix)
-
-    reshaped_input = Reshape((1, input_dim))(input_vector)
-    output = CustomDense()([reshaped_input, weight_matrix])
-    output = Reshape((input_dim,), name=n("self_attention_output"))(output)
+    reshaped_input = Reshape((1, vector_dim))(input_vector)
+    output = Lambda(lambda x: tf.matmul(x[0], x[1]), name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
+    output = Reshape((vector_dim,), name=n("self_attention_output"))(output)
 
     return output
-
-# Test the function
-input_vector = tf.random.uniform((1, 128))
-num_heads = 4
-output_vector = dynamic_self_attention_with_heads(input_vector, num_heads)
-print(f"Output vector shape: {output_vector.shape}")
-
 
 
 def additive_self_attention(character_embedding_dim, num_heads):
@@ -485,7 +476,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
 
-    self_attended_output = dynamic_self_attention_with_heads(head_outputs, num_heads=4)
+    self_attended_output = dynamic_self_attention(head_outputs, reduced_dim=character_embedding_dim//2)
     print(self_attended_output.shape)
     self_attended_output = Add(name=n("self_attention_residual"))([self_attended_output, head_outputs])
     self_attended_output = Reshape((character_embedding_dim,), name=n("reshape_self_attended_output"))(self_attended_output)
