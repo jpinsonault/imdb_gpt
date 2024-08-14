@@ -349,9 +349,9 @@ def dynamic_self_attention(input_vector, hidden_dim):
         weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(input_vec)
         return weights
     
-    reduced_input = Dense(hidden_dim, activation=None, name=n("dense_reduced_input"))(input_vector)
+    squeezed_input = Dense(hidden_dim, activation=None, name=n("dense_squeezed_input"))(input_vector)
 
-    weight_matrix = generate_weights(reduced_input)
+    weight_matrix = generate_weights(squeezed_input)
 
     weight_matrix = Reshape((vector_dim, vector_dim))(weight_matrix)
 
@@ -429,6 +429,72 @@ def ff_layer(character_embedding_dim, activation):
     return apply_ff_layer
 
 
+
+def moe_1x1_projection(input_tokens, num_experts):
+    D = tf.shape(input_tokens)[-1]  # Dimension of the tokens
+
+    # Create E learned square D*D weight matrices (the experts)
+    expert_weights = [tf.Variable(tf.random.normal([D, D]), name=f"expert_{i}_weight") for i in range(num_experts)]
+
+    def apply_moe_layer(input_sequence):
+        # Project each token to E scores using a Dense layer
+        expert_scores = Dense(num_experts, use_bias=False, name="expert_score_projection")(input_sequence)
+        
+        # Sum along the channel dimension to get E scores
+        expert_scores_summed = tf.reduce_sum(expert_scores, axis=-1)
+        
+        # Softmax the scores
+        expert_scores_softmax = Softmax(name="expert_score_softmax")(expert_scores_summed)
+        
+        # Multiply the expert weight matrices by the scores and sum them up
+        weighted_experts = [score * weight for score, weight in zip(tf.unstack(expert_scores_softmax, axis=-1), expert_weights)]
+        combined_weight_matrix = tf.add_n(weighted_experts)
+        
+        # Use the combined weight matrix as the 1x1 projection for each token
+        projected_tokens = tf.matmul(input_sequence, combined_weight_matrix)
+        
+        return projected_tokens
+
+    return apply_moe_layer
+
+
+def moe_self_attention(input_vector, hidden_dim, num_experts):
+    vector_dim = input_vector.shape[-1]
+    
+    # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, vector_dim)
+    expert_weights = [tf.Variable(tf.random.normal([vector_dim, vector_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
+    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
+    
+    def generate_weights(input_vec):
+        # Project the input vector to a set of scores for the experts
+        expert_scores = Dense(num_experts, activation=None, name="expert_score_projection")(input_vec)
+        expert_scores_softmax = Softmax(name="expert_score_softmax")(expert_scores)
+        
+        # Reshape the softmax scores to match the shape needed for multiplication (num_experts,)
+        expert_scores_softmax = Lambda(lambda x: tf.expand_dims(x, axis=-1))(expert_scores_softmax)
+        
+        # Multiply and sum using einsum or broadcasting
+        combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=0))([expert_scores_softmax, expert_weights])
+        
+        return combined_weight_matrix
+    
+    # Squeeze the input vector to a hidden dimension
+    squeezed_input = Dense(hidden_dim, activation=None, name="dense_squeezed_input")(input_vector)
+
+    # Generate the dynamic weight matrix using the MoE approach
+    weight_matrix = generate_weights(squeezed_input)
+
+    # Reshape the input vector for matrix multiplication
+    reshaped_input = Reshape((1, vector_dim))(input_vector)
+    
+    # Apply the dynamic weight matrix to the input vector
+    output = Lambda(lambda x: tf.matmul(x[0], x[1]), name="lambda_matmul_attention")([reshaped_input, weight_matrix])
+    output = Reshape((vector_dim,), name="self_attention_output")(output)
+
+    return output
+
+
+
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
@@ -494,7 +560,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-    self_attended_output = dynamic_self_attention(head_outputs, hidden_dim=character_embedding_dim//2)
+    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, num_experts=1)
 
     output = Dense(character_embedding_dim*8, activation=activation, name=n("dense_output"))(self_attended_output)
     output = Dense(character_embedding_dim, activation=None, name=n("dense_output_final"))(output)
