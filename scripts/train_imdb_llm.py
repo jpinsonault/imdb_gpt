@@ -562,12 +562,9 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, num_experts=1)
 
-    output = Dense(character_embedding_dim*8, activation=activation, name=n("dense_output"))(self_attended_output)
-    output = Dense(character_embedding_dim, activation=None, name=n("dense_output_final"))(output)
-
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
-    x = Add(name=n("add_most_recent_token"))([output, most_recent_token])
+    x = Add(name=n("add_most_recent_token"))([self_attended_output, most_recent_token])
 
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
 
