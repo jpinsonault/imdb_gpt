@@ -591,9 +591,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     self_attended_last_token += residual
     tf.print(f"shapes of everything:\nhead_outputs: {head_outputs.shape}\nself_attended_output: {self_attended_output.shape}\nself_attended_last_token: {self_attended_last_token.shape}")
 
-    x = Add(name=n("add_last_token"))([self_attended_output, self_attended_last_token])
-
-    x = LayerNormalization(name=n("layer_norm_final"))(x)
+    x = self_attended_last_token
 
     # Perform matrix multiplication with embeddings
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
