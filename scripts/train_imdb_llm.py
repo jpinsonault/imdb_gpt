@@ -458,7 +458,7 @@ def moe_1x1_projection(input_tokens, num_experts):
     return apply_moe_layer
 
 
-def moe_self_attention(input_vector, hidden_dim, num_experts):
+def moe_self_attention(input_vector, hidden_dim, num_experts, activation=None):
     vector_dim = input_vector.shape[-1]
     
     # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, vector_dim)
@@ -496,6 +496,9 @@ def moe_self_attention(input_vector, hidden_dim, num_experts):
     output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
                     output_shape=(1, vector_dim),
                     name="lambda_matmul_attention")([reshaped_input, weight_matrix])
+    
+    if activation is not None:
+        output = Activation(activation, name="self_attention_activation")(output)
     
     output = Reshape((vector_dim,), name="self_attention_output")(output)
 
@@ -568,7 +571,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, num_experts=16)
+    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, activation=activation, num_experts=16)
 
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
 
