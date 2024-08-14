@@ -582,16 +582,16 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, activation=activation, num_experts=16)
+    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim*4, activation=activation, num_experts=16)
     self_attended_output += head_outputs
 
-    self_attended_last_token = Reshape((character_embedding_dim,), name=n("reshape_last_token_final"))(last_token)
-    residual = self_attended_last_token
-    self_attended_last_token = moe_self_attention(self_attended_last_token, hidden_dim=character_embedding_dim, activation=None, num_experts=16)
-    self_attended_last_token += residual
-    tf.print(f"shapes of everything:\nhead_outputs: {head_outputs.shape}\nself_attended_output: {self_attended_output.shape}\nself_attended_last_token: {self_attended_last_token.shape}")
+    # self_attended_last_token = Reshape((character_embedding_dim,), name=n("reshape_last_token_final"))(last_token)
+    # residual = self_attended_last_token
+    # self_attended_last_token = moe_self_attention(self_attended_last_token, hidden_dim=character_embedding_dim, activation=None, num_experts=16)
+    # self_attended_last_token += residual
+    # tf.print(f"shapes of everything:\nhead_outputs: {head_outputs.shape}\nself_attended_output: {self_attended_output.shape}\nself_attended_last_token: {self_attended_last_token.shape}")
 
-    x = self_attended_last_token
+    x = self_attended_output
 
     # Perform matrix multiplication with embeddings
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
