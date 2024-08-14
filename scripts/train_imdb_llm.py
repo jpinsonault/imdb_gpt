@@ -273,6 +273,17 @@ class Stack(tf.keras.layers.Layer):
 
     def call(self, inputs):
         return tf.stack(inputs, axis=self.axis)
+    
+class Squeeze(tf.keras.layers.Layer):
+    def __init__(self, axis, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, inputs):
+        return tf.squeeze(inputs, axis=self.axis)
+    
+    def compute_output_shape(self, input_shape):
+        return input_shape[:self.axis] + input_shape[self.axis + 1:]
 
 
 def create_name_generator():
@@ -523,9 +534,9 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
-    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
+    last_token = Reshape((1, character_embedding_dim), name=n("reshape_last_token"))(x[:, -1, :])
 
-    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(most_recent_token)
+    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(last_token)
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
@@ -533,8 +544,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
-        x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
+        last_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
+        x = Multiply(name=n("multiply_last_token"))([x, last_token_projection])
 
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
@@ -543,7 +554,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Add(name=n("add_residual_conv"))([x, residual_conv])
     x = Add(name=n("add_positional_encoding_2"))([x, positional_encoding])
 
-    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
+    last_token = Reshape((1, character_embedding_dim), name=n("reshape_last_token"))(x[:, -1, :])
 
     head_dim = character_embedding_dim // num_heads
 
@@ -561,8 +572,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         queried_tokens = head_input_tokens * global_query
         
-        most_recent_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
-        output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=most_recent_token_projection, output_dim=head_dim)
+        last_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
+        output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=last_token_projection, output_dim=head_dim)
         global_query = create_global_token(output_tokens, head_dim)
 
         head_outputs.append(global_query)
@@ -574,14 +585,18 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim, activation=activation, num_experts=16)
     self_attended_output += head_outputs
 
-    most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
-    most_recent_token = moe_self_attention(most_recent_token, hidden_dim=character_embedding_dim, activation=None, num_experts=16)
+    self_attended_last_token = Reshape((character_embedding_dim,), name=n("reshape_last_token_final"))(last_token)
+    residual = self_attended_last_token
+    self_attended_last_token = moe_self_attention(self_attended_last_token, hidden_dim=character_embedding_dim, activation=None, num_experts=16)
+    self_attended_last_token += residual
+    tf.print(f"shapes of everything:\nhead_outputs: {head_outputs.shape}\nself_attended_output: {self_attended_output.shape}\nself_attended_last_token: {self_attended_last_token.shape}")
 
-    x = Add(name=n("add_most_recent_token"))([self_attended_output, most_recent_token])
+    x = Add(name=n("add_last_token"))([self_attended_output, self_attended_last_token])
 
+    # Perform matrix multiplication with embeddings
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
 
-    x = Softmax(name=n("softmax_output"))(x)
+    x = Softmax(name=n("softmax_to_next_token"))(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=x, name="KermitLanguageModel")
     return model
