@@ -494,7 +494,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-    self_attended_output = dynamic_self_attention(head_outputs, hidden_dim=character_embedding_dim//2)
+    self_attended_output = dynamic_self_attention(head_outputs, hidden_dim=character_embedding_dim//4)
 
     output = Dense(character_embedding_dim*8, activation=activation, name=n("dense_output"))(self_attended_output)
     output = Dense(character_embedding_dim, activation=None, name=n("dense_output_final"))(output)
