@@ -575,6 +575,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     self_attended_output += head_outputs
 
     most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
+    most_recent_token = moe_self_attention(most_recent_token, hidden_dim=character_embedding_dim, activation=None, num_experts=16)
 
     x = Add(name=n("add_most_recent_token"))([self_attended_output, most_recent_token])
 
