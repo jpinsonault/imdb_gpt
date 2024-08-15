@@ -391,7 +391,7 @@ def attention_cross_attention(input_vector, context_vector, hidden_dim):
     return output
 
 
-def additive_self_attention(character_embedding_dim, num_heads):
+def additive_self_attention(character_embedding_dim, num_heads, activation=None):
     def apply_attention(input_sequence):
         head_dim = character_embedding_dim // num_heads
 
@@ -412,8 +412,7 @@ def additive_self_attention(character_embedding_dim, num_heads):
 
             queried_tokens = masked_input_tokens * global_query
             
-            output_tokens = moe_1x1_projection(head_dim, num_experts=16)(queried_tokens)
-
+            output_tokens = moe_1x1_projection(head_dim, num_experts=16, activation=activation)(queried_tokens)
             head_outputs.append(output_tokens)
 
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
@@ -436,8 +435,7 @@ def ff_layer(character_embedding_dim, activation):
     return apply_ff_layer
 
 
-
-def moe_1x1_projection(token_dim, num_experts):
+def moe_1x1_projection(token_dim, num_experts, activation=None):
     # Stack the expert weights into a single tensor of shape (num_experts, D, D)
     expert_weights = [tf.Variable(tf.random.normal([token_dim, token_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
     expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
@@ -470,6 +468,9 @@ def moe_1x1_projection(token_dim, num_experts):
         output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
                         output_shape=(input_length, token_dim),
                         name=n("lambda_matmul_projection"))([input_sequence, combined_weight_matrix])
+        
+        if activation is not None:
+            output = Activation(activation, name=n("moe_activation"))(output)
         
         return output
 
@@ -552,7 +553,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         last_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
         x = Multiply(name=n("multiply_last_token"))([x, last_token_projection])
 
-        x = additive_self_attention(character_embedding_dim, num_heads=num_heads)(x)
+        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, activation=activation)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
