@@ -23,7 +23,7 @@ project_config = {
         'input_length'           : 128,
         'epochs'                 : 16,
         'character_embedding_dim': 192,
-        'batch_size'             : 1024,
+        'batch_size'             : 512,
         'dataset_text_file'      : 'TinyStoriesV2-GPT4-train.txt',
     },
 }
