@@ -455,7 +455,7 @@ def moe_1x1_projection(token_dim, num_experts):
         expert_scores = Dense(num_experts, use_bias=False, name=n("expert_score_projection"))(input_sequence)
         
         # Sum along the channel dimension to get E scores
-        expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores)
+        expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores) / sqrt(input_length)
         
         # Softmax the scores
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores_summed)
