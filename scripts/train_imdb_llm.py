@@ -584,7 +584,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
                                               hidden_dim=character_embedding_dim*4,
                                               output_dim=character_embedding_dim*4,
                                               activation=activation,
-                                              num_experts=16)
+                                              num_experts=8)
     
     self_attended_output = Dense(character_embedding_dim, activation=activation, name=n("dense_self_attended_output"))(self_attended_output)
     self_attended_output += head_outputs
