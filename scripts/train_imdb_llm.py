@@ -470,10 +470,8 @@ def moe_1x1_projection(input_tokens, num_experts):
 
 
 def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activation=None):
-    vector_dim = input_vector.shape[-1]
-    
     # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, output_dim)
-    expert_weights = [tf.Variable(tf.random.normal([vector_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
+    expert_weights = [tf.Variable(tf.random.normal([hidden_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
     expert_weights = Stack(axis=0, name="stack_expert_weights")(expert_weights)
     
     # Expand dimensions of expert_weights for broadcasting
@@ -489,7 +487,7 @@ def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activa
         
         # Multiply and sum using broadcasting
         combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
-                                        output_shape=(vector_dim, output_dim),
+                                        output_shape=(hidden_dim, output_dim),
                                         name="combine_weights")([expert_scores_softmax, expert_weights])
         
         return combined_weight_matrix
@@ -501,7 +499,7 @@ def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activa
     weight_matrix = generate_weights(squeezed_input)
 
     # Reshape the input vector for matrix multiplication
-    reshaped_input = Reshape((1, vector_dim))(input_vector)
+    reshaped_input = Reshape((1, hidden_dim))(squeezed_input)
     
     # Apply the dynamic weight matrix to the input vector
     output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
@@ -586,7 +584,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
                                               hidden_dim=character_embedding_dim*4,
                                               output_dim=character_embedding_dim*4,
                                               activation=activation,
-                                              num_experts=16)
+                                              num_experts=12)
     
     self_attended_output = Dense(character_embedding_dim, activation=activation, name=n("dense_self_attended_output"))(self_attended_output)
     self_attended_output += head_outputs
