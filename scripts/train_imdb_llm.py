@@ -580,18 +580,23 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
+    head_outputs_residual = head_outputs
+
     self_attended_output = moe_self_attention(head_outputs,
                                               hidden_dim=character_embedding_dim*4,
                                               output_dim=character_embedding_dim,
                                               activation=activation,
                                               num_experts=16)
     
+    self_attended_output += head_outputs_residual
+    head_outputs_residual = self_attended_output
+    
     self_attended_output = moe_self_attention(self_attended_output,
                                               hidden_dim=character_embedding_dim*4,
                                               output_dim=character_embedding_dim,
                                               activation=activation,
                                               num_experts=16)
-    self_attended_output += head_outputs
+    self_attended_output += head_outputs_residual
 
     x = self_attended_output
 
