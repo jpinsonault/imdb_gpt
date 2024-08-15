@@ -527,7 +527,7 @@ def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activa
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=6):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=8, num_heads=6):
     activation = 'leaky_relu'
 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
