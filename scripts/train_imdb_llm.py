@@ -469,33 +469,33 @@ def moe_1x1_projection(input_tokens, num_experts):
     return apply_moe_layer
 
 
-def moe_self_attention(input_vector, hidden_dim, num_experts, activation=None):
+def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activation=None):
     vector_dim = input_vector.shape[-1]
     
-    # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, vector_dim)
-    expert_weights = [tf.Variable(tf.random.normal([vector_dim, vector_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
+    # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, output_dim)
+    expert_weights = [tf.Variable(tf.random.normal([vector_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
     expert_weights = Stack(axis=0, name="stack_expert_weights")(expert_weights)
     
     # Expand dimensions of expert_weights for broadcasting
-    expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
+    expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name="expand_expert_weights")(expert_weights)
     
     def generate_weights(input_vec):
         # Project the input vector to a set of scores for the experts
-        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(input_vec)
-        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
+        expert_scores = Dense(num_experts, activation=None, name="expert_score_projection")(input_vec)
+        expert_scores_softmax = Softmax(name="expert_score_softmax")(expert_scores)
         
         # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1, 1)
-        expert_scores_softmax = Lambda(lambda x: tf.reshape(x, (-1, num_experts, 1, 1)), name=n("reshape_scores"))(expert_scores_softmax)
+        expert_scores_softmax = Lambda(lambda x: tf.reshape(x, (-1, num_experts, 1, 1)), name="reshape_scores")(expert_scores_softmax)
         
         # Multiply and sum using broadcasting
         combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
-                                        output_shape=(vector_dim, vector_dim),
-                                        name=n("combine_weights"))([expert_scores_softmax, expert_weights])
+                                        output_shape=(vector_dim, output_dim),
+                                        name="combine_weights")([expert_scores_softmax, expert_weights])
         
         return combined_weight_matrix
     
     # Squeeze the input vector to a hidden dimension
-    squeezed_input = Dense(hidden_dim, activation=None, name=n("dense_squeezed_input"))(input_vector)
+    squeezed_input = Dense(hidden_dim, activation=None, name="dense_squeezed_input")(input_vector)
 
     # Generate the dynamic weight matrix using the MoE approach
     weight_matrix = generate_weights(squeezed_input)
@@ -505,13 +505,13 @@ def moe_self_attention(input_vector, hidden_dim, num_experts, activation=None):
     
     # Apply the dynamic weight matrix to the input vector
     output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
-                    output_shape=(1, vector_dim),
-                    name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
+                    output_shape=(1, output_dim),
+                    name="lambda_matmul_attention")([reshaped_input, weight_matrix])
     
     if activation is not None:
-        output = Activation(activation, name=n("self_attention_activation"))(output)
+        output = Activation(activation, name="self_attention_activation")(output)
     
-    output = Reshape((vector_dim,), name=n("self_attention_output"))(output)
+    output = Reshape((output_dim,), name="self_attention_output")(output)
 
     return output
 
@@ -582,7 +582,13 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     head_outputs = LayerNormalization(name=n("layer_norm_heads"))(head_outputs)
     head_outputs = Reshape((character_embedding_dim,), name=n("reshape_output_heads"))(head_outputs)
 
-    self_attended_output = moe_self_attention(head_outputs, hidden_dim=character_embedding_dim*8, activation=activation, num_experts=32)
+    self_attended_output = moe_self_attention(head_outputs,
+                                              hidden_dim=character_embedding_dim,
+                                              output_dim=character_embedding_dim*4,
+                                              activation=activation,
+                                              num_experts=16)
+    
+    self_attended_output = Dense(character_embedding_dim, activation=activation, name=n("dense_self_attended_output"))(self_attended_output)
     self_attended_output += head_outputs
 
     x = self_attended_output
