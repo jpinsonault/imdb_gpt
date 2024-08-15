@@ -404,19 +404,15 @@ def additive_self_attention(character_embedding_dim, num_heads):
         for i in range(num_heads):
             head_input_tokens = split_inputs[i]
 
-            last_token = Reshape((1, head_dim), name=n("reshape_last_token"))(head_input_tokens[:, -1, :])
-            
             input_positional_mask = create_combined_positional_mask(head_input_tokens)            
 
             masked_input_tokens = head_input_tokens * input_positional_mask
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
-            global_context = Dense(head_dim, use_bias=False, activation='leaky_relu', name=n("dense_global_context"))(Concatenate(name=n("concatenate_global_context"))([global_query, last_token]))
-
             queried_tokens = masked_input_tokens * global_query
             
-            output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_context, output_dim=head_dim)
+            output_tokens = moe_1x1_projection(head_dim, num_experts=16)(queried_tokens)
 
             head_outputs.append(output_tokens)
 
@@ -581,7 +577,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         queried_tokens = masked_input_tokens * global_query
         
-        last_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
         output_tokens = moe_1x1_projection(head_dim, num_experts=16)(queried_tokens)
         global_query = create_global_token(output_tokens, head_dim)
 
