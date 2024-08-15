@@ -441,30 +441,41 @@ def ff_layer(character_embedding_dim, activation):
 
 
 
-def moe_1x1_projection(input_tokens, num_experts):
-    D = tf.shape(input_tokens)[-1]  # Dimension of the tokens
-
-    # Create E learned square D*D weight matrices (the experts)
-    expert_weights = [tf.Variable(tf.random.normal([D, D]), name=f"expert_{i}_weight") for i in range(num_experts)]
-
+def moe_1x1_projection(token_dim, num_experts):
+    # Stack the expert weights into a single tensor of shape (num_experts, D, D)
+    expert_weights = [tf.Variable(tf.random.normal([token_dim, token_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
+    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
+    
+    # Expand dimensions of expert_weights for broadcasting
+    expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
+    
     def apply_moe_layer(input_sequence):
+        input_length = input_sequence.shape[1]
         # Project each token to E scores using a Dense layer
-        expert_scores = Dense(num_experts, use_bias=False, name="expert_score_projection")(input_sequence)
+        expert_scores = Dense(num_experts, use_bias=False, name=n("expert_score_projection"))(input_sequence)
         
         # Sum along the channel dimension to get E scores
-        expert_scores_summed = tf.reduce_sum(expert_scores, axis=-1)
+        expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores)
         
         # Softmax the scores
-        expert_scores_softmax = Softmax(name="expert_score_softmax")(expert_scores_summed)
+        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores_summed)
+        
+        # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1)
+        expert_scores_softmax = Reshape((num_experts, 1, 1), name=n("reshape_scores"))(expert_scores_softmax)
+
+        tf.print(f"shapes of all the stuff: expert_scores: {expert_scores.shape}, expert_scores_summed: {expert_scores_summed.shape}, expert_scores_softmax: {expert_scores_softmax.shape}, expert_weights: {expert_weights.shape}")
         
         # Multiply the expert weight matrices by the scores and sum them up
-        weighted_experts = [score * weight for score, weight in zip(tf.unstack(expert_scores_softmax, axis=-1), expert_weights)]
-        combined_weight_matrix = tf.add_n(weighted_experts)
+        combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
+                                        output_shape=(token_dim, token_dim),
+                                        name=n("combine_weights"))([expert_scores_softmax, expert_weights])
         
-        # Use the combined weight matrix as the 1x1 projection for each token
-        projected_tokens = tf.matmul(input_sequence, combined_weight_matrix)
+        # Apply the combined weight matrix as the 1x1 projection for each token
+        output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
+                        output_shape=(input_length, token_dim),
+                        name=n("lambda_matmul_projection"))([input_sequence, combined_weight_matrix])
         
-        return projected_tokens
+        return output
 
     return apply_moe_layer
 
@@ -571,7 +582,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         queried_tokens = head_input_tokens * global_query
         
         last_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
-        output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=last_token_projection, output_dim=head_dim)
+        output_tokens = moe_1x1_projection(head_dim, num_experts=2)(queried_tokens)
         global_query = create_global_token(output_tokens, head_dim)
 
         head_outputs.append(global_query)
@@ -590,12 +601,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     
     self_attended_output = Dense(character_embedding_dim, activation=activation, name=n("dense_self_attended_output"))(self_attended_output)
 
-    self_attended_output = moe_self_attention(self_attended_output,
-                                                hidden_dim=character_embedding_dim,
-                                                output_dim=character_embedding_dim*4,
-                                                activation=None,
-                                                num_experts=16)
-    self_attended_output = Dense(character_embedding_dim, activation=activation, name=n("dense_self_attended_output_2"))(self_attended_output)
     self_attended_output += head_outputs_residual
 
     x = self_attended_output
