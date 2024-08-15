@@ -579,7 +579,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         global_query = create_global_token(masked_input_tokens, head_dim)
         # global_query = dynamic_self_attention(global_query, hidden_dim=head_dim)
 
-        queried_tokens = masked_input_tokens * global_query
+        queried_tokens = head_input_tokens * global_query
         
         last_token_projection = Dense(head_dim, use_bias=False, activation=SinActivation(), name=n("dense_last_token_projection"))(last_token)
         output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=last_token_projection, output_dim=head_dim)
