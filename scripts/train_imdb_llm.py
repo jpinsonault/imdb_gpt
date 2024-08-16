@@ -449,7 +449,7 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None, mask
 
         if mask:
             input_mask = Dense(1, name=n("input_mask_projection"), use_bias=False, activation=None)(input_sequence)
-            input_mask = 
+            input_mask = Softmax(name=n("input_mask_softmax"))(input_mask)
             masked_input = Multiply(name=n("multiply_mask"))([input_sequence, input_mask])
             expert_scores = Conv1D(filters=num_experts, kernel_size=1, activation=None, name=n("expert_score_projection"))(masked_input)
         else:
