@@ -426,7 +426,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
-        x = moe_1x1_projection(character_embedding_dim, character_embedding_dim*4, num_experts=2, activation=activation, mask=True)(input_sequence)
+        x = moe_1x1_projection(character_embedding_dim, character_embedding_dim*4, num_experts=16, activation=activation, mask=True)(input_sequence)
         x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_ff_2"))(x)
         x = Add(name=n("add_ff"))([x, input_sequence])
         x = LayerNormalization(name=n("layer_norm_ff"))(x)
