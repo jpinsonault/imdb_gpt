@@ -446,7 +446,7 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     def apply_moe_layer(input_sequence):
         input_length = input_sequence.shape[1]
         # Project each token to E scores using a Dense layer
-        expert_scores = Dense(num_experts, use_bias=False, name=n("expert_score_projection"), activation=None)(input_sequence)
+        expert_scores = Conv1D(filters=num_experts, kernel_size=3, activation=None, name=n("expert_score_projection"))(input_sequence)
         
         # Sum along the channel dimension to get E scores
         expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores) / sqrt(input_length)
