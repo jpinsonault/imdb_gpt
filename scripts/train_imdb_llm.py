@@ -412,7 +412,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
             queried_tokens = masked_input_tokens * global_query
             
-            output_tokens = moe_1x1_projection(head_dim, num_experts=16, activation=activation)(queried_tokens)
+            output_tokens = moe_1x1_projection(head_dim, head_dim, num_experts=16, activation=activation)(queried_tokens)
             head_outputs.append(output_tokens)
 
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
@@ -426,7 +426,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
-        x = moe_1x1_projection(character_embedding_dim, num_experts=16, activation=activation)(input_sequence)
+        x = moe_1x1_projection(character_embedding_dim, character_embedding_dim*4, num_experts=16, activation=activation)(input_sequence)
         x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_ff_2"))(x)
         x = Add(name=n("add_ff"))([x, input_sequence])
         x = LayerNormalization(name=n("layer_norm_ff"))(x)
@@ -435,9 +435,9 @@ def ff_layer(character_embedding_dim, activation):
     return apply_ff_layer
 
 
-def moe_1x1_projection(token_dim, num_experts, activation=None):
+def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     # Stack the expert weights into a single tensor of shape (num_experts, D, D)
-    expert_weights = [tf.Variable(tf.random.normal([token_dim, token_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
+    expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
     expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
     
     # Expand dimensions of expert_weights for broadcasting
@@ -461,12 +461,12 @@ def moe_1x1_projection(token_dim, num_experts, activation=None):
         
         # Multiply the expert weight matrices by the scores and sum them up
         combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
-                                        output_shape=(token_dim, token_dim),
+                                        output_shape=(input_dim, output_dim),
                                         name=n("combine_weights"))([expert_scores_softmax, expert_weights])
         
         # Apply the combined weight matrix as the 1x1 projection for each token
         output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
-                        output_shape=(input_length, token_dim),
+                        output_shape=(input_length, output_dim),
                         name=n("lambda_matmul_projection"))([input_sequence, combined_weight_matrix])
         
         if activation is not None:
@@ -578,7 +578,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
         queried_tokens = masked_input_tokens * global_query
         
-        output_tokens = moe_1x1_projection(head_dim, num_experts=16)(queried_tokens)
+        output_tokens = moe_1x1_projection(head_dim, head_dim, num_experts=16)(queried_tokens)
         global_query = create_global_token(output_tokens, head_dim)
 
         head_outputs.append(global_query)
