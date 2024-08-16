@@ -426,7 +426,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
 def ff_layer(character_embedding_dim, activation):
     def apply_ff_layer(input_sequence):
-        x = moe_1x1_projection(character_embedding_dim, character_embedding_dim*4, num_experts=2, activation=activation)(input_sequence)
+        x = moe_1x1_projection(character_embedding_dim, character_embedding_dim*4, num_experts=2, activation=activation, mask=True)(input_sequence)
         x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_ff_2"))(x)
         x = Add(name=n("add_ff"))([x, input_sequence])
         x = LayerNormalization(name=n("layer_norm_ff"))(x)
@@ -435,7 +435,7 @@ def ff_layer(character_embedding_dim, activation):
     return apply_ff_layer
 
 
-def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
+def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None, mask=False):
     # Stack the expert weights into a single tensor of shape (num_experts, D, D)
     expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
     expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
@@ -446,7 +446,14 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     def apply_moe_layer(input_sequence):
         input_length = input_sequence.shape[1]
         # Project each token to E scores using a Dense layer
-        expert_scores = Conv1D(filters=num_experts, kernel_size=3, activation=None, name=n("expert_score_projection"))(input_sequence)
+
+        if mask:
+            input_mask = Dense(1, name=n("input_mask_projection"), use_bias=False, activation='sigmoid')(input_sequence)
+            masked_input = Multiply(name=n("multiply_mask"))([input_sequence, input_mask])
+            expert_scores = Conv1D(filters=num_experts, kernel_size=1, activation=None, name=n("expert_score_projection"))(masked_input)
+        else:
+            expert_scores = Conv1D(filters=num_experts, kernel_size=1, activation=None, name=n("expert_score_projection"))(input_sequence)
+
         
         # Sum along the channel dimension to get E scores
         expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores) / sqrt(input_length)
