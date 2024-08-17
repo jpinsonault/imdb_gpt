@@ -328,7 +328,7 @@ def create_combined_positional_mask(input_sequence):
 
 def create_global_token(input_sequence, token_dim):
     query_tokens = Conv1D(filters=token_dim, kernel_size=1, padding='same', activation=None, name=n("conv_query_tokens"))(input_sequence)
-    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens) / sqrt(input_sequence.shape[1])
+    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens)
     
     return global_token
 
@@ -409,6 +409,8 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
             masked_input_tokens = head_input_tokens * input_positional_mask
 
             global_query = create_global_token(masked_input_tokens, head_dim)
+
+            global_query = Dense(head_dim, activation=None, name=n("dense_global_query"))(global_query)
 
             queried_tokens = masked_input_tokens * global_query
             
