@@ -328,7 +328,7 @@ def create_combined_positional_mask(input_sequence):
 
 def create_global_token(input_sequence, token_dim):
     query_tokens = Conv1D(filters=token_dim, kernel_size=1, padding='same', activation=None, name=n("conv_query_tokens"))(input_sequence)
-    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens)
+    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens) / sqrt(input_sequence.shape[1])
     
     return global_token
 
