@@ -391,7 +391,7 @@ def attention_cross_attention(input_vector, context_vector, hidden_dim):
     return output
 
 
-def additive_self_attention(character_embedding_dim, num_heads, activation=None):
+def additive_self_attention(character_embedding_dim, num_heads, head_experts, activation=None):
     def apply_attention(input_sequence):
         head_dim = character_embedding_dim // num_heads
 
@@ -550,7 +550,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     
     head_dim = character_embedding_dim // num_heads
 
-    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=8)
+    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=2)
     head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
@@ -561,18 +561,19 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     last_token = x[:, -1, :]
 
-    projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=activation)
+    projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
+        last_token = x[:, -1, :]
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(last_token)
+        most_recent_token_projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
         x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
 
-        x = additive_self_attention(character_embedding_dim, num_heads=num_heads)(x)
+        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, head_experts=head_dim_experts)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
