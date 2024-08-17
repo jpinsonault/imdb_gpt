@@ -588,6 +588,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
 
+    output_head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
+
 
     split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(x)
     head_outputs = []
@@ -599,7 +601,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         masked_input_tokens = head_input_tokens * input_positional_mask
 
         global_query = create_global_token(masked_input_tokens, head_dim)
-        global_query = moe_self_attention(global_query, head_dim, head_dim_experts, head_dim, activation=activation)
+        global_query = moe_self_attention(global_query, head_dim, output_head_dim_experts, head_dim, activation=activation)
         global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
 
         queried_tokens = masked_input_tokens * global_query
