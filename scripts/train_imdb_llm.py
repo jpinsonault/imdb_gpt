@@ -565,7 +565,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
-    block_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=4)
+    block_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=1)
 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
