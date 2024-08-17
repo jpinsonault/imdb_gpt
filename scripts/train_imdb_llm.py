@@ -550,7 +550,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     
     head_dim = character_embedding_dim // num_heads
 
-    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=2)
+    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=4)
     head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
