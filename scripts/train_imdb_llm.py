@@ -568,7 +568,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
-        last_token = x[:, -1, :]
 
         most_recent_token_projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
         x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
