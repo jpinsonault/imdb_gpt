@@ -391,7 +391,7 @@ def attention_cross_attention(input_vector, context_vector, hidden_dim):
     return output
 
 
-def additive_self_attention(character_embedding_dim, num_heads, activation=None):
+def additive_self_attention(character_embedding_dim, num_heads, experts, activation=None):
     def apply_attention(input_sequence):
         head_dim = character_embedding_dim // num_heads
 
@@ -410,7 +410,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
-            global_query = Dense(head_dim, activation=None, name=n("dense_global_query"))(global_query)
+            # global_query = moe_self_attention(Flatten()(global_query), head_dim, experts, head_dim, activation=activation)
 
             queried_tokens = masked_input_tokens * global_query
             
@@ -572,7 +572,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(last_token)
         x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
 
-        x = additive_self_attention(character_embedding_dim, num_heads=num_heads)(x)
+        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
