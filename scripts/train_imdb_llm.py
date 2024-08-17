@@ -412,7 +412,7 @@ def additive_self_attention(character_embedding_dim, num_heads, activation=None)
 
             queried_tokens = masked_input_tokens * global_query
             
-            output_tokens = moe_1x1_projection(head_dim, head_dim, num_experts=16, activation=activation)(queried_tokens)
+            output_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n("conv_attention"))(queried_tokens)
             head_outputs.append(output_tokens)
 
         head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
@@ -485,11 +485,9 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None, mask
     return apply_moe_layer
 
 
-def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activation=None):
-    # Stack the expert weights into a single tensor of shape (num_experts, vector_dim, output_dim)
-    expert_weights = [tf.Variable(tf.random.normal([hidden_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
-    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
-    
+def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, activation=None):
+    num_experts = expert_weights.shape[0]
+
     # Expand dimensions of expert_weights for broadcasting
     expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
     
@@ -530,6 +528,14 @@ def moe_self_attention(input_vector, hidden_dim, num_experts, output_dim, activa
     return output
 
 
+def create_experts(input_dim, output_dim, num_experts):
+    expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
+    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
+    
+    return expert_weights
+
+
+
 
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
@@ -541,6 +547,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
     embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name=n("embedding_layer"))
     embedding = embedding_layer(inputs)
+    
+    head_dim = character_embedding_dim // num_heads
+
+    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=1)
+    head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
 
@@ -548,9 +559,9 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
-    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
+    last_token = x[:, -1, :]
 
-    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(most_recent_token)
+    projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
@@ -558,7 +569,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(most_recent_token)
+        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(last_token)
         x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads)(x)
@@ -570,7 +581,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
 
-    head_dim = character_embedding_dim // num_heads
 
     split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(x)
     head_outputs = []
@@ -584,10 +594,10 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         global_query = create_global_token(masked_input_tokens, head_dim)
 
         queried_tokens = masked_input_tokens * global_query
-        tf.print(f"queried_tokens: {queried_tokens.shape}")
+
+        queried_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n("conv_attention"))(queried_tokens)
         
-        output_tokens = dynamic_1x1_convolution(queried_tokens, context_token=global_query, output_dim=head_dim)
-        global_query = create_global_token(output_tokens, head_dim)
+        global_query = create_global_token(queried_tokens, head_dim)
 
         head_outputs.append(global_query)
 
