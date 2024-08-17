@@ -601,8 +601,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         masked_input_tokens = head_input_tokens * input_positional_mask
 
         global_query = create_global_token(masked_input_tokens, head_dim)
+        residual = global_query
         global_query = moe_self_attention(global_query, head_dim, output_head_dim_experts, head_dim, activation=activation)
         global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
+
+        global_query += residual
 
         queried_tokens = masked_input_tokens * global_query
 
