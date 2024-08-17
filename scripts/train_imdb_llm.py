@@ -565,11 +565,12 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
+    block_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=4)
 
     for i in range(num_blocks):
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
+        most_recent_token_projection = moe_self_attention(last_token, character_embedding_dim, block_experts, character_embedding_dim, activation=SinActivation())
         x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
 
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads, head_experts=head_dim_experts)(x)
