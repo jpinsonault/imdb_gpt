@@ -410,8 +410,7 @@ def additive_self_attention(character_embedding_dim, num_heads, experts, activat
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
-            global_query = moe_self_attention(Flatten()(global_query), head_dim, experts, head_dim, activation=activation)
-            global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
+            global_query = Dense(head_dim, activation=activation, name=n("dense_global_query"))(global_query)
 
             queried_tokens = masked_input_tokens * global_query
             
