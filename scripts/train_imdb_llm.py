@@ -410,7 +410,8 @@ def additive_self_attention(character_embedding_dim, num_heads, experts, activat
 
             global_query = create_global_token(masked_input_tokens, head_dim)
 
-            global_query = Dense(head_dim, activation=activation, name=n("dense_global_query"))(global_query)
+            global_query = moe_self_attention(global_query, head_dim, experts, head_dim, activation=activation)
+            global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
 
             queried_tokens = masked_input_tokens * global_query
             
@@ -488,6 +489,12 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None, mask
 
 
 def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, activation=None):
+    """Applies a Mixture of Experts (MoE) self-attention mechanism to the input vector. 
+
+    The function projects the input vector to a set of scores over a group of expert weight matrices.
+    These scores are used to combine the expert matrices dynamically, creating a custom weight matrix for each input vector.
+    The input vector is then projected to the output dimension using this dynamically generated weight matrix.
+    """
     num_experts = expert_weights.shape[0]
 
     # Expand dimensions of expert_weights for broadcasting
@@ -592,10 +599,12 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         masked_input_tokens = head_input_tokens * input_positional_mask
 
         global_query = create_global_token(masked_input_tokens, head_dim)
+        global_query = moe_self_attention(global_query, head_dim, head_dim_experts, head_dim, activation=activation)
+        global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
 
         queried_tokens = masked_input_tokens * global_query
 
-        queried_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n("conv_attention"))(queried_tokens)
+        queried_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=activation, name=n("conv_attention"))(queried_tokens)
         
         global_query = create_global_token(queried_tokens, head_dim)
 
