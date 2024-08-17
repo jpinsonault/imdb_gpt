@@ -535,8 +535,6 @@ def create_experts(input_dim, output_dim, num_experts):
     return expert_weights
 
 
-
-
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
@@ -561,7 +559,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     last_token = x[:, -1, :]
 
-    projection = moe_self_attention(last_token, character_embedding_dim, full_dim_experts, character_embedding_dim, activation=SinActivation())
+    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(last_token)
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
