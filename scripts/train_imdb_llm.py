@@ -687,8 +687,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
     
-    # Ensure the final output has the correct shape
-    x = Dense(alphabet_size, activation=None, name=n("dense_to_vocab"))(x)
+    # Apply the embedding layer to convert the output to logits over the vocabulary
+    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"), output_shape=(input_length, alphabet_size))(x)
 
     # Apply softmax to get the probability distribution over the vocabulary for each token in the sequence
     x = Softmax(name=n("softmax_output"))(x)
