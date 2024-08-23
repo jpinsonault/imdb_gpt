@@ -65,7 +65,7 @@ def character_llm_training():
     char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
     index_to_char = {index: char for char, index in char_to_index.items()}
 
-    fresh_model = linformer_language_model(
+    fresh_model = kermit_language_model(
         input_length=input_length,
         alphabet_size=len(alphabet),
         character_embedding_dim=character_embedding_dim
@@ -404,6 +404,7 @@ def additive_self_attention(character_embedding_dim, num_heads, experts, activat
         head_outputs = []
         for i in range(num_heads):
             head_input_tokens = split_inputs[i]
+            tf.print(f"head_input_tokens: {head_input_tokens.shape}")
 
             input_positional_mask = create_combined_positional_mask(head_input_tokens)            
 
@@ -657,77 +658,44 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=2)
     head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
 
-    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
-
+    
+    # Downsample the sequence
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
-    last_token = x[:, -1, :]
+    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
 
-    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(last_token)
+    # Apply dense projection across the entire sequence
+    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(x)
     x = Multiply(name=n("multiply_projection"))([x, projection])
 
     first_residual = x
 
     for i in range(num_blocks):
+        # Ensure positional encoding matches the shape of `x`
         x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
 
-        most_recent_token_projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_most_recent_token_projection"))(last_token)
-        x = Multiply(name=n("multiply_most_recent_token"))([x, most_recent_token_projection])
-
+        # Apply self-attention and feed-forward layers to the entire sequence
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
     x = Add(name=n("add_residual_conv"))([x, residual_conv])
-    x = Add(name=n("add_positional_encoding_2"))([x, positional_encoding])
 
-    most_recent_token = Reshape((1, character_embedding_dim), name=n("reshape_most_recent_token"))(x[:, -1, :])
+    # Up-convolution: Restore the sequence length to the original input_length
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
+    
+    # Ensure the final output has the correct shape
+    x = Dense(alphabet_size, activation=None, name=n("dense_to_vocab"))(x)
 
-    output_head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
-
-
-    split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(x)
-    head_outputs = []
-    for i in range(num_heads):
-        head_input_tokens = split_inputs[i]
-        
-        input_positional_mask = create_combined_positional_mask(head_input_tokens)            
-
-        masked_input_tokens = head_input_tokens * input_positional_mask
-
-        global_query = create_global_token(masked_input_tokens, head_dim)
-        residual = global_query
-        global_query = moe_self_attention(global_query, head_dim, output_head_dim_experts, head_dim, activation=activation)
-        global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
-
-        global_query += residual
-
-        queried_tokens = masked_input_tokens * global_query
-
-        queried_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=activation, name=n("conv_attention"))(queried_tokens)
-        
-        global_query = create_global_token(queried_tokens, head_dim)
-
-        head_outputs.append(global_query)
-
-    head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
-
-    x = Flatten(name=n("flatten_reductions"))(head_outputs)
-    x = Dense(character_embedding_dim*8, activation=activation, name=n("dense_final_1"))(x)
-    x = LayerNormalization(name=n("layer_norm_final"))(x)
-    x = Dense(character_embedding_dim, activation=None, name=n("dense_final_2"))(x)
-    most_recent_token = Reshape((character_embedding_dim,), name=n("reshape_most_recent_token_final"))(most_recent_token)
-
-    x = Add(name=n("add_most_recent_token"))([x, most_recent_token])
-
-    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"))(x)
-
+    # Apply softmax to get the probability distribution over the vocabulary for each token in the sequence
     x = Softmax(name=n("softmax_output"))(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=x, name="KermitLanguageModel")
     return model
+
 
 
 #......................................................................................................................................
@@ -806,7 +774,7 @@ class ReconstructCallback(keras.callbacks.Callback):
         return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
     
     def _tokenize(self, sequence):
-        return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
+        return tuple([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
 
     def _select_top_character(self, predictions):
         return np.argmax(predictions)
