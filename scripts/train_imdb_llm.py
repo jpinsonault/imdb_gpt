@@ -110,7 +110,7 @@ def character_llm_training():
         index_to_char=index_to_char,
         max_input_length=input_length,
         num_samples=5,
-        frequency=10,
+        frequency=1000,
         gen_length=200,
         text_file=dataset_text_file
     )
