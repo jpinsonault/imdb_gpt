@@ -233,7 +233,6 @@ def remove_excessive_whitespace(text):
     return text.strip()
 
 
-from itertools import islice
 def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
     token_processor = TokenProcessor(char_to_index, max_input_length)
 
@@ -242,8 +241,10 @@ def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
         tokenized = token_processor.tokenize(text)
         for i in range(len(tokenized) - max_input_length):
             input_sequence = tokenized[i:i+max_input_length]
-            target = tokenized[i+max_input_length]
-            yield input_sequence, target
+            target_sequence = tokenized[i+1:i+max_input_length+1]
+            if len(target_sequence) < max_input_length:
+                target_sequence = np.pad(target_sequence, (0, max_input_length - len(target_sequence)), 'constant', constant_values=char_to_index[SPECIAL_PAD])
+            yield input_sequence, target_sequence
 
     def generator():
         for chunk in dataset:
@@ -252,7 +253,7 @@ def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
     return tf.data.Dataset.from_generator(
         generator,
         output_types=(tf.int32, tf.int32),
-        output_shapes=((max_input_length,), ())
+        output_shapes=((max_input_length,), (max_input_length,))
     ).map(lambda x, y: (x, tf.one_hot(y, depth=len(char_to_index)))
     ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
@@ -634,8 +635,8 @@ def linformer_language_model(input_length, alphabet_size, character_embedding_di
         x = LayerNormalization()(x)
         x = Dense(character_embedding_dim, activation='relu')(x)
     
-    x = GlobalAveragePooling1D()(x)
-    x = Dense(alphabet_size, activation='softmax')(x)
+    # The final Dense layer should output a probability distribution over the alphabet for each token
+    x = Dense(alphabet_size, activation='softmax', name="output_layer")(x)
 
     model = tf.keras.Model(inputs=inputs, outputs=x, name="LinformerLanguageModel")
     return model
