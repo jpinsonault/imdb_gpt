@@ -88,7 +88,7 @@ def character_llm_training():
     print("\n> compiling model\n")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=0.0001),
-        loss='categorical_crossentropy',
+        loss=linear_mask_loss,
         metrics=[NextTokenAccuracy()],
     )
 
@@ -160,6 +160,23 @@ def character_llm_training():
         ]
     )
 
+
+def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
+    # Get the shape of the predictions
+    sequence_length = tf.shape(y_pred)[1]
+    
+    # Create a linear mask that decreases from mask_start to mask_end
+    mask = tf.linspace(mask_start, mask_end, sequence_length)
+    
+    # Expand the mask to match the shape of y_pred
+    mask = tf.reshape(mask, [1, sequence_length])
+    
+    # Apply the mask to the loss
+    loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+    masked_loss = loss * mask
+    
+    # Return the mean loss, with the mask applied
+    return tf.reduce_mean(masked_loss)
 
 class TokenProcessor:
     def __init__(self, char_to_index, max_input_length):
@@ -755,7 +772,7 @@ class ReconstructCallback(keras.callbacks.Callback):
         self.temperature = temperature
         self.gen_length = gen_length
 
-    def on_epoch_end(self, epoch, logs):
+    def on_epoch_end(self, epoch, logs=None):
         print(f"\nEpoch {epoch + 1} Autoencoder Outputs:\n")
         self._print_predictions()
 
@@ -773,11 +790,9 @@ class ReconstructCallback(keras.callbacks.Callback):
         return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
     
     def _tokenize(self, sequence):
-        # Returns a numpy array for easier manipulation and reshaping
         return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence], dtype=np.int32)
 
     def _select_top_character(self, predictions):
-        # Select the most likely character for each position
         return np.argmax(predictions, axis=-1)
 
     def _print_predictions(self):
@@ -793,30 +808,32 @@ class ReconstructCallback(keras.callbacks.Callback):
                     input_tensor_reshaped = np.reshape(input_tensor, (1, self.max_input_length))
                     predictions = self.model.predict(input_tensor_reshaped, verbose=0)[0]
 
-                    # Iterate over each position in the sequence to predict the next token
-                    for pos in range(self.max_input_length):
-                        pos_prediction = predictions[pos]
+                    # Focus on the prediction for the last token in the sequence
+                    last_token_prediction = predictions[-1]
 
-                        if i == 0 and pos == 0:
-                            top_5_indices = np.argsort(pos_prediction)[-5:][::-1]
-                            top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
-                            top_5_probs = pos_prediction[top_5_indices]
-                            print(f"Step {i}, Position {pos} - Top 5 predictions:")
-                            for char, prob in zip(top_5_chars, top_5_probs):
-                                bar_length = 40
-                                bar_fill = int(prob * bar_length)
-                                bar = '#' * bar_fill + '-' * (bar_length - bar_fill)
-                                print(f"{char}: {prob:.4f} | {bar}")
+                    if i == 0:
+                        top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
+                        top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
+                        top_5_probs = last_token_prediction[top_5_indices]
+                        print(f"Step {i} - Top 5 predictions for the last token:")
+                        for char, prob in zip(top_5_chars, top_5_probs):
+                            bar_length = 40
+                            bar_fill = int(prob * bar_length)
+                            bar = '#' * bar_fill + '-' * (bar_length - bar_fill)
+                            print(f"{char}: {prob:.4f} | {bar}")
 
-                        predicted_index = self._select_top_character(pos_prediction)
-                        predicted_char = self.index_to_char[predicted_index]
-                        confidence = pos_prediction[predicted_index]
-                        
-                        color_coded_char = self._color_code(predicted_char, confidence)
-                        color_coded_sequence.append(color_coded_char)
-                        
-                        # Update the input_tensor to include the new prediction
-                        input_tensor[pos] = predicted_index
+                    predicted_index = self._select_top_character(last_token_prediction)
+                    predicted_char = self.index_to_char[predicted_index]
+                    confidence = last_token_prediction[predicted_index]
+                    
+                    color_coded_char = self._color_code(predicted_char, confidence)
+                    color_coded_sequence.append(color_coded_char)
+                    
+                    # Append the predicted character to the generated sequence
+                    generated_sequence.append(predicted_char)
+                    
+                    # Update input_tensor to reflect the new prediction
+                    input_tensor = np.concatenate([input_tensor[1:], [predicted_index]])
                     
                 except Exception as e:
                     print(f"Error during prediction: {e}")
@@ -832,6 +849,7 @@ class ReconstructCallback(keras.callbacks.Callback):
             return f"\033[30;43m{char}\033[0m"  # Yellow background, black text
         else:
             return f"\033[30;41m{char}\033[0m"  # Red background, black text
+
 
 
 
