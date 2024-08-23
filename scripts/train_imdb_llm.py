@@ -825,6 +825,15 @@ class ReconstructCallback(keras.callbacks.Callback):
             print(f"Prediction | {''.join(generated_sequence[:self.max_input_length])}<|>{''.join(color_coded_sequence)} |")
             print("\n")
 
+    def _color_code(self, char, confidence):
+        if confidence > 0.92:
+            return f"\033[30;42m{char}\033[0m"  # Green background, black text
+        elif confidence > 0.7:
+            return f"\033[30;43m{char}\033[0m"  # Yellow background, black text
+        else:
+            return f"\033[30;41m{char}\033[0m"  # Red background, black text
+
+
 
 def calculate_steps_per_epoch(file_path: Path, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
     cache_key = f"file_{hashlib.md5(str(file_path).encode()).hexdigest()}"
