@@ -111,7 +111,7 @@ def character_llm_training():
         max_input_length=input_length,
         num_samples=5,
         frequency=1000,
-        gen_length=max(50, input_length//4),
+        gen_length=100,
         text_file=dataset_text_file
     )
 
