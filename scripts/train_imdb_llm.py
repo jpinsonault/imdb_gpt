@@ -774,7 +774,7 @@ class ReconstructCallback(keras.callbacks.Callback):
         return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
     
     def _tokenize(self, sequence):
-        return tuple([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence])
+        return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence], dtype=np.int32)
 
     def _select_top_character(self, predictions):
         return np.argmax(predictions)
