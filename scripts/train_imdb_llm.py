@@ -762,7 +762,7 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
             break
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, text_file, temperature=1.0, gen_length=25):
+    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, text_file, temperature=1.0, gen_length=100):
         self.char_to_index = char_to_index
         self.index_to_char = index_to_char
         self.max_input_length = max_input_length
