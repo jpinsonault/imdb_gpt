@@ -65,7 +65,7 @@ def character_llm_training():
     char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
     index_to_char = {index: char for char, index in char_to_index.items()}
 
-    fresh_model = kermit_language_model(
+    fresh_model = linformer_language_model(
         input_length=input_length,
         alphabet_size=len(alphabet),
         character_embedding_dim=character_embedding_dim
@@ -543,6 +543,102 @@ def create_experts(input_dim, output_dim, num_experts):
     
     return expert_weights
 
+class LinformerSelfAttention(Layer):
+    def __init__(self, embed_dim, num_heads, seq_len, k=64, dropout=0.1):
+        super(LinformerSelfAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.seq_len = seq_len
+        self.k = k
+        self.dropout = dropout
+
+        assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by the number of heads"
+
+        self.head_dim = embed_dim // num_heads
+
+        # Linear projections for queries, keys, and values
+        self.query = Dense(embed_dim)
+        self.key = Dense(embed_dim)
+        self.value = Dense(embed_dim)
+
+        # Low-rank projection matrices
+        self.proj_k = Dense(self.head_dim)  # Adjust projection to match head_dim
+        self.proj_v = Dense(self.head_dim)  # Adjust projection to match head_dim
+
+        # Output linear layer
+        self.out = Dense(embed_dim)
+        self.dropout = Dropout(dropout)
+
+    def build(self, input_shape):
+        # No additional weights are needed here, but this method marks the layer as built.
+        super(LinformerSelfAttention, self).build(input_shape)
+
+    def call(self, x, mask=None):
+        batch_size = tf.shape(x)[0]
+
+        # Project input to queries, keys, and values
+        Q = self.query(x)
+        K = self.key(x)
+        V = self.value(x)
+
+        # Split the embedding into multiple heads
+        Q = tf.reshape(Q, (batch_size, self.seq_len, self.num_heads, self.head_dim))
+        K = tf.reshape(K, (batch_size, self.seq_len, self.num_heads, self.head_dim))
+        V = tf.reshape(V, (batch_size, self.seq_len, self.num_heads, self.head_dim))
+
+        # Apply low-rank projection
+        K = self.proj_k(K)
+        V = self.proj_v(V)
+
+        # Reshape K and V to align with Q for matmul
+        Q = tf.transpose(Q, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, head_dim]
+        K = tf.transpose(K, perm=[0, 2, 1, 3])  # [batch_size, num_heads, k, head_dim]
+        V = tf.transpose(V, perm=[0, 2, 1, 3])  # [batch_size, num_heads, k, head_dim]
+
+        # Compute attention scores
+        attention_scores = tf.matmul(Q, K, transpose_b=True) / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
+
+        if mask is not None:
+            attention_scores += (mask * -1e9)
+
+        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
+        attention_weights = self.dropout(attention_weights)
+
+        # Combine heads
+        attention_output = tf.matmul(attention_weights, V)
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # Back to original shape
+        attention_output = tf.reshape(attention_output, (batch_size, self.seq_len, self.embed_dim))
+
+        # Final linear projection
+        output = self.out(attention_output)
+
+        return output
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.seq_len, self.embed_dim)
+
+def linformer_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=4, k=64):
+    inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name="input_layer")
+    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name="embedding_layer")
+    embedding = embedding_layer(inputs)
+    
+    x = embedding
+    for i in range(num_blocks):
+        attention_output = LinformerSelfAttention(
+            embed_dim=character_embedding_dim,
+            num_heads=num_heads,
+            seq_len=input_length,
+            k=k
+        )(x)
+        x = Add()([x, attention_output])
+        x = LayerNormalization()(x)
+        x = Dense(character_embedding_dim, activation='relu')(x)
+    
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(alphabet_size, activation='softmax')(x)
+
+    model = tf.keras.Model(inputs=inputs, outputs=x, name="LinformerLanguageModel")
+    return model
 
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
