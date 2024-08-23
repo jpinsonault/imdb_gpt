@@ -110,8 +110,8 @@ def character_llm_training():
         index_to_char=index_to_char,
         max_input_length=input_length,
         num_samples=5,
-        frequency=1000,
-        gen_length=100,
+        frequency=10,
+        gen_length=200,
         text_file=dataset_text_file
     )
 
@@ -208,14 +208,19 @@ class NextTokenAccuracy(tf.keras.metrics.Metric):
         self.count = self.add_weight(name='count', initializer='zeros')
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.argmax(y_true, axis=-1)
-        y_pred = tf.argmax(y_pred, axis=-1)
-        values = tf.cast(tf.equal(y_true, y_pred), tf.float32)
+        # Focus on the last token in the sequence
+        y_true_last = tf.argmax(y_true[:, -1, :], axis=-1)
+        y_pred_last = tf.argmax(y_pred[:, -1, :], axis=-1)
+        
+        # Calculate the accuracy for the last token
+        values = tf.cast(tf.equal(y_true_last, y_pred_last), tf.float32)
+        
         if sample_weight is not None:
             sample_weight = tf.cast(sample_weight, tf.float32)
             values = tf.multiply(values, sample_weight)
+        
         self.total.assign_add(tf.reduce_sum(values))
-        self.count.assign_add(tf.cast(tf.size(y_true), tf.float32))
+        self.count.assign_add(tf.cast(tf.size(y_true_last), tf.float32))
 
     def result(self):
         return self.total / self.count
