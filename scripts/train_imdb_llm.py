@@ -700,8 +700,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         x = ff_layer(character_embedding_dim, activation)(x)
  
     # Up-convolution: Restore the sequence length to the original input_length
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', name=n("conv_upsample_1"))(x)
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', name=n("conv_upsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_upsample"))(x)
     embedding_residual = Conv1D(filters=character_embedding_dim, kernel_size=5, padding='same', activation=None, name=n("conv_embedding_residual"))(embedding)
     x = Add(name=n("add_embedding_residual"))([x, embedding_residual])
