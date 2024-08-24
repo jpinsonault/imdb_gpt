@@ -336,14 +336,14 @@ def sinusoidal_encoding(input_length, embedding_dim):
     
     return pos_encoding
 
-def create_combined_positional_mask(input_sequence):
+def create_combined_positional_mask(input_sequence, positional_encoding):
     last_token = Reshape((1, input_sequence.shape[-1]), name=n("reshape_last_token"))(input_sequence[:, -1, :])
 
     input_length = input_sequence.shape[1]
 
     last_token_positional_mask = Dense(input_length, activation=None, name=n("dense_last_token_positional_mask"))(last_token)
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
-    tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence)
+    tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence + positional_encoding)
 
     positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(last_token_positional_mask + tokenwise_positional_mask)
 
@@ -414,7 +414,7 @@ def attention_cross_attention(input_vector, context_vector, hidden_dim):
     return output
 
 
-def additive_self_attention(character_embedding_dim, num_heads, experts, activation=None):
+def additive_self_attention(character_embedding_dim, num_heads, experts, positional_encoding, activation=None):
     def apply_attention(input_sequence):
         head_dim = character_embedding_dim // num_heads
 
@@ -428,7 +428,7 @@ def additive_self_attention(character_embedding_dim, num_heads, experts, activat
             head_input_tokens = split_inputs[i]
             tf.print(f"head_input_tokens: {head_input_tokens.shape}")
 
-            input_positional_mask = create_combined_positional_mask(head_input_tokens)            
+            input_positional_mask = create_combined_positional_mask(head_input_tokens, positional_encoding=positional_encoding)            
 
             masked_input_tokens = head_input_tokens * input_positional_mask
 
@@ -686,7 +686,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
-    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
+    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
 
     # Apply dense projection across the entire sequence
     projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(x)
@@ -696,7 +696,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     for i in range(num_blocks):
         # Apply self-attention and feed-forward layers to the entire sequence
-        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts)(x)
+        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts, positional_encoding=positional_encoding)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
