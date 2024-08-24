@@ -695,9 +695,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     first_residual = x
 
     for i in range(num_blocks):
-        # Ensure positional encoding matches the shape of `x`
-        x = Add(name=n("add_positional_encoding"))([x, positional_encoding])
-
         # Apply self-attention and feed-forward layers to the entire sequence
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
@@ -705,7 +702,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
     x = Add(name=n("add_residual_conv"))([x, residual_conv])
 
-    residual = x
     # Up-convolution: Restore the sequence length to the original input_length
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
