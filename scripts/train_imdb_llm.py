@@ -682,8 +682,8 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     
     # Downsample the sequence
-    x = Conv1D(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
@@ -700,10 +700,10 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         x = ff_layer(character_embedding_dim, activation)(x)
  
     # Up-convolution: Restore the sequence length to the original input_length
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', name=n("conv_upsample_1"))(x)
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=5, strides=2, padding='same', name=n("conv_upsample_2"))(x)
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
+    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_upsample"))(x)
-    embedding_residual = Conv1D(filters=character_embedding_dim, kernel_size=5, padding='same', activation=None, name=n("conv_embedding_residual"))(embedding)
+    embedding_residual = Conv1D(filters=character_embedding_dim, kernel_size=5, padding='same', activation=SinActivation(), name=n("conv_embedding_residual"))(embedding)
     x = Add(name=n("add_embedding_residual"))([x, embedding_residual])
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"), output_shape=(input_length, alphabet_size))(x)
