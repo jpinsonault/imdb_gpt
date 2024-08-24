@@ -699,13 +699,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
         x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts, positional_encoding=positional_encoding)(x)
         x = ff_layer(character_embedding_dim, activation)(x)
  
-    residual_conv = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=SinActivation(), name=n("conv_residual"))(first_residual)
-    # x = Add(name=n("add_residual_conv"))([x, residual_conv])
-
     # Up-convolution: Restore the sequence length to the original input_length
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
     x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
     x = LayerNormalization(name=n("layer_norm_upsample"))(x)
+    x += embedding
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"), output_shape=(input_length, alphabet_size))(x)
 
