@@ -346,7 +346,7 @@ def create_combined_positional_mask(input_sequence, positional_encoding):
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
 
     position_encoded = input_sequence + positional_encoding
-    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=1, activation=None)(position_encoded)
+    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=16, activation=None)(position_encoded)
 
     positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(tokenwise_positional_mask)
 
@@ -465,38 +465,28 @@ def ff_layer(character_embedding_dim, activation):
     return apply_ff_layer
 
 
-def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None, mask=False):
+def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     # Stack the expert weights into a single tensor of shape (num_experts, D, D)
     expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
     expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
+
     
     # Expand dimensions of expert_weights for broadcasting
     expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
     
     def apply_moe_layer(input_sequence):
         input_length = input_sequence.shape[1]
-        # Project each token to E scores using a Dense layer
 
-        if mask:
-            input_mask = Dense(1, name=n("input_mask_projection"), use_bias=False, activation=None)(input_sequence)
-            input_mask = Softmax(name=n("input_mask_softmax"), axis=1)(input_mask)
-            masked_input = Multiply(name=n("multiply_mask"))([input_sequence, input_mask])
-            expert_scores = Conv1D(filters=num_experts, kernel_size=1, activation=None, name=n("expert_score_projection"))(masked_input)
-        else:
-            expert_scores = Conv1D(filters=num_experts, kernel_size=1, activation=None, name=n("expert_score_projection"))(input_sequence)
+        last_token = input_sequence[:, -1, :]
 
-        
-        # Sum along the channel dimension to get E scores
-        expert_scores_summed = Lambda(lambda x: tf.reduce_sum(x, axis=1), name=n("sum_scores"))(expert_scores) / sqrt(input_length)
+        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
         
         # Softmax the scores
-        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores_summed)
+        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
         
         # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1)
         expert_scores_softmax = Reshape((num_experts, 1, 1), name=n("reshape_scores"))(expert_scores_softmax)
 
-        tf.print(f"shapes of all the stuff: expert_scores: {expert_scores.shape}, expert_scores_summed: {expert_scores_summed.shape}, expert_scores_softmax: {expert_scores_softmax.shape}, expert_weights: {expert_weights.shape}")
-        
         # Multiply the expert weight matrices by the scores and sum them up
         combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
                                         output_shape=(input_dim, output_dim),
