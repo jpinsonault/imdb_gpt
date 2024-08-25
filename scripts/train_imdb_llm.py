@@ -680,9 +680,9 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     # Downsample the sequence
     x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("channel_reduction"))(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n("channel_reduction"))(x)
     x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("channel_reduction_2"))(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n("channel_reduction_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
