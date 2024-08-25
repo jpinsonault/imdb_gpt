@@ -479,7 +479,8 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
 
         last_token = input_sequence[:, -1, :]
 
-        last_token = Dense(input_dim, activation='leaky_relu', name=n("dense_last_token"))(last_token)
+        expert_scores = Dense(input_dim, activation='leaky_relu', name=n("dense_last_token"))(last_token)
+        expert_scores += last_token
 
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
         
@@ -515,14 +516,18 @@ def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, act
     The input vector is then projected to the output dimension using this dynamically generated weight matrix.
     """
     num_experts = expert_weights.shape[0]
+    input_dim = input_vector.shape[-1]
 
     # Expand dimensions of expert_weights for broadcasting
     expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
     
     def generate_weights(input_vec):
         # Project the input vector to a set of scores for the experts
-        expert_scores = Dense(num_experts, activation='leaky_relu', name=n("expert_score_projection"))(input_vec)
+        expert_scores = Dense(input_dim, activation='leaky_relu', name=n("expert_score_projection"))(input_vec)
+        expert_scores += input_vec
+
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(expert_scores)
+
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
         
         # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1, 1)
