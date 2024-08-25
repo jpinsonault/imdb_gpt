@@ -483,8 +483,6 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
         expert_scores += last_token
 
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
-
-        expert_scores = LayerNormalization(name=n("layer_norm_expert_scores"))(expert_scores)
         
         # Softmax the scores
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
@@ -529,7 +527,6 @@ def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, act
         expert_scores += input_vec
 
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(expert_scores)
-        expert_scores = LayerNormalization(name=n("layer_norm_expert_scores"))(expert_scores)
 
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
         
@@ -681,12 +678,11 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     
     head_dim = character_embedding_dim // num_heads
 
-    full_dim_experts = create_experts(character_embedding_dim, character_embedding_dim, num_experts=2)
-
-    
     # Downsample the sequence
-    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
+    x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("channel_reduction"))(x)
+    x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
+    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("channel_reduction_2"))(x)
     x = LayerNormalization(name=n("layer_norm_downsample"))(x)
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
