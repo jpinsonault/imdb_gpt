@@ -337,13 +337,16 @@ def sinusoidal_encoding(input_length, embedding_dim):
     return pos_encoding
 
 def create_combined_positional_mask(input_sequence, positional_encoding):
+    token_dim = input_sequence.shape[-1]
     last_token = Reshape((1, input_sequence.shape[-1]), name=n("reshape_last_token"))(input_sequence[:, -1, :])
 
     input_length = input_sequence.shape[1]
 
     last_token_positional_mask = Dense(input_length, activation=None, name=n("dense_last_token_positional_mask"))(last_token)
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
-    tokenwise_positional_mask = Dense(1, activation=None, name=n("dense_tokenwise_positional_mask"))(input_sequence + positional_encoding)
+
+    position_encoded = input_sequence + positional_encoding
+    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=1, activation=None)(position_encoded)
 
     positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(tokenwise_positional_mask)
 
