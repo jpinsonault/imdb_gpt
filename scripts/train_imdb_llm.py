@@ -521,7 +521,8 @@ def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, act
     
     def generate_weights(input_vec):
         # Project the input vector to a set of scores for the experts
-        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(input_vec)
+        expert_scores = Dense(num_experts, activation='leaky_relu', name=n("expert_score_projection"))(input_vec)
+        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(expert_scores)
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
         
         # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1, 1)
