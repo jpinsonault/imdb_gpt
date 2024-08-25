@@ -479,6 +479,8 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
 
         last_token = input_sequence[:, -1, :]
 
+        last_token = Dense(input_dim, activation='leaky_relu', name=n("dense_last_token"))(last_token)
+
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
         
         # Softmax the scores
