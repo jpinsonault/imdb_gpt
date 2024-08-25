@@ -687,12 +687,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
 
-    # Apply dense projection across the entire sequence
-    projection = Dense(character_embedding_dim, use_bias=False, activation=SinActivation(), name=n("dense_projection"))(x)
-    x = Multiply(name=n("multiply_projection"))([x, projection])
-
-    first_residual = x
-
     for i in range(num_blocks):
         # Apply self-attention and feed-forward layers to the entire sequence
         head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
