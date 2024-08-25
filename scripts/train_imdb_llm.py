@@ -483,6 +483,8 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
         expert_scores += last_token
 
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
+
+        expert_scores = LayerNormalization(name=n("layer_norm_expert_scores"))(expert_scores)
         
         # Softmax the scores
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
@@ -527,6 +529,7 @@ def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, act
         expert_scores += input_vec
 
         expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(expert_scores)
+        expert_scores = LayerNormalization(name=n("layer_norm_expert_scores"))(expert_scores)
 
         expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
         
