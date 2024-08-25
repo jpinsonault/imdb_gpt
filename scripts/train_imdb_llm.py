@@ -346,7 +346,7 @@ def create_combined_positional_mask(input_sequence, positional_encoding):
     last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
 
     position_encoded = input_sequence + positional_encoding
-    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=16, activation=None)(position_encoded)
+    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=32, activation=None)(position_encoded)
 
     positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(tokenwise_positional_mask)
 
@@ -470,7 +470,6 @@ def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
     expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
 
-    
     # Expand dimensions of expert_weights for broadcasting
     expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
     
