@@ -756,7 +756,6 @@ def autoencoder_batch_generator(csv_path, batch_size, token_processor: TokenProc
                 entity_name = row[0].strip()
 
                 if len(entity_name) > token_processor.max_input_length or len(entity_name) == 0:
-                    print(f"Skipping entity name: {entity_name}")
                     continue
 
                 try:
