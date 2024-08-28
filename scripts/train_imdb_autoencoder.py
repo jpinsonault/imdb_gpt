@@ -302,6 +302,8 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
+
+    ff_output += input
     
     return ff_output
 
@@ -321,6 +323,8 @@ def transformer_decoder_block(input, encoder_output, num_heads, ff_dim, dropout_
     ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + cross_attention_output)
+
+    ff_output += input
     
     return ff_output
 
