@@ -326,11 +326,11 @@ def attention_pooling(inputs, num_heads, dropout_rate=0.1):
     masked_inputs = layers.Multiply()([inputs, attention_scores])
     
     # Global average pooling on the masked inputs
-    pooled_output = layers.GlobalAveragePooling1D()(masked_inputs)
+    pooled_output = layers.GlobalMaxPooling1D()(masked_inputs)
     
     return pooled_output
 
-def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.1):
+def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_encoder_blocks = 1
     num_decoder_blocks = 1
     num_heads = 8
