@@ -302,8 +302,6 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
-
-    ff_output += input
     
     return ff_output
 
@@ -313,18 +311,11 @@ def transformer_decoder_block(input, encoder_output, num_heads, ff_dim, dropout_
     attention_output = layers.Dropout(dropout_rate)(attention_output)
     attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
     
-    # Cross-attention
-    cross_attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(attention_output, encoder_output)
-    cross_attention_output = layers.Dropout(dropout_rate)(cross_attention_output)
-    cross_attention_output = layers.LayerNormalization(epsilon=1e-6)(cross_attention_output + attention_output)
-    
     # Feed-forward network
-    ff_output = layers.Dense(ff_dim, activation='gelu')(cross_attention_output)
+    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
     ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
-    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + cross_attention_output)
-
-    ff_output += input
+    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
     
     return ff_output
 
@@ -372,7 +363,7 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     # Expand the bottleneck back to the sequence length for the decoder
     repeated_bottleneck = layers.RepeatVector(input_length)(bottleneck)
     
-    x = repeated_bottleneck
+    x = repeated_bottleneck + positional_encoding
 
     # Decoder blocks
     for _ in range(num_decoder_blocks):
