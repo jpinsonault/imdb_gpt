@@ -1,4 +1,5 @@
 from collections import defaultdict, namedtuple
+import csv
 import json
 from pathlib import Path
 import random
@@ -10,6 +11,7 @@ import time
 from tqdm import tqdm
 import pickle
 from config import project_config
+import random
 
 MovieDescription = namedtuple('MovieDescription', ['title', 'tconst', 'description'])
 
@@ -281,7 +283,7 @@ def list_characters(db_path, limit=None):
     return character_tuples
 
 
-def save_all_entities_to_file(data_dir, db_filename):
+def save_all_entities_to_file(data_dir: Path, db_filename):
     characters = set(list_characters(data_dir / db_filename))
     titles = set(list_movie_titles(data_dir / db_filename))
     names = set(list_names(data_dir / db_filename))
@@ -375,7 +377,81 @@ def find_long_title_high_rating_movies(db_path):
     print(f"95th percentile: {percentile_95}")
 
 
-if __name__ == '__main__':
-    data_dir = project_config['data_dir']
+def print_sqlite_schema(db_path):
+    """
+    Prints the schema of the SQLite database.
+
+    :param db_path: Path to the SQLite database file.
+    """
+    try:
+        # Connect to the SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Query to retrieve all table names in the database
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
+
+        # Loop through all tables and print their schema
+        for table in tables:
+            table_name = table[0]
+            print(f"Schema for table '{table_name}':")
+            
+            # Query to get the schema of the table
+            cursor.execute(f"PRAGMA table_info('{table_name}');")
+            schema = cursor.fetchall()
+
+            # Print each column's schema
+            for column in schema:
+                print(f"  {column[1]}: {column[2]} (Not Null: {bool(column[3])}, Default: {column[4]})")
+            
+            print("\n")  # Add a newline after each table schema
+
+    except sqlite3.Error as e:
+        print(f"An error occurred while accessing the SQLite database: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_dataset(db_path, output_csv):
+    # Connect to the database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
     
-    save_all_entities_to_file(data_dir, 'imdb.db')
+    # Define queries to extract entities and their types
+    queries = {
+        'movie': "SELECT primaryTitle AS entity FROM title_basics WHERE titleType='movie'",
+        'tvSeries': "SELECT primaryTitle AS entity FROM title_basics WHERE titleType='tvSeries'",
+        'episode': "SELECT title AS entity FROM search_episodes",
+        'person': "SELECT primaryName AS entity FROM name_basics",
+        'character': "SELECT name AS entity FROM search_characters",
+    }
+
+    # Prepare the output data
+    dataset = set()
+    
+    # Wrap the iteration with tqdm for progress tracking
+    for entity_type, query in tqdm(queries.items(), desc="Processing Entity Types"):
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        for row in rows:
+            dataset.add((row[0], entity_type))
+
+    dataset = list(dataset)
+    random.shuffle(dataset)
+    
+    # Write the dataset to CSV
+    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile, delimiter='\t')
+        writer.writerow(['entity', 'type'])
+        writer.writerows(dataset)
+    
+    # Close the database connection
+    conn.close()
+
+
+if __name__ == '__main__':
+    data_dir = Path(project_config['data_dir'])
+    
+    save_dataset(data_dir / 'imdb.db', data_dir / 'imdb_dataset.csv')

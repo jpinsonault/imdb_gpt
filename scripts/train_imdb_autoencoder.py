@@ -22,6 +22,8 @@ from config import project_config
 from scripts.attention_model import generative_matrix_attention
 from scripts.utils import print_project_config
 # from torch.utils.data import Dataset, DataLoader
+import csv
+import random
 import os
 import json
 import hashlib
@@ -47,8 +49,7 @@ class TokenProcessor:
 
     def tokenize(self, input_string):
         if len(input_string) > self.max_input_length:
-            print(f"Warning: Input string is longer than max input length of {
-                  self.max_input_length}: {input_string}")
+            print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
             input_string = input_string[:self.max_input_length]
         input_indices = [self.char_to_index.get(
             char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
@@ -95,14 +96,13 @@ def main(args):
 
 
 def character_autoencoder_training():
-    # data_dir                = Path(project_config['docker_data_dir_mount'])
     data_dir = Path(project_config['data_dir'])
-    db_path = data_dir / 'imdb.db'
+    csv_path = data_dir / 'entities.csv'
     max_input_length = project_config['entities']['max_entity_length']
     batch_size = project_config['search_autoencoder']['batch_size']
     character_embedding_dim = project_config['search_autoencoder']['character_embedding_dim']
 
-    alphabet = get_alphabet(db_path)
+    alphabet = get_alphabet(csv_path)
 
     print_project_config(project_config)
 
@@ -121,8 +121,6 @@ def character_autoencoder_training():
     model_path = data_dir / "models" / "imdb_autoencoder.keras"
     loaded_model = try_load_model(model_path)
 
-    # compare the two models and if there's a difference, use the new model because
-    # the loaded model is out of date
     if loaded_model is None:
         print("\n> no model found, using new model\n")
         model = fresh_model
@@ -148,7 +146,7 @@ def character_autoencoder_training():
         mask_percentage=masked_percentage,
     )
 
-    dataset = tf.data.Dataset.from_generator(lambda: autoencoder_batch_generator(db_path, batch_size, token_processor),
+    dataset = tf.data.Dataset.from_generator(lambda: autoencoder_batch_generator(csv_path, batch_size, token_processor),
                                              output_types=(
                                                  tf.int32, tf.float32),
                                              output_shapes=((batch_size, max_input_length, ),
@@ -178,7 +176,7 @@ def character_autoencoder_training():
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     reconstruct_callback = ReconstructCallback(
-        db_path, token_processor, num_samples=10, frequency=save_frequency)
+        csv_path, token_processor, num_samples=10, frequency=save_frequency)
 
     tensorboard_callback = TensorBoardBatchLogger(
         log_dir=str(logs_dir), update_freq=5)
@@ -704,7 +702,8 @@ class RecursiveTextBatchGenerator:
                            (self.batch_size, self.max_input_length, len(self.char_to_index)))
         )
 
-def autoencoder_batch_generator(db_path, batch_size, token_processor: TokenProcessor, SPECIAL_PAD='PAD'):
+
+def autoencoder_batch_generator(csv_path, batch_size, token_processor: TokenProcessor):
     while True:
         # Set up batches
         x_batch = np.zeros(
@@ -712,50 +711,43 @@ def autoencoder_batch_generator(db_path, batch_size, token_processor: TokenProce
         y_batch = np.zeros((batch_size, token_processor.max_input_length, len(
             token_processor.char_to_index)), dtype=np.float32)
 
-        # Database connection
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        # Open the CSV file
+        with open(csv_path, 'r', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
 
-        # Initialize batch index
-        batch_index = 0
+            # Initialize batch index
+            batch_index = 0
 
-        query = "SELECT entityName FROM entity_vectors WHERE LENGTH(entityName) < ?"
-        cursor.execute(query, (token_processor.max_input_length,))
+            print("Entity Batch Generator: Fetching entity names from CSV file...")
+            for row in reader:
+                entity_name = row[0].strip()
 
-        all_entities = cursor.fetchall()
+                if len(entity_name) > token_processor.max_input_length or len(entity_name) == 0:
+                    print(f"Skipping entity name: {entity_name}")
+                    continue
 
-        conn.close()
+                try:
+                    input_string_token_indices = token_processor.tokenize(entity_name)
 
-        print("Entity Batch Generator: Fetching entity names from entity_vectors table...")
-        for entity_name in all_entities:
-            entity_name = entity_name[0].strip()
+                    x_batch[batch_index] = input_string_token_indices
+                    for idx, token_index in enumerate(input_string_token_indices):
+                        y_batch[batch_index, idx, token_index] = 1
 
-            if len(entity_name) > token_processor.max_input_length or len(entity_name) == 0:
-                print(f"Skipping entity name: {entity_name}")
-                continue
+                    batch_index += 1
 
-            try:
-                input_string_token_indices = token_processor.tokenize(
-                    entity_name)
-
-                x_batch[batch_index] = input_string_token_indices
-                for idx, token_index in enumerate(input_string_token_indices):
-                    y_batch[batch_index, idx, token_index] = 1
-
-                batch_index += 1
-
-                if batch_index == batch_size:
-                    batch_index = 0
-                    yield x_batch, y_batch
-                    x_batch = np.zeros(
-                        (batch_size, token_processor.max_input_length), dtype=np.int32)
-                    y_batch = np.zeros((batch_size, token_processor.max_input_length, len(
-                        token_processor.char_to_index)), dtype=np.float32)
-            except Exception as e:
-                traceback.print_exc()
-                exc_type, exc_obj, exc_tb = sys.exc_info()
-                print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
-                print(f"\nFailed to process entity name: {entity_name}\n")
+                    if batch_index == batch_size:
+                        batch_index = 0
+                        yield x_batch, y_batch
+                        x_batch = np.zeros(
+                            (batch_size, token_processor.max_input_length), dtype=np.int32)
+                        y_batch = np.zeros((batch_size, token_processor.max_input_length, len(
+                            token_processor.char_to_index)), dtype=np.float32)
+                except Exception as e:
+                    traceback.print_exc()
+                    exc_type, exc_obj, exc_tb = sys.exc_info()
+                    print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
+                    print(f"\nFailed to process entity name: {entity_name}\n")
 
 
 def masked_categorical_crossentropy(char_to_index, y_true, y_pred):
@@ -810,32 +802,35 @@ class TensorBoardBatchLogger(keras.callbacks.Callback):
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, db_path, token_processor: TokenProcessor, num_samples, frequency):
+    def __init__(self, csv_path, token_processor: TokenProcessor, num_samples, frequency):
         super().__init__()
-        self.db_path = db_path
+        self.csv_path = csv_path
         self.token_processor = token_processor
         self.num_samples = num_samples
         self.frequency = frequency
+        self.all_entities = self._load_entities_from_csv()
+
+    def _load_entities_from_csv(self):
+        entities = []
+        with open(self.csv_path, 'r', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                entity_name = row[0].strip()
+                if len(entity_name) < self.token_processor.max_input_length:
+                    entities.append(entity_name)
+        return entities
 
     def on_batch_end(self, epoch, logs=None):
         if epoch % self.frequency != 0:
             return
 
-        # Database connection
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Fetch a random sample of entity names less than max_input_length
-        cursor.execute(f"SELECT entityName FROM entity_vectors WHERE LENGTH(entityName) < {
-                       self.token_processor.max_input_length} ORDER BY RANDOM() LIMIT {self.num_samples}")
-        selected_rows = cursor.fetchall()
-
-        conn.close()
+        # Select a random sample of entity names
+        selected_rows = random.sample(self.all_entities, self.num_samples)
 
         print(f"\nReconstruction examples at the end of epoch {epoch}:")
 
-        for row in selected_rows:
-            original = row[0].strip()
+        for original in selected_rows:
             tokenized = self.token_processor.tokenize(original)
             # Reshape to (1, max_input_length)
             tokenized = np.expand_dims(tokenized, axis=0)
@@ -909,33 +904,25 @@ def get_corpus_stats(corpus_stats_filename):
     return corpus_stats["alphabet"], corpus_stats["character_counts"]
 
 
-def get_alphabet(db_path):
-    # Connect to the SQLite database
-    try:
-        conn = sqlite3.connect(db_path)
-    except Exception as e:
-        print(f"Error connecting to database file: {db_path}: {e}")
-        exit(1)
-    cursor = conn.cursor()
+def get_alphabet(csv_path):
+    # Initialize a set to collect all unique characters
+    alphabet_set = set()
 
-    # Query the alphabet table
-    cursor.execute("SELECT characters FROM alphabet")
+    # Open the CSV file and read it
+    with open(csv_path, 'r', encoding='utf-8') as csvfile:
+        reader = csv.reader(csvfile)
+        next(reader)  # Skip the header row
 
-    # Fetch the result
-    result = cursor.fetchone()
+        # Iterate over each row to collect characters
+        for row in reader:
+            entity_name = row[0].strip()
+            if entity_name:  # Ensure that the entity name is not empty
+                alphabet_set.update(entity_name)
 
-    # Close the database connection
-    conn.close()
+    # Convert the set to a sorted list of characters
+    alphabet = sorted(alphabet_set)
 
-    if result:
-        # Parse the JSON field to get the list of characters
-
-        alphabet = json.loads(result[0])
-        alphabet = [chr(ord(c)) for c in alphabet]
-        return alphabet
-    else:
-        # Return an empty list if no data is found
-        return []
+    return alphabet
 
 
 if __name__ == "__main__":
