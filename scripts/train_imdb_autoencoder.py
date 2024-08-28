@@ -115,8 +115,7 @@ def character_autoencoder_training():
 
     fresh_model = kermit_autoencoder(input_length=max_input_length,
                                      alphabet_size=len(alphabet),
-                                     character_embedding_dim=character_embedding_dim,
-                                     num_blocks_per_resolution=num_blocks_per_resolution)
+                                     character_embedding_dim=character_embedding_dim)
 
     model_path = data_dir / "models" / "imdb_autoencoder.keras"
     loaded_model = try_load_model(model_path)
@@ -567,64 +566,97 @@ def entropy_minimization_layer():
     
     return Lambda(call)
 
-def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, num_blocks_per_resolution):
-    default_activation = 'gelu'
+
+def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
+    # Self-attention
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    attention_output = layers.Dropout(dropout_rate)(attention_output)
+    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
+    
+    # Feed-forward network
+    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
+    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
+    ff_output = layers.Dropout(dropout_rate)(ff_output)
+    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
+    
+    return ff_output
+
+def transformer_decoder_block(input, encoder_output, num_heads, ff_dim, dropout_rate=0.1):
+    # Self-attention
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    attention_output = layers.Dropout(dropout_rate)(attention_output)
+    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
+    
+    # Cross-attention
+    cross_attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(attention_output, encoder_output)
+    cross_attention_output = layers.Dropout(dropout_rate)(cross_attention_output)
+    cross_attention_output = layers.LayerNormalization(epsilon=1e-6)(cross_attention_output + attention_output)
+    
+    # Feed-forward network
+    ff_output = layers.Dense(ff_dim, activation='gelu')(cross_attention_output)
+    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
+    ff_output = layers.Dropout(dropout_rate)(ff_output)
+    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + cross_attention_output)
+    
+    return ff_output
+
+def attention_pooling(inputs, num_heads, dropout_rate=0.1):
+    # Self-attention to get attention scores
+    attention_scores = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=dropout_rate)(inputs, inputs)
+    attention_scores = layers.Softmax(axis=1)(attention_scores)  # Normalize scores across the sequence
+    
+    # Apply attention scores as a mask and multiply
+    masked_inputs = layers.Multiply()([inputs, attention_scores])
+    
+    # Global average pooling on the masked inputs
+    pooled_output = layers.GlobalAveragePooling1D()(masked_inputs)
+    
+    return pooled_output
+
+def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.1):
+    num_encoder_blocks = 4
+    num_decoder_blocks = 4
+    num_heads = 8
+
+    ff_dim = character_embedding_dim * 4
+    bottleneck_dim = character_embedding_dim
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
-    embedding = Embedding(input_dim=alphabet_size,
-                          output_dim=character_embedding_dim, name="embedding")(inputs)
+    embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
+    embedding = layers.Dropout(dropout_rate)(embedding)
 
-    conv_down_to_half = Conv1D(filters=character_embedding_dim*2, kernel_size=5, strides=2, padding="same", activation=default_activation)(embedding)
-    conv_down_to_half = LayerNormalization()(conv_down_to_half)
+    # Positional encoding
+    positions = tf.range(start=0, limit=input_length, delta=1)
+    positional_encoding = Embedding(input_dim=input_length, output_dim=character_embedding_dim)(positions)
+    x = embedding + positional_encoding
 
-    # Apply entropy_boosted_residual_layer here
-    residual_half = residual_conv1d_block(conv_down_to_half, filters=character_embedding_dim*2, kernel_size=3, activation=default_activation, num_blocks=num_blocks_per_resolution, name="residual_conv1d_block_half")
-    x = entropy_boosted_residual_layer(use_entropy_boost=False)([conv_down_to_half, residual_half])
+    # Encoder blocks
+    for _ in range(num_encoder_blocks):
+        x = transformer_encoder_block(x, num_heads, ff_dim, dropout_rate)
 
-    conv_down_to_quarter = Conv1D(filters=character_embedding_dim*4, kernel_size=5, strides=2, padding="same", activation=default_activation)(x)
-    conv_down_to_quarter = LayerNormalization()(conv_down_to_quarter)
+    encoder_output = x
 
-    # Apply entropy_boosted_residual_layer here as well
-    residual_quarter = residual_conv1d_block(conv_down_to_quarter, filters=character_embedding_dim*4, kernel_size=3, activation=default_activation, num_blocks=num_blocks_per_resolution, name="residual_conv1d_block_quarter")
-    x = entropy_boosted_residual_layer(use_entropy_boost=False)([conv_down_to_quarter, residual_quarter])
+    # Bottleneck with combined attention pooling
+    bottleneck = attention_pooling(encoder_output, num_heads, dropout_rate)
+    bottleneck = layers.Dense(bottleneck_dim, activation='linear')(bottleneck)
+    bottleneck = layers.LayerNormalization()(bottleneck)
 
-    shrink_channels = Conv1D(filters=character_embedding_dim, kernel_size=1, strides=1, padding="same", activation=default_activation)(x)
-    shrink_channels = LayerNormalization()(shrink_channels)
-
-    condensed_convolutions = Dense(character_embedding_dim*2, activation=default_activation)(Flatten()(x))
+    # Expand the bottleneck back to the sequence length for the decoder
+    repeated_bottleneck = layers.RepeatVector(input_length)(bottleneck)
     
-    # Apply entropy_boosted_residual_layer to the dense layers
-    dense_residual = Dense(character_embedding_dim*2, activation=default_activation)(
-        Dense(character_embedding_dim*2, activation=default_activation)(condensed_convolutions)
-    )
-    condensed_convolutions = entropy_boosted_residual_layer(use_entropy_boost=False)([condensed_convolutions, dense_residual])
+    x = repeated_bottleneck
 
-    final_representation = Dense(input_length*4, activation=default_activation)(Flatten()(embedding))
-    final_representation = Dense(input_length, activation=default_activation)(final_representation)
-    final_representation = LayerNormalization()(final_representation)
+    # Decoder blocks
+    for _ in range(num_decoder_blocks):
+        x = transformer_decoder_block(x, encoder_output, num_heads, ff_dim, dropout_rate)
 
-####################################################################################################
-    bottleneck = entropy_minimization_layer()(final_representation)
-####################################################################################################d
+    # Final output layer
+    outputs = Dense(alphabet_size, activation='softmax')(x)
 
-    x = Dense(input_length*character_embedding_dim, activation=default_activation)(Flatten()(bottleneck))
-    x = Dense(input_length*character_embedding_dim, activation=default_activation)(Flatten()(x))
-    x = LayerNormalization()(x)
-    x = Reshape((input_length, character_embedding_dim))(x)
-
-    x = Conv1D(filters=alphabet_size, kernel_size=1, strides=1, padding="same", activation=default_activation)(x)
-    
-    # Apply entropy_boosted_residual_layer to the final convolutional layers
-    conv_residual = Conv1D(filters=alphabet_size, kernel_size=1, strides=1, padding="same", activation=default_activation)(
-        Conv1D(filters=alphabet_size//2, kernel_size=1, strides=1, padding="same", activation=default_activation)(x)
-    )
-    x = entropy_boosted_residual_layer(use_entropy_boost=False)([x, conv_residual])
-    
-    x = LayerNormalization()(x)
-    x = Conv1D(filters=alphabet_size, kernel_size=1, strides=1, padding="same", activation="softmax")(x)
-
-    model = Model(inputs=inputs, outputs=x, name="kermit_autoencoder")
+    model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_combined_attention_pooling")
     return model
+
+
 
 class RecursiveTextBatchGenerator:
     def __init__(self, root_dir: str, batch_size: int, max_input_length: int, char_to_index: dict):
