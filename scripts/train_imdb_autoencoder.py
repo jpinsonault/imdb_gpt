@@ -110,8 +110,6 @@ def character_autoencoder_training():
     char_to_index = {char: index for index, char in enumerate(alphabet)}
     index_to_char = {index: char for index, char in enumerate(alphabet)}
 
-    num_blocks_per_resolution = 1
-
     fresh_model = kermit_autoencoder(input_length=max_input_length,
                                      alphabet_size=len(alphabet),
                                      character_embedding_dim=character_embedding_dim)
@@ -130,7 +128,7 @@ def character_autoencoder_training():
 
     print("\n> compiling model\n")
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.0001),
+        optimizer=keras.optimizers.Adam(learning_rate=0.0002),
         loss=MaskedCategoricalCrossentropy(char_to_index=char_to_index),
         metrics=["accuracy"],
     )
@@ -364,6 +362,7 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     repeated_bottleneck = layers.RepeatVector(input_length)(bottleneck)
     
     x = repeated_bottleneck + positional_encoding
+    x = Dense(character_embedding_dim, activation='gelu')(x)
 
     # Decoder blocks
     for _ in range(num_decoder_blocks):
