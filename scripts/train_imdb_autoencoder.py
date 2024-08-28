@@ -39,13 +39,12 @@ SPECIAL_END = '\u200E'
 
 
 class TokenProcessor:
-    def __init__(self, char_to_index, max_input_length, mask_percentage):
+    def __init__(self, char_to_index, max_input_length):
         self.char_to_index = char_to_index
         self.index_to_char = {index: char for char,
                               index in char_to_index.items()}
         self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
         self.max_input_length = max_input_length
-        self.mask_percentage = mask_percentage
 
     def tokenize(self, input_string):
         if len(input_string) > self.max_input_length:
@@ -138,12 +137,7 @@ def character_autoencoder_training():
 
     model.summary()
 
-    masked_percentage = 0.15
-    token_processor = TokenProcessor(
-        char_to_index=char_to_index,
-        max_input_length=max_input_length,
-        mask_percentage=masked_percentage,
-    )
+    token_processor = TokenProcessor(char_to_index=char_to_index, max_input_length=max_input_length)
 
     dataset = tf.data.Dataset.from_generator(lambda: autoencoder_batch_generator(csv_path, batch_size, token_processor),
                                              output_types=(
@@ -296,276 +290,6 @@ class Stack(Layer):
         return tf.stack(inputs, axis=1)
 
 
-class ContinuousPositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, P):
-        super(ContinuousPositionalEncoding, self).__init__()
-        self.P = P
-
-    def call(self, x):
-        position = tf.expand_dims(x, -1)  # shape: (batch_size, 1)
-        div_term = tf.exp(tf.range(0, self.P, 2, dtype=tf.float32)
-                          * -(np.log(10000.0) / self.P))
-
-        sin_terms = tf.sin(position * div_term)
-        cos_terms = tf.cos(position * div_term)
-
-        # Concatenate sin and cos terms along the last dimension
-        encoding = tf.concat([sin_terms, cos_terms], axis=-1)
-
-        return Flatten()(encoding)
-
-
-class FoveatedAttention(Layer):
-    """
-    Foveated Attention Layer for Neural Networks.
-    """
-
-    def __init__(self, num_foveas, character_embedding_dim, fovea_embedding_dim, fixed_width, return_context=False, **kwargs):
-        super(FoveatedAttention, self).__init__(**kwargs)
-        self.sin_activation = SinActivation()
-
-        self.num_foveas = num_foveas
-        self.fixed_width = fixed_width
-        self.return_context = return_context
-        self.character_embedding_dim = character_embedding_dim
-        self.fovea_embedding_dim = fovea_embedding_dim
-
-        self.center_prediction_1 = [Dense(fovea_embedding_dim, activation=self.sin_activation)
-                                    for _ in range(num_foveas)]
-        self.center_prediction_2 = [Dense(fovea_embedding_dim, activation=self.sin_activation)
-                                    for _ in range(num_foveas)]
-        self.center_prediction_3 = [Dense(fovea_embedding_dim, activation=self.sin_activation)
-                                    for _ in range(num_foveas)]
-        self.center_prediction_end = [Dense(1, activation=None)
-                              for _ in range(num_foveas)]
-        
-        self.center_prediction_layer_norms = [LayerNormalization() for _ in range(num_foveas)]
-
-        self.context_dense_layers_start = [Dense(fovea_embedding_dim, activation=self.sin_activation)
-                                            for _ in range(num_foveas)]
-        self.context_dense_layers_end = [Dense(fovea_embedding_dim, activation=self.sin_activation)
-                                     for _ in range(num_foveas)]
-        self.context_dense_layer_norms = [LayerNormalization() for _ in range(num_foveas)]
-
-        self.compressed_context_bottleneck = Dense(character_embedding_dim, activation=self.sin_activation)
-        self.compressed_context_embiggen = Dense(fovea_embedding_dim, activation=self.sin_activation)
-        self.compressed_context_layer_norm = LayerNormalization()
-
-        self.at_full = Conv1D(filters=character_embedding_dim, kernel_size=5,
-                              strides=1, padding="same", activation=self.sin_activation)
-        self.to_one_4th = Conv1D(filters=character_embedding_dim*2, kernel_size=8,
-                                 strides=4, padding="same", activation=self.sin_activation)
-        self.at_one_4th = Conv1D(filters=character_embedding_dim*2, kernel_size=4,
-                                 strides=1, padding="same", activation=self.sin_activation)
-        self.to_one_16th = Conv1D(filters=character_embedding_dim*4, kernel_size=8,
-                                  strides=4, padding="same", activation=self.sin_activation)
-        self.at_one_16th = Conv1D(filters=character_embedding_dim*4, kernel_size=4,
-                                  strides=1, padding="same", activation=self.sin_activation)
-
-        self.positional_encoding = ContinuousPositionalEncoding(
-            P=character_embedding_dim)
-
-        self.layer_norm_at_full = LayerNormalization()
-        self.layer_norm_at_one_4th = LayerNormalization()
-        self.layer_norm_at_one_16th = LayerNormalization()
-
-    def build(self, input_shape):
-        self.channels = input_shape[-1]
-        super(FoveatedAttention, self).build(input_shape)
-
-    def call(self, input_list) -> Tuple[Layer, Layer, Layer]:
-        token_inputs = input_list[0]
-        batch_size = tf.shape(token_inputs)[0]
-        should_produce_context = len(input_list) == 1
-        previous_fovea_outputs = input_list[1] if len(input_list) > 1 else 0
-        previous_fovea_centers = input_list[2] if len(input_list) > 1 else [tf.zeros((batch_size, 1)) for _ in range(self.num_foveas)]
-
-        length = tf.shape(token_inputs)[1]
-
-        if should_produce_context:
-            global_context = self.convolute_inputs_from_full_to_one_16th(token_inputs)
-            compressed_context = self.compressed_context_bottleneck(global_context)
-            compressed_context = self.compressed_context_embiggen(compressed_context)
-            compressed_context = self.compressed_context_layer_norm(compressed_context)
-        else:
-            global_context = previous_fovea_outputs
-            compressed_context = 0
-
-        foveated_outputs, fovea_centers = self.compute_foveas(token_inputs, previous_fovea_centers, global_context, batch_size, length)
-
-        final_representation = compressed_context + (Add()(foveated_outputs) / tf.sqrt(tf.cast(self.num_foveas, tf.float32)))
-
-        return final_representation, fovea_centers
-
-    def compute_foveas(self, token_inputs, previous_fovea_centers, global_context, batch_size, length):
-        foveated_outputs = []
-        fovea_centers = []
-
-        positional_encodings = [self.positional_encoding(center) for center in previous_fovea_centers]
-        positional_encodings = tf.concat(positional_encodings, axis=-1)
-
-        for i in range(self.num_foveas):
-            previous_fovea_center = previous_fovea_centers[i]
-
-            positional_encoding = self.positional_encoding(previous_fovea_center)
-
-            context_and_position = Concatenate()([global_context, positional_encoding])
-
-            fovea_center = self.center_prediction_1[i](context_and_position)
-            fovea_center = self.center_prediction_2[i](fovea_center)
-            fovea_center = self.center_prediction_3[i](fovea_center)
-            fovea_center = self.center_prediction_layer_norms[i](fovea_center)
-
-            fovea_center = self.center_prediction_end[i](fovea_center)
-
-            fovea_center = Sigmoid()(fovea_center + previous_fovea_center)
-
-            fovea_centers.append(fovea_center)
-
-            positional_encoding = self.positional_encoding(fovea_center)
-
-            center_position = tf.cast(
-                fovea_center * tf.cast(length, tf.float32), tf.int32)
-
-            # Generate masks for each fovea
-            row_indices = tf.range(length)
-            row_indices = tf.expand_dims(row_indices, 0)
-            row_indices = tf.tile(row_indices, [batch_size, 1])
-
-            masks = tf.logical_and(
-                row_indices >= center_position - self.fixed_width // 2,
-                row_indices < center_position + self.fixed_width // 2
-            )
-            masks = tf.cast(masks, tf.float32)
-
-            # Apply masks to extract foveas
-            masks = tf.expand_dims(masks, -1)
-            foveas = token_inputs * masks
-
-            # Ensure no zero-length segments
-            mask_sums = tf.reduce_sum(masks, axis=1)
-            # Replace zero-length segments with 1 to avoid NaNs
-            mask_sums = tf.where(mask_sums == 0, 1.0, mask_sums)
-
-            fovea_means = tf.reduce_sum(foveas, axis=1) / mask_sums
-
-            means_and_positions = Concatenate()(
-                [fovea_means, positional_encoding])
-
-            # Process through dense layer
-            fovea_features = self.context_dense_layers_end[i](means_and_positions)
-            fovea_features = self.context_dense_layer_norms[i](fovea_features)
-
-            foveated_outputs.append(fovea_features)
-
-        return foveated_outputs, fovea_centers
-
-    def convolute_inputs_from_full_to_one_16th(self, inputs):
-        full = self.at_full(inputs)
-        full = Add()([full, inputs])
-        full = self.layer_norm_at_full(full)
-        to_one_fourth = self.to_one_4th(full)
-        one_fourth = self.at_one_4th(to_one_fourth)
-        one_fourth = Add()([one_fourth, to_one_fourth])
-        one_fourth = self.layer_norm_at_one_4th(one_fourth)
-        to_one_16th = self.to_one_16th(one_fourth)
-        one_16th = self.at_one_16th(to_one_16th)
-        one_16th = Add()([one_16th, to_one_16th])
-        one_16th = self.layer_norm_at_one_16th(one_16th)
-        return Flatten()(one_16th)
-
-    def get_config(self):
-        config = super(FoveatedAttention, self).get_config()
-        config.update({
-            'num_foveas': self.num_foveas,
-            'embedding_size': self.context_dense_layers_end[0].units,
-            'fixed_width': self.fixed_width,
-        })
-        return config
-
-
-class StatsLayer(Layer):
-    def call(self, inputs):
-        mean = tf.reduce_mean(inputs, axis=1, keepdims=True)
-        stddev = tf.math.reduce_std(inputs, axis=1, keepdims=True)
-        min_val = tf.reduce_min(inputs, axis=1, keepdims=True)
-        max_val = tf.reduce_max(inputs, axis=1, keepdims=True)
-        return Concatenate()([mean, stddev, min_val, max_val])
-
-
-def entropy_boosted_residual_layer(use_entropy_boost=True):
-    """
-    A layer that applies a residual connection and optionally scales its output based on the entropy of the input.
-    
-    Args:
-    use_entropy_boost: Boolean, if True, apply entropy-based scaling. If False, just add the residual.
-    
-    Returns:
-    A Keras layer that can be used in a model
-    """
-    def calculate_entropy(tensor):
-        normalized = tf.nn.softmax(tensor, axis=-1)
-        entropy = -tf.reduce_sum(normalized * tf.math.log(normalized + 1e-10), axis=-1)
-        max_entropy = tf.math.log(tf.cast(tf.shape(normalized)[-1], tf.float32))
-        normalized_entropy = entropy / max_entropy
-        return tf.reduce_mean(normalized_entropy)
-
-    def call(inputs):
-        x, residual = inputs
-        
-        if use_entropy_boost:
-            input_entropy = calculate_entropy(x)
-            scale = tf.where(input_entropy > 0.5, 
-                             1.0 + (input_entropy - 0.5), 
-                             1.0 - (0.5 - input_entropy))
-            scaled_residual = scale * residual
-            return x + scaled_residual
-        else:
-            return x + residual
-
-    return tf.keras.layers.Lambda(call)
-
-def residual_conv1d_block(x, filters, kernel_size, activation, num_blocks, name, strides=1):
-    for i in range(num_blocks):
-        residual = x
-        starting_conv = DepthwiseConv1D(kernel_size=kernel_size, strides=strides, padding="same", activation=activation, name=f"{name}_starting_conv_{i}")
-        reduction = Conv1D(filters=filters//4, kernel_size=1, strides=1, padding="same", activation=activation, name=f"{name}_reduction_{i}")
-        expansion = Conv1D(filters=filters, kernel_size=1, strides=1, padding="same", activation=activation, name=f"{name}_expansion_{i}")
-        ending_conv = DepthwiseConv1D(kernel_size=kernel_size, strides=strides, padding="same", activation=activation, name=f"{name}_ending_conv_{i}")
-
-        x = starting_conv(x)
-        x = reduction(x)
-        x = expansion(x)
-        x = ending_conv(x)
-
-        x = x + residual
-        x = LayerNormalization()(x)
-    return x
-
-
-def entropy_minimization_layer():
-    def call(x):
-        # Calculate entropy with improved numerical stability
-        epsilon = 1e-7
-        x_abs = tf.abs(x)
-        x_norm = x_abs / (tf.reduce_sum(x_abs, axis=-1, keepdims=True) + epsilon)
-        entropy = -tf.reduce_sum(x_norm * tf.math.log(x_norm + epsilon), axis=-1)
-        
-        # Normalize entropy to [0, 1]
-        max_entropy = tf.math.log(tf.cast(tf.shape(x)[-1], tf.float32))
-        normalized_entropy = entropy / (max_entropy + epsilon)
-        
-        # Clip normalized entropy to avoid extreme values
-        normalized_entropy = tf.clip_by_value(normalized_entropy, 0.0, 1.0)
-        
-        # Scale the input based on entropy, preserving sign
-        scale = 1 - tf.expand_dims(normalized_entropy, -1)
-        result = x * scale
-        
-        return result
-    
-    return Lambda(call)
-
 
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     # Self-attention
@@ -614,11 +338,11 @@ def attention_pooling(inputs, num_heads, dropout_rate=0.1):
     return pooled_output
 
 def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.1):
-    num_encoder_blocks = 4
-    num_decoder_blocks = 4
+    num_encoder_blocks = 1
+    num_decoder_blocks = 1
     num_heads = 8
 
-    ff_dim = character_embedding_dim * 4
+    ff_dim = character_embedding_dim
     bottleneck_dim = character_embedding_dim
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)

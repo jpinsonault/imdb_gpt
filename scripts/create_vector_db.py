@@ -84,7 +84,7 @@ if __name__ == '__main__':
     
     encoder_model = Model(inputs=full_model.input, outputs=encoder_layer.output)
     
-    token_processor = TokenProcessor(char_to_index=char_to_index, max_input_length=max_input_length, mask_percentage=.01)
+    token_processor = TokenProcessor(char_to_index=char_to_index, max_input_length=max_input_length)
     
     embeddings_path = "models/imdb_autoencoder_embeddings.npy"
     save_embeddings(encoder_model, token_processor, corpus_file_path, embeddings_path)
