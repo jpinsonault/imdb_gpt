@@ -360,7 +360,7 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
 
     encoder_output = x
     # Bottleneck with combined attention pooling
-    bottleneck = attention_pooling(encoder_output, num_heads, dropout_rate)
+    bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
     bottleneck = layers.Dense(bottleneck_dim, activation='linear')(bottleneck)
     bottleneck = layers.LayerNormalization()(bottleneck)
 
