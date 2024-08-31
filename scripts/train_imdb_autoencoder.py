@@ -10,6 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 import numpy as np
 from collections import defaultdict
+from scripts.train_imdb_llm import sinusoidal_encoding
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -343,8 +344,7 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     embedding = layers.Dropout(dropout_rate)(embedding)
 
     # Positional encoding
-    positions = tf.range(start=0, limit=input_length, delta=1)
-    positional_encoding = Embedding(input_dim=input_length, output_dim=character_embedding_dim)(positions)
+    positional_encoding = sinusoidal_encoding(input_length, character_embedding_dim)
     x = embedding + positional_encoding
 
     # Encoder blocks
