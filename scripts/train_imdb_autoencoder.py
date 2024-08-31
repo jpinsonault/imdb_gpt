@@ -334,7 +334,7 @@ def attention_pooling(inputs, num_heads, dropout_rate=0.1):
 def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_encoder_blocks = 4
     num_decoder_blocks = 4
-    num_heads = 2
+    num_heads = 1
 
     ff_dim = character_embedding_dim
     bottleneck_dim = character_embedding_dim
@@ -343,9 +343,14 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
     embedding = layers.Dropout(dropout_rate)(embedding)
 
+    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
+    reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
+
+    reduced_to_quarter = LayerNormalization()(reduced_to_quarter)
+
     # Positional encoding
-    positional_encoding = sinusoidal_encoding(input_length, character_embedding_dim)
-    x = embedding + positional_encoding
+    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim)
+    x = reduced_to_quarter + positional_encoding
 
     # Encoder blocks
     for _ in range(num_encoder_blocks):
@@ -359,7 +364,7 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     bottleneck = layers.LayerNormalization()(bottleneck)
 
     # Expand the bottleneck back to the sequence length for the decoder
-    repeated_bottleneck = layers.RepeatVector(input_length)(bottleneck)
+    repeated_bottleneck = layers.RepeatVector(input_length//4)(bottleneck)
     
     x = repeated_bottleneck + positional_encoding
     x = Dense(character_embedding_dim, activation='gelu')(x)
@@ -368,8 +373,11 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
     for _ in range(num_decoder_blocks):
         x = transformer_decoder_block(x, encoder_output, num_heads, ff_dim, dropout_rate)
 
+    back_to_half = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
+    back_to_full = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(back_to_half)
+
     # Final output layer
-    outputs = Dense(alphabet_size, activation='softmax')(x)
+    outputs = Dense(alphabet_size, activation='softmax')(back_to_full)
 
     model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_combined_attention_pooling")
     return model
