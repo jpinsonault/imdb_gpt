@@ -318,9 +318,11 @@ def transformer_decoder_block(input, encoder_output, num_heads, ff_dim, dropout_
     
     return ff_output
 
-def attention_pooling(inputs, num_heads, dropout_rate=0.1):
+def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
     # Self-attention to get attention scores
-    attention_scores = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=dropout_rate)(inputs, inputs)
+
+    positional_encoded = positional_encoding + inputs
+    attention_scores = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=dropout_rate)(positional_encoded, inputs)
     attention_scores = layers.Softmax(axis=1)(attention_scores)  # Normalize scores across the sequence
     
     # Apply attention scores as a mask and multiply
@@ -357,7 +359,6 @@ def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dro
         x = transformer_encoder_block(x, num_heads, ff_dim, dropout_rate)
 
     encoder_output = x
-    encoder_output += positional_encoding
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, dropout_rate)
     bottleneck = layers.Dense(bottleneck_dim, activation='linear')(bottleneck)
