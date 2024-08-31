@@ -10,7 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 import numpy as np
 from collections import defaultdict
-from scripts.train_imdb_llm import sinusoidal_encoding
+from scripts.train_imdb_llm import ReduceSum, sinusoidal_encoding
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -144,7 +144,7 @@ def character_autoencoder_training():
                                              output_shapes=((batch_size, max_input_length, ),
                                                             (batch_size, max_input_length, len(char_to_index))))
 
-    save_frequency = 50
+    save_frequency = 200
 
     save_model_by_batch_callback = keras.callbacks.ModelCheckpoint(
         filepath=str(model_path),
@@ -326,8 +326,8 @@ def attention_pooling(inputs, num_heads, dropout_rate=0.1):
     # Apply attention scores as a mask and multiply
     masked_inputs = layers.Multiply()([inputs, attention_scores])
     
-    # Global average pooling on the masked inputs
-    pooled_output = layers.GlobalMaxPooling1D()(masked_inputs)
+    # reduce sum over the masked input sequence
+    pooled_output = ReduceSum(axis=1)(masked_inputs)
     
     return pooled_output
 
