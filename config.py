@@ -15,7 +15,7 @@ project_config = {
     
     'search_autoencoder': {
         'epochs'                 : 16,
-        'character_embedding_dim': 48,
+        'character_embedding_dim': 96,
         'batch_size'             : 64,
     },
 

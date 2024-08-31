@@ -334,7 +334,7 @@ def attention_pooling(inputs, num_heads, dropout_rate=0.1):
 def kermit_autoencoder(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_encoder_blocks = 4
     num_decoder_blocks = 4
-    num_heads = 1
+    num_heads = 2
 
     ff_dim = character_embedding_dim
     bottleneck_dim = character_embedding_dim
