@@ -378,9 +378,9 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
-    embedding = layers.Dropout(dropout_rate)(embedding)
+    dropped_out_embedding = layers.Dropout(dropout_rate)(embedding)
 
-    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
+    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(dropped_out_embedding)
     reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
 
     reduced_to_quarter = LayerNormalization()(reduced_to_quarter)
@@ -416,7 +416,8 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
         siren_inputs = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))(siren_inputs)
 
     siren_output = SirenLayer(alphabet_size, name="siren_output", is_first=False)(siren_inputs)
-    siren_output = Softmax()(siren_output)
+    # Apply the embedding layer to convert the output to logits over the vocabulary
+    x = Lambda(lambda x: tf.matmul(x, embedding.embeddings, transpose_b=True), output_shape=(input_length, alphabet_size))(siren_output)
 
     model = Model(inputs=inputs, outputs=siren_output)
     return model
