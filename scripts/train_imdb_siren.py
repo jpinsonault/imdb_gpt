@@ -367,7 +367,6 @@ class RepeatBottleneckLayer(Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.output_length, input_shape[-1])
 
-
 def kermit_autoencoder(input_length, output_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_encoder_blocks = 4
     num_decoder_blocks = 4
@@ -377,7 +376,8 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
     bottleneck_dim = character_embedding_dim
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
-    embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
+    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
+    embedding = embedding_layer(inputs)
     dropped_out_embedding = layers.Dropout(dropout_rate)(embedding)
 
     reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(dropped_out_embedding)
@@ -402,11 +402,17 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
     # Use the custom layer to repeat bottleneck for each output position
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
 
-    # Generate and expand positional encoding for output positions using a custom layer
-    expanded_positions = ExpandAndTileLayer(output_length)(bottleneck)
+    # Generate positional encoding for output positions
+    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
+    
+    # Repeat the positional encoding across the batch size to match expanded_bottleneck
+    tiled_positional_encoding = layers.Lambda(
+        lambda x: tf.tile(siren_positional_encoding, [tf.shape(x)[0], 1, 1]),
+        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim)
+    )(expanded_bottleneck)
 
     # Concatenate bottleneck and positions
-    siren_inputs = layers.Concatenate(axis=-1)([expanded_bottleneck, expanded_positions])
+    siren_inputs = layers.Concatenate(axis=-1)([expanded_bottleneck, tiled_positional_encoding])
 
     # Apply SIREN layers
     num_siren_layers = 4
@@ -415,11 +421,12 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
     for i in range(num_siren_layers):
         siren_inputs = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))(siren_inputs)
 
-    siren_output = SirenLayer(alphabet_size, name="siren_output", is_first=False)(siren_inputs)
+    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)(siren_inputs)
+    
     # Apply the embedding layer to convert the output to logits over the vocabulary
-    x = Lambda(lambda x: tf.matmul(x, embedding.embeddings, transpose_b=True), output_shape=(input_length, alphabet_size))(siren_output)
+    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), output_shape=(output_length, alphabet_size))(siren_output)
 
-    model = Model(inputs=inputs, outputs=siren_output)
+    model = Model(inputs=inputs, outputs=x)
     return model
 
 
@@ -649,10 +656,6 @@ class ReconstructCallback(keras.callbacks.Callback):
 
             print(f"Original      | {original_restored}")
             print(f"Reconstructed | {reconstructed}\n")
-
-        if epoch % 100 == 0:
-            self.model.save(f"imdb_autoencoder_epoch_{epoch}.h5")
-            print(f"Saved model at epoch {epoch}")
 
 
 def are_models_same(model1, model2):
