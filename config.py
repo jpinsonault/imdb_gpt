@@ -24,23 +24,26 @@ project_config = {
     },
     
     'search_autoencoder': {
-        'epochs'                 : 16,
-        'character_embedding_dim': 96,
-        'batch_size'             : 64,
+        'epochs'                  : 16,
+        'character_embedding_dim' : 96,
+        'batch_size'              : 64,
     },
 
     'siren': {
-        'max_output_length'      : 288,
-        'batch_size'             : 128,
-        'character_embedding_dim': 128,
-        'bottleneck_dim'         : 128,
+        'max_output_length'       : 288,
+        'batch_size'              : 128,
+        'character_embedding_dim' : 128,
+        'bottleneck_dim'          : 128,
+        'siren_width'             : 256,
+        'num_encoder_blocks'      : 4,
+        'num_siren_layers'        : 8,
     },
 
     'llm': {
-        'input_length'           : 128,
-        'epochs'                 : 16,
-        'character_embedding_dim': 192,
-        'batch_size'             : 512,
-        'dataset_text_file'      : 'TinyStoriesV2-GPT4-train.txt',
+        'input_length'            : 128,
+        'epochs'                  : 16,
+        'character_embedding_dim' : 192,
+        'batch_size'              : 512,
+        'dataset_text_file'       : 'TinyStoriesV2-GPT4-train.txt',
     },
 }

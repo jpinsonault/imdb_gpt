@@ -49,8 +49,6 @@ def character_autoencoder_training():
     max_input_length = project_config['entities']['max_entity_length']
     max_output_length = project_config['siren']['max_output_length']
     batch_size = project_config['siren']['batch_size']
-    character_embedding_dim = project_config['siren']['character_embedding_dim']
-    bottleneck_dim = project_config['siren']['bottleneck_dim']
 
     # Prepare alphabet and character mapping from multiple JSONL files
     alphabet = get_alphabet(jsonl_files)
@@ -59,10 +57,8 @@ def character_autoencoder_training():
     char_to_index = {char: index for index, char in enumerate(alphabet)}
 
     fresh_model = kermit_siren(input_length=max_input_length,
-                                     output_length=max_output_length,
-                                     alphabet_size=len(alphabet),
-                                     character_embedding_dim=character_embedding_dim,
-                                     bottleneck_dim=bottleneck_dim)
+                               alphabet_size=len(alphabet),
+                               config=project_config['siren'])
 
     model_path = data_dir / "models" / "imdb_autoencoder.keras"
     loaded_model = try_load_model(model_path)
@@ -85,12 +81,12 @@ def character_autoencoder_training():
 
     model.summary()
 
-    input_token_processor = TokenProcessor(char_to_index=char_to_index, max_input_length=max_input_length)
-    output_token_processor = TokenProcessor(char_to_index=char_to_index, max_input_length=max_output_length)
+    input_tokenizer = Tokenizer(char_to_index=char_to_index, max_input_length=max_input_length)
+    output_tokenizer = Tokenizer(char_to_index=char_to_index, max_input_length=max_output_length)
 
     # Use the new batch generator for multiple JSONL files
     dataset = tf.data.Dataset.from_generator(
-        lambda: autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, output_token_processor),
+        lambda: autoencoder_batch_generator(jsonl_files, batch_size, input_tokenizer, output_tokenizer),
         output_types=(tf.int32, tf.float32),
         output_shapes=((batch_size, max_input_length,), (batch_size, max_output_length, len(char_to_index)))
     )
@@ -119,7 +115,7 @@ def character_autoencoder_training():
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     reconstruct_callback = ReconstructCallback(
-        jsonl_files, input_token_processor, num_samples=10, frequency=save_frequency
+        jsonl_files, input_tokenizer, num_samples=10, frequency=save_frequency
     )
 
     tensorboard_callback = TensorBoardBatchLogger(
@@ -152,7 +148,7 @@ def character_autoencoder_training():
     ])
 
 
-class TokenProcessor:
+class Tokenizer:
     def __init__(self, char_to_index, max_input_length):
         self.char_to_index = char_to_index
         self.index_to_char = {index: char for char,
@@ -312,10 +308,15 @@ class RepeatBottleneckLayer(Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.output_length, input_shape[-1])
 
-def kermit_siren(input_length, output_length, alphabet_size, character_embedding_dim, bottleneck_dim, dropout_rate=0.001):
-    num_encoder_blocks = 4
-    num_decoder_blocks = 4
+def kermit_siren(input_length, alphabet_size, config: dict):
     num_heads = 1
+
+    character_embedding_dim = config['character_embedding_dim']
+    bottleneck_dim = config['bottleneck_dim']
+    output_length = config['max_output_length']
+    num_encoder_blocks = config['num_encoder_blocks']
+    dropout_rate = 0.1
+
 
     ff_dim = character_embedding_dim
 
@@ -340,8 +341,8 @@ def kermit_siren(input_length, output_length, alphabet_size, character_embedding
     encoder_output = x
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
-    bottleneck = layers.Dense(bottleneck_dim, activation='linear')(bottleneck)
-    bottleneck = layers.LayerNormalization()(bottleneck)
+    bottleneck = Dense(bottleneck_dim, activation='linear')(bottleneck)
+    bottleneck = LayerNormalization()(bottleneck)
 
     # Use the custom layer to repeat bottleneck for each output position
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
@@ -350,19 +351,18 @@ def kermit_siren(input_length, output_length, alphabet_size, character_embedding
     siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
     
     # Repeat the positional encoding across the batch size to match expanded_bottleneck
-    tiled_positional_encoding = layers.Lambda(
+    tiled_positional_encoding = Lambda(
         lambda x: tf.tile(siren_positional_encoding, [tf.shape(x)[0], 1, 1]),
         output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim)
     )(expanded_bottleneck)
 
     # Concatenate bottleneck and positions
-    siren_inputs = layers.Concatenate(axis=-1)([expanded_bottleneck, tiled_positional_encoding])
+    siren_inputs = Concatenate(axis=-1)([expanded_bottleneck, tiled_positional_encoding])
 
     # Apply SIREN layers
-    num_siren_layers = 4
-    siren_width = 256
+    siren_width = config['siren_width']
 
-    for i in range(num_siren_layers):
+    for i in range(config['num_siren_layers']):
         siren_inputs = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))(siren_inputs)
 
     siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)(siren_inputs)
@@ -454,7 +454,7 @@ class RecursiveTextBatchGenerator:
         )
 
 
-def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, output_token_processor):
+def autoencoder_batch_generator(jsonl_files, batch_size, input_tokenizer: Tokenizer, output_tokenizer: Tokenizer):
     """
     Efficient batch generator for autoencoder training using multiple JSONL files.
     """
@@ -475,8 +475,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, 
 
     # Generate batches
     data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
-    x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
-    y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
+    x_batch = np.zeros((batch_size, input_tokenizer.max_input_length), dtype=np.int32)
+    y_batch = np.zeros((batch_size, output_tokenizer.max_input_length, len(output_tokenizer.char_to_index)), dtype=np.float32)
 
     batch_index = 0
 
@@ -495,15 +495,15 @@ def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, 
         query = data_point.get('query', '').strip()
         result = data_point.get('result', '').strip()
 
-        if not query or len(query) > input_token_processor.max_input_length:
+        if not query or len(query) > input_tokenizer.max_input_length:
             continue
 
         try:
             # Tokenize the input query
-            input_string_token_indices = input_token_processor.tokenize(query)
+            input_string_token_indices = input_tokenizer.tokenize(query)
 
             # Tokenize the output result
-            output_token_indices = output_token_processor.tokenize(result)[:output_token_processor.max_input_length]
+            output_token_indices = output_tokenizer.tokenize(result)[:output_tokenizer.max_input_length]
 
             # Update the batch
             x_batch[batch_index] = input_string_token_indices
@@ -519,8 +519,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, 
                 batch_index = 0
                 yield x_batch, y_batch
                 # Reset for next batch
-                x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
-                y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
+                x_batch = np.zeros((batch_size, input_tokenizer.max_input_length), dtype=np.int32)
+                y_batch = np.zeros((batch_size, output_tokenizer.max_input_length, len(output_tokenizer.char_to_index)), dtype=np.float32)
 
         except Exception as e:
             traceback.print_exc()
@@ -585,10 +585,10 @@ class TensorBoardBatchLogger(keras.callbacks.Callback):
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, jsonl_files, input_token_processor: TokenProcessor, num_samples, frequency):
+    def __init__(self, jsonl_files, input_tokenizer: Tokenizer, num_samples, frequency):
         super().__init__()
         self.jsonl_files = jsonl_files
-        self.input_token_processor = input_token_processor
+        self.input_tokenizer = input_tokenizer
         self.num_samples = num_samples
         self.frequency = frequency
         self.all_entities = self._load_entities_from_jsonl()
@@ -602,7 +602,7 @@ class ReconstructCallback(keras.callbacks.Callback):
                     data = json.loads(line)
                     entity_name = data.get('query', '').strip()
                     entity_type = data.get('type', '').strip()
-                    if len(entity_name) < self.input_token_processor.max_input_length:
+                    if len(entity_name) < self.input_tokenizer.max_input_length:
                         entities.append(entity_name)
                         types.append(entity_type)
         return list(zip(entities, types))
@@ -617,19 +617,19 @@ class ReconstructCallback(keras.callbacks.Callback):
         print(f"\nReconstruction examples at the end of epoch {epoch}:")
 
         for original in selected_rows:
-            tokenized = self.input_token_processor.tokenize(original[0])
+            tokenized = self.input_tokenizer.tokenize(original[0])
             # Reshape to (1, max_input_length)
             tokenized = np.expand_dims(tokenized, axis=0)
             prediction = self.model.predict(tokenized, verbose=0)
-            reconstructed = self.input_token_processor.indices_to_string(
+            reconstructed = self.input_tokenizer.indices_to_string(
                 np.argmax(prediction, axis=-1)[0])
 
-            original_restored = self.input_token_processor.indices_to_string(
+            original_restored = self.input_tokenizer.indices_to_string(
                 tokenized[0])
 
-            print(f"Entity type: {original[1]}")
-            print(f"Original      | {original_restored}")
-            print(f"Reconstructed | {reconstructed}\n")
+            print(f"Type   | {original[1]}")
+            print(f"Query  | {original_restored}")
+            print(f"Answer | {reconstructed}\n")
 
 
 def are_models_same(model1, model2):
