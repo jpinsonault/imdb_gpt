@@ -60,6 +60,7 @@ def character_autoencoder_training():
                                alphabet_size=len(alphabet),
                                config=project_config['siren'])
 
+    model_path = data_dir / "models" / "imdb_autoencoder.keras"
 
     print("\n> compiling model\n")
     model.compile(
@@ -130,9 +131,9 @@ def character_autoencoder_training():
     model.fit(dataset, epochs=3, callbacks=[
         learning_rate_callback,
         reconstruct_callback,
-        save_model_callback,
+        # save_model_callback,
+        # save_model_by_batch_callback,
         commit_changes_to_git_callback,
-        save_model_by_batch_callback,
         tensorboard_callback
     ])
 

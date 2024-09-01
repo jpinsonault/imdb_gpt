@@ -90,14 +90,14 @@ def save_datasets(db_path, output_dir):
             SELECT m.tconst, m.title, m.year, m.genres, m.rating, m.numVotes, m.isAdult, m.runtimeMinutes
             FROM search_movies m
         """,
-        'tvSeries': """
-            SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
-            FROM search_shows s
-        """,
-        'episode': """
-            SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
-            FROM search_episodes e
-        """,
+        # 'tvSeries': """
+        #     SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
+        #     FROM search_shows s
+        # """,
+        # 'episode': """
+        #     SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
+        #     FROM search_episodes e
+        # """,
         'person': """
             SELECT p.nconst, p.primaryName, p.birthYear, p.deathYear, p.primaryProfession, p.knownForTitles
             FROM search_people p
