@@ -416,6 +416,7 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
         siren_inputs = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))(siren_inputs)
 
     siren_output = SirenLayer(alphabet_size, name="siren_output", is_first=False)(siren_inputs)
+    siren_output = Softmax()(siren_output)
 
     model = Model(inputs=inputs, outputs=siren_output)
     return model
