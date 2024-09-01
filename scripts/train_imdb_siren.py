@@ -182,7 +182,7 @@ def character_autoencoder_training():
 
     learning_rate_callback = ScheduledLearningRateCallback(
         schedule=[
-            (0, 0.0001),
+            (0, 0.0002),
             (1, 0.00008),
             (2, 0.00005),
             (3, 0.00002),
@@ -425,6 +425,7 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
     
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), output_shape=(output_length, alphabet_size))(siren_output)
+    x = Softmax()(x)
 
     model = Model(inputs=inputs, outputs=x)
     return model
