@@ -34,7 +34,7 @@ project_config = {
         'batch_size'              : 128,
         'character_embedding_dim' : 128,
         'bottleneck_dim'          : 128,
-        'siren_width'             : 256,
+        'siren_width'             : 512,
         'num_encoder_blocks'      : 4,
         'num_siren_layers'        : 8,
     },

@@ -315,7 +315,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck_dim = config['bottleneck_dim']
     output_length = config['max_output_length']
     num_encoder_blocks = config['num_encoder_blocks']
-    dropout_rate = 0.1
+    dropout_rate = 0.01
 
 
     ff_dim = character_embedding_dim
@@ -323,7 +323,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
     embedding = embedding_layer(inputs)
-    dropped_out_embedding = layers.Dropout(dropout_rate)(embedding)
+    dropped_out_embedding = Dropout(dropout_rate)(embedding)
 
     reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(dropped_out_embedding)
     reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
