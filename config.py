@@ -30,7 +30,10 @@ project_config = {
     },
 
     'siren': {
-        'max_output_length'      : 200,
+        'max_output_length'      : 288,
+        'batch_size'             : 128,
+        'character_embedding_dim': 96,
+        'bottleneck_dim'         : 96,
     },
 
     'llm': {

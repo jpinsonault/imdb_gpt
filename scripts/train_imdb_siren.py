@@ -40,60 +40,6 @@ SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 
 
-class TokenProcessor:
-    def __init__(self, char_to_index, max_input_length):
-        self.char_to_index = char_to_index
-        self.index_to_char = {index: char for char,
-                              index in char_to_index.items()}
-        self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
-        self.max_input_length = max_input_length
-
-    def tokenize(self, input_string):
-        if len(input_string) > self.max_input_length:
-            print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
-            input_string = input_string[:self.max_input_length]
-        input_indices = [self.char_to_index.get(
-            char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
-
-        # Pad the input to max_input_length using zeros
-        total_pad = self.max_input_length - len(input_indices)
-        # num_to_pad_left = random.randint(0, total_pad)
-        num_to_pad_left = 0
-        num_to_pad_right = total_pad - num_to_pad_left
-
-        input_indices = [self.char_to_index[SPECIAL_PAD]]*num_to_pad_left + \
-            input_indices + [self.char_to_index[SPECIAL_PAD]]*num_to_pad_right
-
-        if len(input_indices) != self.max_input_length:
-            raise ValueError(
-                f"Input string is unexpected length: {input_string}: {len(input_indices)}")
-
-        return np.array(input_indices)
-
-    def indices_to_string(self, indices):
-        return "".join([self.index_to_char[index] for index in indices])
-
-    def tokenize_and_mask_input(self, input_string):
-        input_tensor = self.tokenize(input_string)
-        return input_tensor
-
-
-class MaskedCategoricalCrossentropy(tf.keras.losses.Loss):
-    def __init__(self, char_to_index, **kwargs):
-        super().__init__(**kwargs)
-        self.char_to_index = char_to_index
-
-    def call(self, y_true, y_pred):
-        padding_mask = K.cast(
-            K.equal(K.argmax(y_true, axis=-1), self.char_to_index[SPECIAL_PAD]), K.floatx())
-        mask = 1.0 - 0.99 * padding_mask
-        loss = keras.losses.categorical_crossentropy(y_true, y_pred)
-        weighted_loss = loss * mask
-        return K.sum(weighted_loss) / K.sum(mask)
-
-
-def main(args):
-    character_autoencoder_training()
 
 
 def character_autoencoder_training():
@@ -102,20 +48,21 @@ def character_autoencoder_training():
     pprint(project_config)
     max_input_length = project_config['entities']['max_entity_length']
     max_output_length = project_config['siren']['max_output_length']
-    batch_size = project_config['search_autoencoder']['batch_size']
-    character_embedding_dim = project_config['search_autoencoder']['character_embedding_dim']
+    batch_size = project_config['siren']['batch_size']
+    character_embedding_dim = project_config['siren']['character_embedding_dim']
+    bottleneck_dim = project_config['siren']['bottleneck_dim']
 
     # Prepare alphabet and character mapping from multiple JSONL files
     alphabet = get_alphabet(jsonl_files)
     alphabet = [SPECIAL_PAD] + alphabet
 
     char_to_index = {char: index for index, char in enumerate(alphabet)}
-    index_to_char = {index: char for index, char in enumerate(alphabet)}
 
-    fresh_model = kermit_autoencoder(input_length=max_input_length,
+    fresh_model = kermit_siren(input_length=max_input_length,
                                      output_length=max_output_length,
                                      alphabet_size=len(alphabet),
-                                     character_embedding_dim=character_embedding_dim)
+                                     character_embedding_dim=character_embedding_dim,
+                                     bottleneck_dim=bottleneck_dim)
 
     model_path = data_dir / "models" / "imdb_autoencoder.keras"
     loaded_model = try_load_model(model_path)
@@ -204,49 +151,61 @@ def character_autoencoder_training():
         tensorboard_callback
     ])
 
-    
 
-def gelu_activation(x):
-    return tf.keras.activations.gelu(x, approximate=True)
+class TokenProcessor:
+    def __init__(self, char_to_index, max_input_length):
+        self.char_to_index = char_to_index
+        self.index_to_char = {index: char for char,
+                              index in char_to_index.items()}
+        self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
+        self.max_input_length = max_input_length
+
+    def tokenize(self, input_string):
+        if len(input_string) > self.max_input_length:
+            print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
+            input_string = input_string[:self.max_input_length]
+        input_indices = [self.char_to_index.get(
+            char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
+
+        # Pad the input to max_input_length using zeros
+        total_pad = self.max_input_length - len(input_indices)
+        # num_to_pad_left = random.randint(0, total_pad)
+        num_to_pad_left = 0
+        num_to_pad_right = total_pad - num_to_pad_left
+
+        input_indices = [self.char_to_index[SPECIAL_PAD]]*num_to_pad_left + \
+            input_indices + [self.char_to_index[SPECIAL_PAD]]*num_to_pad_right
+
+        if len(input_indices) != self.max_input_length:
+            raise ValueError(
+                f"Input string is unexpected length: {input_string}: {len(input_indices)}")
+
+        return np.array(input_indices)
+
+    def indices_to_string(self, indices):
+        return "".join([self.index_to_char[index] for index in indices])
+
+    def tokenize_and_mask_input(self, input_string):
+        input_tensor = self.tokenize(input_string)
+        return input_tensor
 
 
-class StandardDeviationLayer(Layer):
-    def call(self, inputs):
-        return tf.math.reduce_std(inputs, axis=1, keepdims=True)
+class MaskedCategoricalCrossentropy(tf.keras.losses.Loss):
+    def __init__(self, char_to_index, **kwargs):
+        super().__init__(**kwargs)
+        self.char_to_index = char_to_index
+
+    def call(self, y_true, y_pred):
+        padding_mask = K.cast(
+            K.equal(K.argmax(y_true, axis=-1), self.char_to_index[SPECIAL_PAD]), K.floatx())
+        mask = 1.0 - 0.99 * padding_mask
+        loss = keras.losses.categorical_crossentropy(y_true, y_pred)
+        weighted_loss = loss * mask
+        return K.sum(weighted_loss) / K.sum(mask)
 
 
-class CoefficientOfVariationLayer(Layer):
-    def call(self, inputs):
-        mean = tf.reduce_mean(inputs, axis=1, keepdims=True)
-        std_dev = tf.math.reduce_std(inputs, axis=1, keepdims=True)
-        cv = std_dev / mean
-        return tf.squeeze(cv, axis=1)
-
-
-class EntropyLayer(Layer):
-    def call(self, inputs):
-        std_dev = tf.math.reduce_std(inputs, axis=1, keepdims=True)
-        entropy = 0.5 * \
-            tf.math.log(2 * tf.constant(np.pi) *
-                        tf.constant(np.e) * tf.square(std_dev))
-
-        entropy = tf.squeeze(entropy, axis=1)
-        return entropy
-
-
-class SinActivation(Layer):
-    def call(self, inputs):
-        return tf.math.sin(inputs)
-
-
-class Sigmoid(Layer):
-    def call(self, inputs):
-        return tf.math.sigmoid(inputs)
-
-
-class ReduceMeanLayer(Layer):
-    def call(self, inputs):
-        return tf.reduce_mean(inputs, axis=1, keepdims=True)
+def main(args):
+    character_autoencoder_training()
 
 
 class SirenLayer(Layer):
@@ -311,20 +270,6 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     
     return ff_output
 
-def transformer_decoder_block(input, encoder_output, num_heads, ff_dim, dropout_rate=0.1):
-    # Self-attention
-    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
-    attention_output = layers.Dropout(dropout_rate)(attention_output)
-    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
-    
-    # Feed-forward network
-    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
-    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
-    ff_output = layers.Dropout(dropout_rate)(ff_output)
-    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
-    
-    return ff_output
-
 def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
     # Self-attention to get attention scores
 
@@ -367,13 +312,12 @@ class RepeatBottleneckLayer(Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.output_length, input_shape[-1])
 
-def kermit_autoencoder(input_length, output_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
+def kermit_siren(input_length, output_length, alphabet_size, character_embedding_dim, bottleneck_dim, dropout_rate=0.001):
     num_encoder_blocks = 4
     num_decoder_blocks = 4
     num_heads = 1
 
     ff_dim = character_embedding_dim
-    bottleneck_dim = character_embedding_dim
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)
