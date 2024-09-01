@@ -35,8 +35,8 @@ project_config = {
         'character_embedding_dim' : 128,
         'bottleneck_dim'          : 128,
         'siren_width'             : 512,
-        'num_encoder_blocks'      : 4,
-        'num_siren_layers'        : 8,
+        'num_encoder_blocks'      : 8,
+        'num_siren_layers'        : 4,
     },
 
     'llm': {
