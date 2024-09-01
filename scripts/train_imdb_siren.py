@@ -510,58 +510,83 @@ class RecursiveTextBatchGenerator:
         )
 
 
-def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor: TokenProcessor, output_token_processor: TokenProcessor):
+def autoencoder_batch_generator(jsonl_files, batch_size, input_token_processor, output_token_processor):
     """
-    Batch generator for autoencoder training using multiple JSONL files.
+    Efficient batch generator for autoencoder training using multiple JSONL files.
     """
+    # Load all JSONL data into memory
+    all_data = []
+    dataset_sizes = []
+
+    # Load data from each JSONL file and store in memory
+    for jsonl_path in jsonl_files:
+        with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
+            data = [json.loads(line) for line in jsonl_file]
+            all_data.append(data)
+            dataset_sizes.append(len(data))
+    
+    # Calculate sampling probabilities based on dataset sizes
+    total_size = sum(dataset_sizes)
+    sampling_probs = [size / total_size for size in dataset_sizes]
+
+    # Generate batches
+    data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
+    x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
+    y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
+
+    batch_index = 0
+
     while True:
-        # Set up batches
-        x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
-        y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
+        # Randomly choose a dataset based on sampling probabilities
+        dataset_choice = random.choices(range(len(jsonl_files)), weights=sampling_probs, k=1)[0]
 
-        # Process each JSONL file specified
-        for jsonl_path in jsonl_files:
-            with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
-                # Initialize batch index
+        # Check if we've exhausted the chosen dataset
+        if data_indices[dataset_choice] >= dataset_sizes[dataset_choice]:
+            continue  # Skip if this dataset is exhausted
+
+        # Fetch data point from chosen dataset
+        data_point = all_data[dataset_choice][data_indices[dataset_choice]]
+        data_indices[dataset_choice] += 1
+
+        query = data_point.get('query', '').strip()
+        result = data_point.get('result', '').strip()
+
+        if not query or len(query) > input_token_processor.max_input_length:
+            continue
+
+        try:
+            # Tokenize the input query
+            input_string_token_indices = input_token_processor.tokenize(query)
+
+            # Tokenize the output result
+            output_token_indices = output_token_processor.tokenize(result)[:output_token_processor.max_input_length]
+
+            # Update the batch
+            x_batch[batch_index] = input_string_token_indices
+
+            # One-hot encode the output batch
+            for idx, token_index in enumerate(output_token_indices):
+                y_batch[batch_index, idx, token_index] = 1
+
+            batch_index += 1
+
+            # Yield a full batch
+            if batch_index == batch_size:
                 batch_index = 0
+                yield x_batch, y_batch
+                # Reset for next batch
+                x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
+                y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
 
-                print(f"Entity Batch Generator: Fetching entities from {jsonl_path}...")
-                for line in jsonl_file:
-                    data = json.loads(line)
-                    query = data.get('query', '').strip()
-                    result = data.get('result', '').strip()
-
-                    if not query or len(query) > input_token_processor.max_input_length:
-                        continue
-
-                    try:
-                        # Tokenize the query (input)
-                        input_string_token_indices = input_token_processor.tokenize(query)
-
-                        # Initialize output token indices for SIREN output
-                        output_token_indices = output_token_processor.tokenize(result)[:output_token_processor.max_input_length]
-
-                        # Update input batch
-                        x_batch[batch_index] = input_string_token_indices
-
-                        # Update output batch with one-hot encoding for target tokens
-                        for idx, token_index in enumerate(output_token_indices):
-                            y_batch[batch_index, idx, token_index] = 1
-
-                        batch_index += 1
-
-                        if batch_index == batch_size:
-                            batch_index = 0
-                            yield x_batch, y_batch
-                            # Reset batches for the next iteration
-                            x_batch = np.zeros((batch_size, input_token_processor.max_input_length), dtype=np.int32)
-                            y_batch = np.zeros((batch_size, output_token_processor.max_input_length, len(output_token_processor.char_to_index)), dtype=np.float32)
-                    except Exception as e:
-                        traceback.print_exc()
-                        exc_type, exc_obj, exc_tb = sys.exc_info()
-                        print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
-                        print(f"\nFailed to process entity: {query}\n")
-
+        except Exception as e:
+            traceback.print_exc()
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
+            print(f"\nFailed to process entity: {query}\n")
+        
+        # Check if all datasets are exhausted
+        if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
+            break  # Exit loop if all datasets are exhausted
 
 
 def masked_categorical_crossentropy(char_to_index, y_true, y_pred):
