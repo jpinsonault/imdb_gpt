@@ -1,457 +1,237 @@
-from collections import defaultdict, namedtuple
-import csv
-import json
-from pathlib import Path
-import random
-import re
 import sqlite3
-import sys
-import time
-
+import json
+from jinja2 import Template, Environment
+from pathlib import Path
 from tqdm import tqdm
-import pickle
 from config import project_config
-import random
 
-MovieDescription = namedtuple('MovieDescription', ['title', 'tconst', 'description'])
+# Function to create a Jinja2 environment with Python's built-in functions
+def create_jinja_environment():
+    env = Environment()
+    env.globals.update(str=str)  # Provide the 'str' function to the environment
+    return env
 
+# Create the Jinja2 environment
+jinja_env = create_jinja_environment()
 
+# Dynamic Jinja2 templates with conditional logic
+templates = {
+    'movie': jinja_env.from_string(
+        """
+        Title: {{ title }}
+        {% if year %}Year{{ 's' if '-' in str(year) else '' }}: {{ year }}{% endif %}
+        {% if genres %}Genre{{ 's' if ',' in genres else '' }}: {{ genres | replace(',', ', ') }}{% endif %}
+        {% if rating %}Rating: {{ rating }}{% endif %}
+        {% if isAdult and isAdult == 1 %}Note: Adult Content{% endif %}
+        """
+    ),
+    'tvSeries': jinja_env.from_string(
+        """
+        TV Series: {{ title }}
+        {% if startYear or endYear %}Year{{ 's' if startYear and endYear and str(startYear) != str(endYear) else '' }}: {{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}{% endif %}
+        {% if genres %}Genre{{ 's' if ',' in genres else '' }}: {{ genres | replace(',', ', ') }}{% endif %}
+        {% if rating %}Rating: {{ rating }}{% endif %}
+        """
+    ),
+    'episode': jinja_env.from_string(
+        """
+        Episode: {{ title }}
+        {% if parentTitle %}Series: {{ parentTitle }}{% endif %}
+        {% if seasonNumber %}Season: {{ seasonNumber }}{% endif %}
+        {% if episodeNumber %}Episode: {{ episodeNumber }}{% endif %}
+        """
+    ),
+    'person': jinja_env.from_string(
+        """
+        Name: {{ primaryName }}
+        {% if primaryProfession %}Profession{{ 's' if ',' in primaryProfession else '' }}: {{ primaryProfession | replace(',', ', ') }}{% endif %}
+        {% if knownForTitles %}Known for: {{ knownForTitles | replace(',', '\n') }}{% endif %}
+        """
+    ),
+    'character': jinja_env.from_string(
+        """
+        Character: {{ character }}
+        {% if name %}Played by: {{ name }}{% endif %}
+        {% if title %}Show: {{ title }}{% endif %}
+        {% if job %}Job: {{ job }}{% endif %}
+        """
+    )
+}
 
-db_schema = """
-CREATE TABLE title_akas (
-    titleId TEXT NOT NULL,
-    ordering INTEGER NOT NULL,
-    title TEXT,
-    region TEXT,
-    language TEXT,
-    types TEXT,
-    attributes TEXT,
-    isOriginalTitle INTEGER,
-    PRIMARY KEY (titleId, ordering),
-    FOREIGN KEY (titleId) REFERENCES title_basics (tconst)
-);
-
-CREATE TABLE title_basics (
-    tconst TEXT PRIMARY KEY,
-    titleType TEXT,
-    primaryTitle TEXT,
-    originalTitle TEXT,
-    isAdult INTEGER,
-    startYear INTEGER,
-    endYear INTEGER,
-    runtimeMinutes INTEGER,
-    genres TEXT
-);
-
-CREATE TABLE title_crew (
-    tconst TEXT PRIMARY KEY,
-    directors TEXT,
-    writers TEXT,
-    FOREIGN KEY (tconst) REFERENCES title_basics (tconst)
-);
-
-CREATE TABLE title_episode (
-    tconst TEXT PRIMARY KEY,
-    parentTconst TEXT,
-    seasonNumber INTEGER,
-    episodeNumber INTEGER,
-    FOREIGN KEY (tconst) REFERENCES title_basics (tconst),
-    FOREIGN KEY (parentTconst) REFERENCES title_basics (tconst)
-);
-
-CREATE TABLE title_principals (
-    tconst TEXT NOT NULL,
-    ordering INTEGER NOT NULL,
-    nconst TEXT,
-    category TEXT,
-    job TEXT,
-    characters TEXT,
-    PRIMARY KEY (tconst, ordering),
-    FOREIGN KEY (tconst) REFERENCES title_basics (tconst),
-    FOREIGN KEY (nconst) REFERENCES name_basics (nconst)
-);
-
-CREATE TABLE title_ratings (
-    tconst TEXT PRIMARY KEY,
-    averageRating REAL,
-    numVotes INTEGER,
-    FOREIGN KEY (tconst) REFERENCES title_basics (tconst)
-);
-
-CREATE TABLE name_basics (
-    nconst TEXT PRIMARY KEY,
-    primaryName TEXT,
-    birthYear INTEGER,
-    deathYear INTEGER,
-    primaryProfession TEXT,
-    knownForTitles TEXT
-);"""
-
-def format_movie_descriptions(db_path):
-    query = f"""
-    SELECT
-        tb.tconst,
-        tb.primaryTitle,
-        tb.startYear,
-        tb.genres,
-        tr.averageRating,
-        tr.numVotes,
-        group_concat(CASE WHEN tp.category IN ('actor', 'actress') THEN nb.primaryName || ':@' || tp.characters ELSE NULL END, '|') AS actors,
-        group_concat(CASE WHEN tp.category = 'director' THEN nb.primaryName ELSE NULL END, ',') AS directors,
-        group_concat(CASE WHEN tp.category = 'writer' THEN nb.primaryName ELSE NULL END, ',') AS writers
-    FROM
-        title_basics AS tb
-    LEFT JOIN
-        title_ratings AS tr ON tb.tconst = tr.tconst
-    LEFT JOIN
-        title_principals AS tp ON tb.tconst = tp.tconst
-    LEFT JOIN
-        name_basics AS nb ON tp.nconst = nb.nconst
-    GROUP BY
-        tb.tconst    
+def load_dictionaries(cursor):
     """
-
-    print("Connecting to database...")
-    # Connect to the SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Execute the query
-    print("Executing query...")
-    cursor.execute(query)
-    movies = cursor.fetchall()
-
-    # Formatting the results
-    formatted_movies = []
-    for movie in tqdm(movies, desc="Formatting movies"):
-        # Adjusted to match the number of selected columns
-        (tconst, title, start_year, genres, rating, num_votes, actors, directors, writers) = movie
-        # The rest of your code remains the same...
-        genres = genres.replace(',', ', ') if genres else genres
-
-        movie_desc = f"Title: {title}\nYear: {start_year}\nGenres: {genres}\n"
-
-        if directors:
-            directors = ', '.join(directors.split(',')) if directors else directors
-            movie_desc += f"Directors: {directors}\n"
-        if writers:
-            writers = ', '.join(writers.split(',')) if writers else writers
-            movie_desc += f"Writers: {writers}\n"
-        if actors:
-            actors = reformat_characters(actors)
-            movie_desc += f"Cast:\n{actors}\n"
-        if rating:
-            movie_desc += f"Rating: {rating} ({num_votes} votes)\n"
-        movie_desc += '-'*40 + '\n'
-        formatted_movies.append(MovieDescription(title, tconst, movie_desc))
-
-    conn.close()
-    return formatted_movies
-
-
-def reformat_characters(actor_string):
+    Load all titles (tconst) and names (nconst) into dictionaries for lookup.
     """
-    Reformat the actor string to replace the list of roles with a more natural representation.
-    Example: 'Owen: ["Role1", "Role2"]' to 'Owen as Role1 and Role2'
-    """
-    if not actor_string:
-        return ""
-    
-    actors = actor_string.split('|')
-    formatted_actors = []
-    for actor in actors:
-        parts = actor.split(':@')
-        if len(parts) >= 1:
-            try:
-                name, roles = parts
-            except ValueError:
-                print(parts, actor)
-                raise
-            roles = roles.strip("[]").replace('"', '').replace(", ", " and ")
+    # Load titles from movies and shows into a single dictionary
+    cursor.execute("SELECT tconst, title FROM search_movies")
+    tconst_to_title = {row[0]: row[1] for row in cursor.fetchall()}
 
-            role_string = f" - {name} as {roles}\n"
-            formatted_actors.append(role_string)
-        else:
-            formatted_actors.append(actor)
+    cursor.execute("SELECT tconst, title FROM search_shows")
+    tconst_to_title.update({row[0]: row[1] for row in cursor.fetchall()})
 
-    return "".join(formatted_actors)
+    # Load names from people into a dictionary
+    cursor.execute("SELECT nconst, primaryName FROM search_people")
+    nconst_to_name = {row[0]: row[1] for row in cursor.fetchall()}
 
+    return tconst_to_title, nconst_to_name
 
-def create_movie_dataset(db_path):
-    formatted_movies = format_movie_descriptions(db_path)
-
-    for movie in random.sample(formatted_movies, 50):
-        print(movie.description)
-
-
-def list_movie_titles(db_path, limit=None):
-    query = f"""
-    SELECT primaryTitle, tconst FROM title_basics    
-    """
-    
-    if limit:
-        query += f" LIMIT {limit}"
-
-    print("Fetching movie titles...")
-
-    # Connect to the SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Execute the query
-    cursor.execute(query)
-    titles = cursor.fetchall()
-
-    conn.close()
-    return titles
-
-def list_names(db_path, limit=None):
-    query = f"""
-    SELECT primaryName, nconst FROM name_basics
-    """
-    
-    if limit:
-        query += f" LIMIT {limit}"
-
-    print("Fetching names...")
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute(query)
-    names = cursor.fetchall()
-
-    conn.close()
-    return names
-
-def list_episode_titles(db_path, limit=None):
-    query = f"""
-    SELECT primaryTitle, tconst
-    FROM title_episode 
-    JOIN title_basics
-    ON title_episode.tconst = title_basics.tconst
-    """
-    
-    if limit:
-        query += f" LIMIT {limit}"
-    
-
-    print("Fetching episode titles...")
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    cursor.execute(query)
-    episode_titles = cursor.fetchall()
-
-    conn.close()
-    return episode_titles
-
-
-def list_characters(db_path, limit=None):
-    query = """
-    SELECT
-        tp.characters, tp.tconst, tp.nconst
-    FROM
-        title_principals AS tp
-    WHERE
-        tp.category IN ('actor', 'actress')
-    AND
-        tp.characters IS NOT NULL    
-    """
-    
-    if limit:
-        query += f" LIMIT {limit}"
-
-    print("Fetching character names...")
-
-    # Connect to the SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Execute the query
-    cursor.execute(query)
-    character_entries = cursor.fetchall()
-
-    conn.close()
-
-    character_tuples = []
-    for characters_str, tconst, nconst in character_entries:
-        # Using regex to find all occurrences of characters between quotes
-        characters = re.findall(r'\"(.*?)\"', characters_str)
-        for character in characters:
-            character_tuples.append((character, tconst, nconst))
-
-    return character_tuples
-
-
-def save_all_entities_to_file(data_dir: Path, db_filename):
-    characters = set(list_characters(data_dir / db_filename))
-    titles = set(list_movie_titles(data_dir / db_filename))
-    names = set(list_names(data_dir / db_filename))
-    episode_titles = set(list_episode_titles(data_dir / db_filename))
-
-    all_entities = defaultdict(list)
-    
-    print(f"found titles: {len(titles)}, first two: {list(titles)[0:2]}")
-    for title, tconst in titles:
-        all_entities[title.lower()].append({'tconst': tconst, 'type': 'title'})
-    
-    print(f"found names: {len(names)}, first two: {list(names)[0:2]}")
-    for name, nconst in names:
-        all_entities[name.lower()].append({'nconst': nconst, 'type': 'name'})
-    
-    print(f"found episode titles: {len(episode_titles)}, first two: {list(episode_titles)[0:2]}")
-    all_entities.extend(episode_titles)
-    
-    print(f"found characters: {len(characters)}, first two: {list(characters)[0:2]}")
-    all_entities.extend(characters)
-
-    all_entities = [entity for entity in all_entities if len(entity) < 94 and len(entity) > 2]
-
-    all_entities = list(set(all_entities))
-    
-    print(f"first 10 entities: {all_entities[0:10]}")
-
-    print(f"Total entities: {len(all_entities)}")
-    print(f"Min length: {min(len(entity) for entity in all_entities)}")
-    print(f"Max length: {max(len(entity) for entity in all_entities)}")
-    print(f"Average length: {sum(len(entity) for entity in all_entities) / len(all_entities)}")
-    percentile_95 = sorted(len(entity) for entity in all_entities)[int(len(all_entities) * 0.95)]
-    percentile_99 = sorted(len(entity) for entity in all_entities)[int(len(all_entities) * 0.99)]
-    print(f"99th percentile: {percentile_99}")
-    print(f"95th percentile: {percentile_95}")
-
-    # write each entity to a file, one per line
-    entity_file = './entities.txt'
-    with open(entity_file, 'w', encoding='utf-8') as f:
-        for entity in tqdm(all_entities, desc="Writing entities to file"):
-            try:
-                f.write(entity + '\n')
-            except UnicodeEncodeError:
-                print(f"UnicodeEncodeError: {entity}")
-                continue
-            
-            
-def find_long_title_high_rating_movies(db_path):
-    query = """
-    SELECT
-        tb.tconst,
-        tb.primaryTitle,
-        tr.averageRating,
-        tr.numVotes
-    FROM
-        title_basics AS tb
-    JOIN
-        title_ratings AS tr ON tb.tconst = tr.tconst
-    WHERE
-        LENGTH(tb.primaryTitle) > 64
-    AND
-        tr.averageRating > 5
-    AND
-        tr.numVotes > 100
-    """
-
-    print("Fetching movies with long titles and high ratings...")
-
-    # Connect to the SQLite database
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # Execute the query
-    cursor.execute(query)
-    movies = cursor.fetchall()
-
-    conn.close()
-
-    for movie in movies:
-        print(f"Title: {movie[1]}, Rating: {movie[2]}, Number of Votes: {movie[3]}")
-        
-    print(f"Found {len(movies)} movies with long titles and high ratings")
-    
-    # print out all the length stats
-    print(f"Min length: {min(len(movie[1]) for movie in movies)}")
-    print(f"Max length: {max(len(movie[1]) for movie in movies)}")
-    print(f"Average length: {sum(len(movie[1]) for movie in movies) / len(movies)}")
-    percentile_95 = sorted(len(movie[1]) for movie in movies)[int(len(movies) * 0.95)]
-    percentile_99 = sorted(len(movie[1]) for movie in movies)[int(len(movies) * 0.99)]
-    print(f"99th percentile: {percentile_99}")
-    print(f"95th percentile: {percentile_95}")
-
-
-def print_sqlite_schema(db_path):
-    """
-    Prints the schema of the SQLite database.
-
-    :param db_path: Path to the SQLite database file.
-    """
-    try:
-        # Connect to the SQLite database
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        # Query to retrieve all table names in the database
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-
-        # Loop through all tables and print their schema
-        for table in tables:
-            table_name = table[0]
-            print(f"Schema for table '{table_name}':")
-            
-            # Query to get the schema of the table
-            cursor.execute(f"PRAGMA table_info('{table_name}');")
-            schema = cursor.fetchall()
-
-            # Print each column's schema
-            for column in schema:
-                print(f"  {column[1]}: {column[2]} (Not Null: {bool(column[3])}, Default: {column[4]})")
-            
-            print("\n")  # Add a newline after each table schema
-
-    except sqlite3.Error as e:
-        print(f"An error occurred while accessing the SQLite database: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-
-def save_dataset(db_path, output_csv):
+# Function to save dataset as JSONL files with dynamic templating
+def save_datasets(db_path, output_dir):
     # Connect to the database
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    # Define queries to extract entities and their types
+
+    # Load dictionaries for tconst and nconst lookups
+    tconst_to_title, nconst_to_name = load_dictionaries(cursor)
+
+    # Corrected queries to extract entities and their types
     queries = {
-        'movie': "SELECT primaryTitle AS entity FROM title_basics WHERE titleType='movie'",
-        'tvSeries': "SELECT primaryTitle AS entity FROM title_basics WHERE titleType='tvSeries'",
-        'episode': "SELECT title AS entity FROM search_episodes",
-        'person': "SELECT primaryName AS entity FROM name_basics",
-        'character': "SELECT name AS entity FROM search_characters",
+        'movie': """
+            SELECT m.tconst, m.title, m.year, m.genres, m.rating, m.numVotes, m.isAdult, m.runtimeMinutes
+            FROM search_movies m
+        """,
+        'tvSeries': """
+            SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
+            FROM search_shows s
+        """,
+        'episode': """
+            SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
+            FROM search_episodes e
+        """,
+        'person': """
+            SELECT p.nconst, p.primaryName, p.birthYear, p.deathYear, p.primaryProfession, p.knownForTitles
+            FROM search_people p
+        """,
+        'character': """
+            SELECT c.tconst, c.nconst, c.name, c.character, c.category, c.job
+            FROM search_characters c
+        """
     }
 
-    # Prepare the output data
-    dataset = set()
-    
-    # Wrap the iteration with tqdm for progress tracking
-    for entity_type, query in tqdm(queries.items(), desc="Processing Entity Types"):
+    # Create output directory if it does not exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Sets to track valid shows, movies, and people
+    included_shows = set()
+    included_movies = set()
+    included_people = set()
+    filtered_counts = {entity_type: 0 for entity_type in queries}
+
+    # Process each entity type
+    for entity_type, query in queries.items():
         cursor.execute(query)
         rows = cursor.fetchall()
-        for row in rows:
-            dataset.add((row[0], entity_type))
 
-    dataset = list(dataset)
-    random.shuffle(dataset)
-    
-    # Write the dataset to CSV
-    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile, delimiter='\t')
-        writer.writerow(['entity', 'type'])
-        writer.writerows(dataset)
-    
+        output_file = Path(output_dir) / f"{entity_type}.jsonl"
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for row in tqdm(rows, desc=f"Processing {entity_type}"):
+                # Filter out titles without years or with fewer than 10 votes
+                if entity_type in ['movie', 'tvSeries']:
+                    year = row[2]
+                    votes_row = 5 if entity_type == 'movie' else 6
+                    votes = row[votes_row]
+                    # Check for missing year and votes
+                    if year is None or votes is None or votes < 10:
+                        filtered_counts[entity_type] += 1
+                        continue
+
+                    # Add valid movies and shows to the corresponding sets
+                    if entity_type == 'movie':
+                        included_movies.add(row[0])  # Add tconst of the movie to the set
+                    elif entity_type == 'tvSeries':
+                        included_shows.add(row[0])  # Add tconst of the show to the set
+
+                # Check if episode's parentTconst is in included shows
+                if entity_type == 'episode' and row[1] not in included_shows:
+                    filtered_counts[entity_type] += 1
+                    continue
+
+                # Check if person's known titles are in included movies or shows
+                if entity_type == 'person':
+                    known_tconsts = row[5]
+                    if known_tconsts is None:
+                        filtered_counts[entity_type] += 1
+                        continue
+
+                    known_tconsts = known_tconsts.split(',')
+                    # Filter based on tconsts
+                    if not any(tconst in included_movies or tconst in included_shows for tconst in known_tconsts):
+                        filtered_counts[entity_type] += 1
+                        continue
+                    included_people.add(row[0])  # Add nconst of the person to the set
+                    # Resolve the titles using the lookup dictionary
+                    resolved_titles = [tconst_to_title.get(tconst, 'Unknown') for tconst in known_tconsts]
+                    row = list(row)  # Convert to a mutable list
+                    row[5] = ', '.join(resolved_titles)  # Update knownForTitles with resolved titles
+
+                # Check if character's tconst or nconst are in included movies or people
+                if entity_type == 'character' and (row[0] not in included_movies or row[1] not in included_people):
+                    filtered_counts[entity_type] += 1
+                    continue
+
+                # Construct the data dictionary
+                if entity_type == 'movie':
+                    data = {
+                        'tconst': row[0], 'title': row[1], 'year': row[2], 'genres': row[3],
+                        'rating': row[4], 'numVotes': row[5], 'isAdult': row[6], 'runtimeMinutes': row[7]
+                    }
+                    query_value = row[1]
+                elif entity_type == 'tvSeries':
+                    data = {
+                        'tconst': row[0], 'title': row[1], 'startYear': row[2], 'endYear': row[3],
+                        'genres': row[4], 'rating': row[5], 'numVotes': row[6],
+                        'isAdult': row[7], 'runtimeMinutes': row[8]
+                    }
+                    query_value = row[1]
+                elif entity_type == 'episode':
+                    parent_title = tconst_to_title.get(row[1], 'Unknown')
+                    data = {
+                        'tconst': row[0], 'parentTconst': row[1], 'title': row[2],
+                        'parentTitle': parent_title, 'seasonNumber': row[3], 'episodeNumber': row[4], 'isAdult': row[5]
+                    }
+                    query_value = row[2]
+                elif entity_type == 'person':
+                    data = {
+                        'nconst': row[0], 'primaryName': row[1], 'birthYear': row[2], 'deathYear': row[3],
+                        'primaryProfession': row[4], 'knownForTitles': row[5]
+                    }
+                    query_value = row[1]
+                elif entity_type == 'character':
+                    title = tconst_to_title.get(row[0], 'Unknown')
+                    name = nconst_to_name.get(row[1], 'Unknown')
+                    data = {
+                        'tconst': row[0], 'nconst': row[1], 'name': name, 'character': row[2],
+                        'title': title, 'category': row[3], 'job': row[4]
+                    }
+                    query_value = row[2]
+
+                # Remove empty or None values for a cleaner output
+                data = {k: v for k, v in data.items() if v not in (None, '', '\\\\N')}
+
+                # Format the template
+                formatted_text = templates[entity_type].render(data).strip()
+
+                # Create the JSON object for output
+                json_record = json.dumps({
+                    "type": entity_type,
+                    "query": query_value,
+                    "result": formatted_text,
+                    **{k: v for k, v in data.items() if k in ['tconst', 'nconst', 'parentTconst']}
+                })
+
+                # Write the JSON object to file
+                f.write(json_record + '\n')
+
+    # Log filtered counts
+    print("Filtering Summary:")
+    for entity_type, count in filtered_counts.items():
+        print(f"Filtered {count} items from {entity_type}")
+
     # Close the database connection
     conn.close()
-
 
 if __name__ == '__main__':
     data_dir = Path(project_config['data_dir'])
     
-    save_dataset(data_dir / 'imdb.db', data_dir / 'imdb_dataset.csv')
+    save_datasets(data_dir / 'imdb.db', data_dir)

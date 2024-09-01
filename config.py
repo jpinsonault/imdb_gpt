@@ -6,6 +6,16 @@ project_config = {
     'data_dir'             : "./data/",
     'corpus_dir'           : "./data/corpus/",
     'docker_data_dir_mount': '/app/imdb',
+
+    'dataset': {
+        'jsonl_files': [
+            "movie.jsonl",
+            "tvSeries.jsonl",
+            "episode.jsonl",
+            "person.jsonl",
+            "character.jsonl",
+        ],
+    },
     
     'entities': {
         'max_entity_length'  : 96,
@@ -17,6 +27,10 @@ project_config = {
         'epochs'                 : 16,
         'character_embedding_dim': 96,
         'batch_size'             : 64,
+    },
+
+    'siren': {
+        'max_output_length'      : 200,
     },
 
     'llm': {
