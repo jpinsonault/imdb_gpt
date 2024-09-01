@@ -56,21 +56,10 @@ def character_autoencoder_training():
 
     char_to_index = {char: index for index, char in enumerate(alphabet)}
 
-    fresh_model = kermit_siren(input_length=max_input_length,
+    model = kermit_siren(input_length=max_input_length,
                                alphabet_size=len(alphabet),
                                config=project_config['siren'])
 
-    model_path = data_dir / "models" / "imdb_autoencoder.keras"
-    loaded_model = try_load_model(model_path)
-
-    if loaded_model is None:
-        print("\n> no model found, using new model\n")
-        model = fresh_model
-    elif not are_models_same(fresh_model, loaded_model):
-        print("\n> loaded model is out of date, using new model\n")
-        model = fresh_model
-    else:
-        model = loaded_model
 
     print("\n> compiling model\n")
     model.compile(
@@ -341,9 +330,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     encoder_output = x
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
-    bottleneck = Dense(bottleneck_dim*4, activation='gelu')(bottleneck)
     bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
-    # bottleneck = LayerNormalization()(bottleneck)
 
     # Use the custom layer to repeat bottleneck for each output position
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
