@@ -595,14 +595,17 @@ class ReconstructCallback(keras.callbacks.Callback):
 
     def _load_entities_from_jsonl(self):
         entities = []
+        types = []
         for jsonl_path in self.jsonl_files:
             with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
                 for line in jsonl_file:
                     data = json.loads(line)
                     entity_name = data.get('query', '').strip()
+                    entity_type = data.get('type', '').strip()
                     if len(entity_name) < self.input_token_processor.max_input_length:
                         entities.append(entity_name)
-        return entities
+                        types.append(entity_type)
+        return list(zip(entities, types))
 
     def on_batch_end(self, epoch, logs=None):
         if epoch % self.frequency != 0:
@@ -614,7 +617,7 @@ class ReconstructCallback(keras.callbacks.Callback):
         print(f"\nReconstruction examples at the end of epoch {epoch}:")
 
         for original in selected_rows:
-            tokenized = self.input_token_processor.tokenize(original)
+            tokenized = self.input_token_processor.tokenize(original[0])
             # Reshape to (1, max_input_length)
             tokenized = np.expand_dims(tokenized, axis=0)
             prediction = self.model.predict(tokenized, verbose=0)
@@ -624,6 +627,7 @@ class ReconstructCallback(keras.callbacks.Callback):
             original_restored = self.input_token_processor.indices_to_string(
                 tokenized[0])
 
+            print(f"Entity type: {original[1]}")
             print(f"Original      | {original_restored}")
             print(f"Reconstructed | {reconstructed}\n")
 
