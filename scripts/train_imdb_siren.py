@@ -399,10 +399,10 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
     bottleneck = layers.Dense(bottleneck_dim, activation='linear')(bottleneck)
     bottleneck = layers.LayerNormalization()(bottleneck)
 
-    # Custom layer to repeat bottleneck
+    # Use the custom layer to repeat bottleneck for each output position
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
 
-    # Custom layer to expand and tile positions
+    # Generate and expand positional encoding for output positions using a custom layer
     expanded_positions = ExpandAndTileLayer(output_length)(bottleneck)
 
     # Concatenate bottleneck and positions
@@ -420,6 +420,8 @@ def kermit_autoencoder(input_length, output_length, alphabet_size, character_emb
 
     model = Model(inputs=inputs, outputs=siren_output)
     return model
+
+
 
 
 class RecursiveTextBatchGenerator:
