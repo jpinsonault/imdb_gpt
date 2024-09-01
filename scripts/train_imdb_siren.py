@@ -341,8 +341,8 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     encoder_output = x
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
-    bottleneck = Dense(bottleneck_dim*4, activation='linear')(bottleneck)
-    bottleneck = Dense(bottleneck_dim, activation='gelu')(bottleneck)
+    bottleneck = Dense(bottleneck_dim*4, activation='gelu')(bottleneck)
+    bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
     bottleneck = LayerNormalization()(bottleneck)
 
     # Use the custom layer to repeat bottleneck for each output position
