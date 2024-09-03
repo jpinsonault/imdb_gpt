@@ -128,7 +128,7 @@ def character_autoencoder_training():
     )
 
     # Train the model
-    model.fit(dataset, epochs=3, callbacks=[
+    model.fit(dataset, epochs=10, callbacks=[
         learning_rate_callback,
         reconstruct_callback,
         # save_model_callback,
