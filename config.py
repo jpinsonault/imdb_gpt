@@ -10,19 +10,10 @@ project_config = {
     'dataset': {
         'jsonl_files': [
             "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
-            "movie.jsonl",
             # "tvSeries.jsonl",
             # "episode.jsonl",
-            "person.jsonl",
-            "character.jsonl",
+            # "person.jsonl",
+            # "character.jsonl",
         ],
     },
     
