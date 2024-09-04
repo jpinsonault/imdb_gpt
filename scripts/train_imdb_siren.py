@@ -40,8 +40,6 @@ SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 
 
-
-
 def character_autoencoder_training():
     data_dir = Path(project_config['data_dir'])
     jsonl_files = [data_dir / jsonl_file for jsonl_file in project_config['dataset']['jsonl_files']]
@@ -337,12 +335,12 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
 
     # Generate positional encoding for output positions
-    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
+    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim//4)
     
     # Repeat the positional encoding across the batch size to match expanded_bottleneck
     tiled_positional_encoding = Lambda(
         lambda x: tf.tile(siren_positional_encoding, [tf.shape(x)[0], 1, 1]),
-        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim)
+        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim//4)
     )(expanded_bottleneck)
 
     # Concatenate bottleneck and positions
