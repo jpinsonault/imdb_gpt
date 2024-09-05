@@ -205,9 +205,9 @@ class SirenLayer(Layer):
     def build(self, input_shape):
         # Create a dense layer with the given number of units and sine activation
         self.layer = tf.keras.layers.Dense(
-            units=self.units, activation=self.activation, dtype=self.layer_dtype)
+            units=self.units, activation=None, dtype=self.layer_dtype)  # Removed activation to apply it after adding dynamic bias
 
-        fan_in = input_shape[-1]
+        fan_in = input_shape[0][-1]  # Input shape is a tuple of (position_encoding, bottleneck), so use the first
 
         # Initialize the weights of the layer according to the SIREN scheme
         if self.is_first:
@@ -217,15 +217,33 @@ class SirenLayer(Layer):
             self.layer.kernel_initializer = tf.initializers.RandomUniform(minval=-tf.sqrt(6 / fan_in) / self.omega,
                                                                           maxval=tf.sqrt(6 / fan_in) / self.omega)
 
-    def call(self, inputs):
-        # Call the dense layer with the given inputs
-        return self.layer(inputs)
+        # Dense layer to generate dynamic biases from the bottleneck
+        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype)
 
-    def get_config(self):
-        # Define the configuration of the layer
-        config = super(SirenLayer, self).get_config()
-        config.update({'units': self.units, 'dtype': self.layer_dtype})
-        return config
+    def call(self, inputs):
+        # Split inputs into positional encoding and bottleneck
+        position_encoding, bottleneck = inputs
+
+        # Pass the bottleneck through the bias-generating dense layer
+        dynamic_bias = self.bias_dense(bottleneck)
+
+        # Ensure dynamic bias has the correct shape by expanding dimensions
+        dynamic_bias = tf.expand_dims(dynamic_bias, axis=1)  # Shape: [batch_size, 1, units]
+
+        # Repeat dynamic bias to match the positional encoding length
+        dynamic_bias = tf.repeat(dynamic_bias, repeats=tf.shape(position_encoding)[1], axis=1)  # Shape: [batch_size, output_length, units]
+
+        # Compute the weighted sum of inputs
+        weighted_input = self.layer(position_encoding)
+
+        # Add the dynamic bias
+        biased_output = weighted_input + dynamic_bias
+
+        # Apply sine activation function
+        output = self.activation(self.omega * biased_output)
+
+        return output
+
 
 
 class ExpandDims(Layer):
@@ -238,7 +256,6 @@ class Stack(Layer):
 
     def call(self, inputs):
         return tf.stack(inputs, axis=1)
-
 
 
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
@@ -255,6 +272,7 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     
     return ff_output
 
+
 def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
     # Self-attention to get attention scores
 
@@ -269,6 +287,7 @@ def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
     pooled_output = ReduceSum(axis=1)(masked_inputs)
     
     return pooled_output
+
 
 class ExpandAndTileLayer(Layer):
     def __init__(self, output_length, **kwargs):
@@ -306,7 +325,6 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     num_encoder_blocks = config['num_encoder_blocks']
     dropout_rate = 0.01
 
-
     ff_dim = character_embedding_dim
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
@@ -331,45 +349,29 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
     bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
-    # for debugging, replace the bottlneck with all ones
-    bottleneck = Lambda(lambda x: tf.ones_like(x))(bottleneck)
 
-    # Use the custom layer to repeat bottleneck for each output position
-    expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
-
-    # Generate positional encoding for output positions
-    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
-    
-    # Repeat the positional encoding across the batch size to match expanded_bottleneck
-    tiled_positional_encoding = Lambda(
-        lambda x: tf.tile(siren_positional_encoding, [tf.shape(x)[0], 1, 1]),
-        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim)
-    )(expanded_bottleneck)
-
-    # Concatenate bottleneck and positions
-    siren_inputs = Concatenate(axis=-1)([expanded_bottleneck, tiled_positional_encoding])
+    # Generate linearly increasing positions between 0 and 1, equal to the output length
+    siren_positional_encoding = Lambda(lambda _: tf.linspace(0.0, 1.0, output_length), output_shape=(output_length,))(bottleneck)
+    siren_positional_encoding = Lambda(lambda x: tf.expand_dims(x, axis=-1), output_shape=(output_length, 1))(siren_positional_encoding)
 
     # Apply SIREN layers
     siren_width = config['siren_width']
 
+    # Initialize SIREN layer input
+    siren_inputs = siren_positional_encoding
+
+    # Pass through SIREN layers
     for i in range(config['num_siren_layers']):
-        siren_inputs = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))(siren_inputs)
+        siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_inputs, bottleneck])
 
-        if i == 0:
-            residual = siren_inputs
+    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_positional_encoding, bottleneck])
 
-    siren_inputs = Add()([siren_inputs, residual])
-
-    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)(siren_inputs)
-    
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), output_shape=(output_length, alphabet_size))(siren_output)
     x = Softmax()(x)
 
     model = Model(inputs=inputs, outputs=x)
     return model
-
-
 
 
 class RecursiveTextBatchGenerator:
