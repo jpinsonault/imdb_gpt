@@ -358,11 +358,11 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     siren_width = config['siren_width']
 
     # Initialize SIREN layer input
-    siren_inputs = siren_positional_encoding
+    siren_output = siren_positional_encoding
 
     # Pass through SIREN layers
     for i in range(config['num_siren_layers']):
-        siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_inputs, bottleneck])
+        siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_output, bottleneck])
 
     siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_output, bottleneck])
 
