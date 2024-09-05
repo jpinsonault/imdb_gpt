@@ -357,15 +357,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
 
     # Expansion of the bottleneck
-    bottleneck = LayerNormalization()(bottleneck)  # Layer normalization before expanding
     bottleneck = Dense(bottleneck_dim * 4, activation='gelu')(bottleneck)  # Use GELU or another activation to add non-linearity
-
-    # Optional: Another layer norm here if needed
-    # bottleneck = LayerNormalization()(bottleneck)
-
-    # Compression back to the original bottleneck dimension
-    bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)  # No activation for the final compression layer
-    bottleneck = LayerNormalization()(bottleneck)  # Final normalization
 
     siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
 
