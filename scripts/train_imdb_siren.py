@@ -218,8 +218,8 @@ class SirenLayer(Layer):
                                                                           maxval=tf.sqrt(6 / fan_in) / self.omega)
 
         # Dense layer to generate dynamic biases from the bottleneck
-        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
-        self.frequency_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
+        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=tf.math.sin)
+        self.frequency_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=tf.math.sin)
 
     def call(self, inputs):
         # Split inputs into positional encoding and bottleneck
@@ -356,7 +356,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
 
     # Expansion of the bottleneck
-    bottleneck = Dense(bottleneck_dim * 4, activation='gelu')(bottleneck)  # Use GELU or another activation to add non-linearity
+    bottleneck = Dense(bottleneck_dim * 4, activation=tf.math.sin)(bottleneck)  # Use GELU or another activation to add non-linearity
 
     siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
 
