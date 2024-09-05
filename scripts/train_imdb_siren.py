@@ -335,12 +335,12 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)
 
     # Generate positional encoding for output positions
-    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim//4)
+    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
     
     # Repeat the positional encoding across the batch size to match expanded_bottleneck
     tiled_positional_encoding = Lambda(
         lambda x: tf.tile(siren_positional_encoding, [tf.shape(x)[0], 1, 1]),
-        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim//4)
+        output_shape=lambda input_shape: (input_shape[0], output_length, character_embedding_dim)
     )(expanded_bottleneck)
 
     # Concatenate bottleneck and positions

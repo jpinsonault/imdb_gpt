@@ -9,7 +9,7 @@ project_config = {
 
     'dataset': {
         'jsonl_files': [
-            "movie.jsonl",
+            "one.jsonl",
             # "tvSeries.jsonl",
             # "episode.jsonl",
             # "person.jsonl",
@@ -31,12 +31,12 @@ project_config = {
 
     'siren': {
         'max_output_length'       : 288,
-        'batch_size'              : 128,
         'character_embedding_dim' : 256,
         'bottleneck_dim'          : 256,
         'siren_width'             : 512,
         'num_encoder_blocks'      : 4,
         'num_siren_layers'        : 8,
+        'batch_size'              : 1,
     },
 
     'llm': {
