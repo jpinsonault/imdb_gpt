@@ -203,7 +203,7 @@ class SirenLayer(Layer):
         self.activation = activation
 
     def build(self, input_shape):
-        # Create a dense layer with the given number of units and sine activation
+        # Create a dense layer with the given number of units
         self.layer = tf.keras.layers.Dense(
             units=self.units, activation=None, dtype=self.layer_dtype)  # Removed activation to apply it after adding dynamic bias
 
@@ -217,33 +217,29 @@ class SirenLayer(Layer):
             self.layer.kernel_initializer = tf.initializers.RandomUniform(minval=-tf.sqrt(6 / fan_in) / self.omega,
                                                                           maxval=tf.sqrt(6 / fan_in) / self.omega)
 
-        # Dense layer to generate dynamic biases from the bottleneck
-        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
-
     def call(self, inputs):
-        # Split inputs into positional encoding and bottleneck
-        position_encoding, bottleneck = inputs
+        # Split inputs into positional encoding and phase adjustment
+        layer_input, phase_adjustment = inputs
 
-        # Pass the bottleneck through the bias-generating dense layer
-        dynamic_bias = self.bias_dense(bottleneck)
+        # Expand dimensions to match the output length
+        phase_adjustment = tf.expand_dims(phase_adjustment, axis=1)  # Shape: [batch_size, 1, units]
 
-        # Ensure dynamic bias has the correct shape by expanding dimensions
-        dynamic_bias = tf.expand_dims(dynamic_bias, axis=1)  # Shape: [batch_size, 1, units]
+        # Repeat phase adjustment to match positional encoding length
+        phase_adjustment = tf.repeat(phase_adjustment, repeats=layer_input.shape[1], axis=1)  # Shape: [batch_size, output_length, units]
 
-        # Repeat dynamic bias to match the positional encoding length
-        dynamic_bias = tf.repeat(dynamic_bias, repeats=tf.shape(position_encoding)[1], axis=1)  # Shape: [batch_size, output_length, units]
+        # Compute the weighted input
+        weighted_input = self.layer(layer_input)
 
-        # Compute the weighted sum of inputs
-        weighted_input = self.layer(position_encoding)
-
-        # Add the dynamic bias
-        biased_output = weighted_input + dynamic_bias
+        # Apply phase adjustment
+        biased_output = weighted_input + phase_adjustment
 
         # Apply sine activation function
         output = self.activation(self.omega * biased_output)
 
         return output
-
+    
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0][0], input_shape[0][1], self.units)
 
 
 class ExpandDims(Layer):
@@ -323,6 +319,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck_dim = config['bottleneck_dim']
     output_length = config['max_output_length']
     num_encoder_blocks = config['num_encoder_blocks']
+    siren_width = config['siren_width']
     dropout_rate = 0.01
 
     ff_dim = character_embedding_dim
@@ -350,20 +347,22 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
     bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
 
+    # Compute phase adjustment once from the bottleneck
+    phase_adjustment = Dense(siren_width, activation=None)(bottleneck)
+
     # Generate linearly increasing positions between 0 and 1, equal to the output length
     siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
-
-    # Apply SIREN layers
-    siren_width = config['siren_width']
 
     # Initialize SIREN layer input
     siren_output = siren_positional_encoding
 
-    # Pass through SIREN layers
+    # Pass through SIREN layers with consistent phase adjustment
     for i in range(config['num_siren_layers']):
-        siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_output, bottleneck])
+        siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_output, phase_adjustment])
 
-    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_output, bottleneck])
+    # Final SIREN layer output
+    phase_adjustment = Dense(character_embedding_dim, activation=None)(bottleneck)
+    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_output, phase_adjustment])
 
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), output_shape=(output_length, alphabet_size))(siren_output)
@@ -371,6 +370,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
 
     model = Model(inputs=inputs, outputs=x)
     return model
+
 
 
 class RecursiveTextBatchGenerator:
