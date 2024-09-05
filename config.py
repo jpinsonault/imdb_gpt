@@ -35,7 +35,7 @@ project_config = {
         'bottleneck_dim'          : 256,
         'siren_width'             : 512,
         'num_encoder_blocks'      : 6,
-        'num_siren_layers'        : 16,
+        'num_siren_layers'        : 8,
         'batch_size'              : 128,
         'epochs'                  : 100,
     },
