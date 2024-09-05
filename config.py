@@ -37,6 +37,7 @@ project_config = {
         'num_encoder_blocks'      : 4,
         'num_siren_layers'        : 8,
         'batch_size'              : 1,
+        'epochs'                  : 100,
     },
 
     'llm': {

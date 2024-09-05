@@ -47,6 +47,7 @@ def character_autoencoder_training():
     max_input_length = project_config['entities']['max_entity_length']
     max_output_length = project_config['siren']['max_output_length']
     batch_size = project_config['siren']['batch_size']
+    epochs = project_config['siren']['epochs']
 
     # Prepare alphabet and character mapping from multiple JSONL files
     alphabet = get_alphabet(jsonl_files)
@@ -114,19 +115,19 @@ def character_autoencoder_training():
     learning_rate_callback = ScheduledLearningRateCallback(
         schedule=[
             (0, 0.0002),
-            (1, 0.0001),
-            (2, 0.00005),
-            (3, 0.00002),
-            (4, 0.00001),
-            (5, 0.00008),
-            (6, 0.00005),
-            (7, 0.00002),
-            (8, 0.00001)
+            # (1, 0.0001),
+            # (2, 0.00005),
+            # (3, 0.00002),
+            # (4, 0.00001),
+            # (5, 0.00008),
+            # (6, 0.00005),
+            # (7, 0.00002),
+            # (8, 0.00001)
         ]
     )
 
     # Train the model
-    model.fit(dataset, epochs=10, callbacks=[
+    model.fit(dataset, epochs=epochs, callbacks=[
         learning_rate_callback,
         reconstruct_callback,
         # save_model_callback,
