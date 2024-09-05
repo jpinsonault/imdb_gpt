@@ -251,7 +251,6 @@ class SirenLayer(Layer):
         return output
 
 
-
 class ExpandDims(Layer):
     def call(self, inputs):
         return tf.expand_dims(inputs, axis=1)
