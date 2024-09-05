@@ -331,6 +331,8 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     # Bottleneck with combined attention pooling
     bottleneck = attention_pooling(encoder_output, num_heads, positional_encoding, dropout_rate)
     bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
+    # for debugging, replace the bottlneck with all ones
+    bottleneck = Lambda(lambda x: tf.ones_like(x))(bottleneck)
 
     # Use the custom layer to repeat bottleneck for each output position
     expanded_bottleneck = RepeatBottleneckLayer(output_length)(bottleneck)

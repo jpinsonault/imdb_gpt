@@ -31,8 +31,8 @@ project_config = {
 
     'siren': {
         'max_output_length'       : 288,
-        'character_embedding_dim' : 256,
-        'bottleneck_dim'          : 256,
+        'character_embedding_dim' : 32,
+        'bottleneck_dim'          : 32,
         'siren_width'             : 512,
         'num_encoder_blocks'      : 4,
         'num_siren_layers'        : 8,
