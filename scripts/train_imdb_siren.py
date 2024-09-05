@@ -364,7 +364,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     for i in range(config['num_siren_layers']):
         siren_output = SirenLayer(siren_width, name=f"siren_{i}", is_first=(i == 0))([siren_inputs, bottleneck])
 
-    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_positional_encoding, bottleneck])
+    siren_output = SirenLayer(character_embedding_dim, name="siren_output", is_first=False)([siren_output, bottleneck])
 
     # Apply the embedding layer to convert the output to logits over the vocabulary
     x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), output_shape=(output_length, alphabet_size))(siren_output)
