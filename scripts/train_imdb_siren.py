@@ -114,7 +114,7 @@ def character_autoencoder_training():
 
     learning_rate_callback = ScheduledLearningRateCallback(
         schedule=[
-            (0, 0.0002),
+            (0, 0.00001),
             # (1, 0.0001),
             # (2, 0.00005),
             # (3, 0.00002),
