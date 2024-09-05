@@ -218,7 +218,8 @@ class SirenLayer(Layer):
                                                                           maxval=tf.sqrt(6 / fan_in) / self.omega)
 
         # Dense layer to generate dynamic biases from the bottleneck
-        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=tf.math.sin)
+        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
+        self.bias_layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
     def call(self, inputs):
         # Split inputs into positional encoding and bottleneck
@@ -226,6 +227,7 @@ class SirenLayer(Layer):
 
         # Pass the bottleneck through the bias-generating dense layer
         dynamic_bias = self.bias_dense(bottleneck)
+        dynamic_bias = self.bias_layernorm(dynamic_bias)
 
         # Ensure dynamic bias has the correct shape by expanding dimensions
         dynamic_bias = tf.expand_dims(dynamic_bias, axis=1)  # Shape: [batch_size, 1, units]
