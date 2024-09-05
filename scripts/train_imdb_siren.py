@@ -218,16 +218,14 @@ class SirenLayer(Layer):
                                                                           maxval=tf.sqrt(6 / fan_in) / self.omega)
 
         # Dense layer to generate dynamic biases from the bottleneck
-        self.bias_dense_one = tf.keras.layers.Dense(self.units*2, dtype=self.layer_dtype, activation=None)
-        self.bias_dense_two = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
+        self.bias_dense = tf.keras.layers.Dense(self.units, dtype=self.layer_dtype, activation=None)
 
     def call(self, inputs):
         # Split inputs into positional encoding and bottleneck
         position_encoding, bottleneck = inputs
 
         # Pass the bottleneck through the bias-generating dense layer
-        dynamic_bias = self.bias_dense_two(bottleneck)
-        # dynamic_bias = self.bias_dense_two(dynamic_bias)
+        dynamic_bias = self.bias_dense(bottleneck)
 
         # Ensure dynamic bias has the correct shape by expanding dimensions
         dynamic_bias = tf.expand_dims(dynamic_bias, axis=1)  # Shape: [batch_size, 1, units]
@@ -353,8 +351,7 @@ def kermit_siren(input_length, alphabet_size, config: dict):
     bottleneck = Dense(bottleneck_dim, activation=None)(bottleneck)
 
     # Generate linearly increasing positions between 0 and 1, equal to the output length
-    siren_positional_encoding = Lambda(lambda _: tf.linspace(0.0, 1.0, output_length), output_shape=(output_length,))(bottleneck)
-    siren_positional_encoding = Lambda(lambda x: tf.expand_dims(x, axis=-1), output_shape=(output_length, 1))(siren_positional_encoding)
+    siren_positional_encoding = sinusoidal_encoding(output_length, character_embedding_dim)
 
     # Apply SIREN layers
     siren_width = config['siren_width']
