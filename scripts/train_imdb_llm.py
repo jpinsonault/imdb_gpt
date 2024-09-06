@@ -81,8 +81,7 @@ def character_llm_training():
         index_to_char=index_to_char,
         max_input_length=input_length,
         num_samples=5,
-        frequency=1000,
-        gen_length=200,
+        frequency=100,
         jsonl_files=jsonl_files
     )
 
@@ -185,45 +184,44 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
             continue
 
         # Combine query and result with special separator
-        full_text = f"{query}{SPECIAL_SEP}{result}"
+        full_text = f"{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
 
         try:
             # Tokenize the full text
             input_chars = list(full_text)
             input_token_indices = [tokenizer.char_to_index.get(char, tokenizer.char_to_index[SPECIAL_PAD]) for char in input_chars]
 
-            # Prepare shifted output (next character prediction)
-            output_token_indices = input_token_indices[1:] + [tokenizer.char_to_index[SPECIAL_END]]
+            # Prepare input (query + separator) and output (result + end token)
+            query_sep_length = len(query) + 1  # +1 for the separator
+            input_indices = input_token_indices[:query_sep_length]
+            output_indices = input_token_indices[query_sep_length:]
 
-            # Generate multiple prefixes
-            for start_idx in range(0, len(input_token_indices), tokenizer.max_input_length // 2):
-                end_idx = start_idx + tokenizer.max_input_length
+            # Pad if necessary
+            if len(input_indices) < tokenizer.max_input_length:
+                pad_length = tokenizer.max_input_length - len(input_indices)
+                input_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+                output_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
 
-                prefix_input = input_token_indices[start_idx:end_idx]
-                prefix_output = output_token_indices[start_idx:end_idx]
+            # Truncate if necessary
+            input_indices = input_indices[:tokenizer.max_input_length]
+            output_indices = output_indices[:tokenizer.max_input_length]
 
-                # Pad if necessary
-                if len(prefix_input) < tokenizer.max_input_length:
-                    pad_length = tokenizer.max_input_length - len(prefix_input)
-                    prefix_input += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
-                    prefix_output += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+            # Update the batch
+            x_batch[batch_index] = input_indices
+            
+            # One-hot encode the output
+            for i, token_index in enumerate(output_indices):
+                y_batch[batch_index, i, token_index] = 1
 
-                # Update the batch
-                x_batch[batch_index] = prefix_input
-                
-                # One-hot encode the output
-                for i, token_index in enumerate(prefix_output):
-                    y_batch[batch_index, i, token_index] = 1
+            batch_index += 1
 
-                batch_index += 1
-
-                # Yield a full batch
-                if batch_index == batch_size:
-                    yield x_batch, y_batch
-                    # Reset for next batch
-                    batch_index = 0
-                    x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
-                    y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
+            # Yield a full batch
+            if batch_index == batch_size:
+                yield x_batch, y_batch
+                # Reset for next batch
+                batch_index = 0
+                x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
+                y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
 
         except Exception as e:
             traceback.print_exc()
@@ -261,6 +259,9 @@ class Tokenizer:
         self.index_to_char = {index: char for char,
                               index in char_to_index.items()}
         self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
+        self.index_to_char[char_to_index[SPECIAL_START]] = '^'
+        self.index_to_char[char_to_index[SPECIAL_END]] = '$'
+        self.index_to_char[char_to_index[SPECIAL_SEP]] = '#'
         self.max_input_length = max_input_length
 
     def tokenize(self, input_string):
@@ -836,7 +837,7 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0, gen_length=100):
+    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0):
         self.char_to_index = char_to_index
         self.index_to_char = index_to_char
         self.max_input_length = max_input_length
@@ -844,15 +845,14 @@ class ReconstructCallback(keras.callbacks.Callback):
         self.frequency = frequency
         self.jsonl_files = jsonl_files
         self.temperature = temperature
-        self.gen_length = gen_length
 
     def on_epoch_end(self, epoch, logs=None):
-        print(f"\nEpoch {epoch + 1} Autoencoder Outputs:\n")
+        print(f"\nEpoch {epoch + 1} Reconstruction Outputs:\n")
         self._print_predictions()
 
     def on_batch_end(self, batch, logs=None):
         if batch % self.frequency == 0:
-            print(f"\nBatch {batch} Autoencoder Outputs:\n")
+            print(f"\nBatch {batch} Reconstruction Outputs:\n")
             self._print_predictions()
 
     def _get_random_sequence(self):
@@ -863,11 +863,10 @@ class ReconstructCallback(keras.callbacks.Callback):
             data = json.loads(random_line)
             query = data.get('query', '').strip()
             result = data.get('result', '').strip()
-            full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
-            if len(full_text) > self.max_input_length:
-                start = random.randint(0, len(full_text) - self.max_input_length)
-                return full_text[start:start+self.max_input_length]
-            return full_text.ljust(self.max_input_length, SPECIAL_PAD)
+            input_text = f"{query}{SPECIAL_SEP}"
+            if len(input_text) > self.max_input_length:
+                input_text = input_text[:self.max_input_length]
+            return input_text, result
     
     def _tokenize(self, sequence):
         return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence], dtype=np.int32)
@@ -877,25 +876,25 @@ class ReconstructCallback(keras.callbacks.Callback):
 
     def _print_predictions(self):
         for _ in range(self.num_samples):
-            input_sequence = self._get_random_sequence()
+            input_sequence, target_result = self._get_random_sequence()
             input_tensor = self._tokenize(input_sequence)
             
             generated_sequence = list(input_sequence)
             color_coded_sequence = []
             
-            for i in range(self.gen_length):
+            for i in range(self.max_input_length - len(input_sequence)):
                 try:
                     input_tensor_reshaped = np.reshape(input_tensor, (1, self.max_input_length))
                     predictions = self.model.predict(input_tensor_reshaped, verbose=0)[0]
 
                     # Focus on the prediction for the last token in the sequence
-                    last_token_prediction = predictions[-1]
+                    last_token_prediction = predictions[len(generated_sequence) - 1]
 
                     if i == 0:
                         top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
                         top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
                         top_5_probs = last_token_prediction[top_5_indices]
-                        print(f"Step {i} - Top 5 predictions for the last token:")
+                        print(f"Step {i} - Top 5 predictions for the next token:")
                         for char, prob in zip(top_5_chars, top_5_probs):
                             bar_length = 40
                             bar_fill = int(prob * bar_length)
@@ -915,11 +914,18 @@ class ReconstructCallback(keras.callbacks.Callback):
                     # Update input_tensor to reflect the new prediction
                     input_tensor = np.concatenate([input_tensor[1:], [predicted_index]])
                     
+                    # Stop if we've reached the end token or the maximum length
+                    if predicted_char == SPECIAL_END or len(generated_sequence) == self.max_input_length:
+                        break
+                    
                 except Exception as e:
                     print(f"Error during prediction: {e}")
                     break
             
-            print(f"Prediction | {''.join(generated_sequence[:self.max_input_length])}<|>{''.join(color_coded_sequence)} |")
+            print(f"Input    | {input_sequence}")
+            print(f"Target   | {target_result}")
+            print(f"Predicted| {''.join(generated_sequence[len(input_sequence):])}")
+            print(f"Color    | {''.join(color_coded_sequence)}")
             print("\n")
 
     def _color_code(self, char, confidence):
