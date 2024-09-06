@@ -183,34 +183,26 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
             continue
 
         # Combine query and result with special separator
-        full_text = f"{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+        full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
 
-        try:
-            # Tokenize the full text
-            input_chars = list(full_text)
-            input_token_indices = [tokenizer.char_to_index.get(char, tokenizer.char_to_index[SPECIAL_PAD]) for char in input_chars]
+        # Tokenize the full text
+        full_text_tokens = tokenizer.tokenize(full_text)
 
-            # Prepare input (query + separator) and output (result + end token)
-            query_sep_length = len(query) + 1  # +1 for the separator
-            input_indices = input_token_indices[:query_sep_length]
-            output_indices = input_token_indices[query_sep_length:]
+        # Create sliding window prefixes
+        for i in range(1, len(full_text_tokens)):
+            input_tokens = full_text_tokens[:i]
+            target_token = full_text_tokens[i]
 
-            # Pad if necessary
-            if len(input_indices) < tokenizer.max_input_length:
-                pad_length = tokenizer.max_input_length - len(input_indices)
-                input_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
-                output_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+            # Pad input if necessary
+            if len(input_tokens) < tokenizer.max_input_length:
+                input_tokens = np.pad(input_tokens, (0, tokenizer.max_input_length - len(input_tokens)), 
+                                      mode='constant', constant_values=tokenizer.char_to_index[SPECIAL_PAD])
+            else:
+                input_tokens = input_tokens[-tokenizer.max_input_length:]
 
-            # Truncate if necessary
-            input_indices = input_indices[:tokenizer.max_input_length]
-            output_indices = output_indices[:tokenizer.max_input_length]
-
-            # Update the batch
-            x_batch[batch_index] = input_indices
-            
-            # One-hot encode the output
-            for i, token_index in enumerate(output_indices):
-                y_batch[batch_index, i, token_index] = 1
+            # Update batch
+            x_batch[batch_index] = input_tokens
+            y_batch[batch_index, :, target_token] = 1
 
             batch_index += 1
 
@@ -222,17 +214,10 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
                 x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
                 y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
 
-        except Exception as e:
-            traceback.print_exc()
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
-            print(f"\nFailed to process entity: {query}\n")
-        
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
             # Reset all indices and continue
             data_indices = [0] * len(jsonl_files)
-
 
 def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
     # Get the shape of the predictions
