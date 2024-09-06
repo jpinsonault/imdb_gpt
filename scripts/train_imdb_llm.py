@@ -24,6 +24,7 @@ from tensorflow.keras.layers import Input, Embedding, MultiHeadAttention, LayerN
 from tensorflow.keras.models import Model
 from tensorflow.keras import backend as K
 from tensorflow.keras.regularizers import l2
+Callback = keras.callbacks.Callback
 from config import project_config
 from datasets import load_dataset, concatenate_datasets
 from scripts.attention_model import generative_matrix_attention
@@ -63,8 +64,6 @@ def character_llm_training():
     print(f"Alphabet size: {len(alphabet)}")
 
     char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
-    index_to_char = {index: char for char, index in char_to_index.items()}
-
 
     model = kermit_language_model(
         input_length=input_length,
@@ -286,8 +285,8 @@ class Tokenizer:
 
         return np.array(input_indices)
 
-    def indices_to_string(self, indices):
-        return "".join([self.index_to_char[index] for index in indices])
+    def untokenize(self, one_hot_indices):
+        return "".join([self.index_to_char[index] for index in one_hot_indices])
 
     def tokenize_and_mask_input(self, input_string):
         input_tensor = self.tokenize(input_string)
@@ -836,102 +835,62 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
             break
 
 
-class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, tokenizer, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0):
+class ReconstructCallback(Callback):
+    def __init__(self, tokenizer: Tokenizer, max_input_length, num_samples=5, frequency=100, jsonl_files=None):
+        super().__init__()
         self.tokenizer = tokenizer
         self.max_input_length = max_input_length
         self.num_samples = num_samples
         self.frequency = frequency
         self.jsonl_files = jsonl_files
-        self.temperature = temperature
 
     def on_epoch_end(self, epoch, logs=None):
-        print(f"\nEpoch {epoch + 1} Reconstruction Outputs:\n")
-        self._print_predictions()
+        if (epoch + 1) % self.frequency == 0:
+            print(f"\nEpoch {epoch + 1} - Reconstruction samples:")
+            for _ in range(self.num_samples):
+                self.generate_sample()
 
-    def on_batch_end(self, batch, logs=None):
-        if batch % self.frequency == 0:
-            print(f"\nBatch {batch} Reconstruction Outputs:\n")
-            self._print_predictions()
-
-    def _get_random_sequence(self):
-        random_file = random.choice(self.jsonl_files)
-        with open(random_file, 'r', encoding='utf-8') as f:
+    def generate_sample(self):
+        # Randomly select a JSONL file and a line from it
+        jsonl_file = random.choice(self.jsonl_files)
+        with open(jsonl_file, 'r') as f:
             lines = f.readlines()
-            random_line = random.choice(lines)
-            data = json.loads(random_line)
-            query = data.get('query', '').strip()
-            result = data.get('result', '').strip()
-            full_text = f"{query}{SPECIAL_SEP}{result}"
-            return full_text
+            line = random.choice(lines)
+            data = json.loads(line)
 
-    def _select_top_character(self, predictions, temperature=1.0):
-        predictions = np.asarray(predictions).astype('float64')
-        predictions = np.log(predictions) / temperature
-        exp_preds = np.exp(predictions)
-        predictions = exp_preds / np.sum(exp_preds)
-        probas = np.random.multinomial(1, predictions, 1)
-        return np.argmax(probas)
+        query = data['query']
+        result = data['result']
 
-    def _print_predictions(self):
-        for sample in range(self.num_samples):
-            print(f"\nSample {sample + 1}:")
-            full_sequence = self._get_random_sequence()
-            input_sequence, target_result = full_sequence.split(SPECIAL_SEP, 1)
-            input_sequence += SPECIAL_SEP
+        # Construct the prompt
+        prompt = f"{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
+        input_indices = self.tokenizer.tokenize(prompt)
+
+        print("\nInput query:")
+        print(self.tokenizer.untokenize(input_indices))
+
+        print("\nExpected result:")
+        print(result)
+
+        print("\nModel prediction:")
+        generated_text = self.generate_continuation(input_indices)
+        print(generated_text)
+
+        print("-" * 50)
+
+    def generate_continuation(self, input_indices):
+        generated_chars = []
+        for _ in range(self.max_input_length):
+            prediction = self.model.predict(tf.expand_dims(input_indices, 0), verbose=0)
+            next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
+            next_char = self.tokenizer.index_to_char[next_char_index]
             
-            full_target = self.tokenizer.indices_to_string(self.tokenizer.tokenize(full_sequence))
-            print(f"Full Target: {full_target}")
+            if next_char == SPECIAL_END:
+                break
             
-            input_tensor = self.tokenizer.tokenize(input_sequence)
-            generated_sequence = list(input_sequence)
-            color_coded_sequence = []
-            
-            for i in range(self.max_input_length - len(input_sequence)):
-                try:
-                    input_tensor_reshaped = np.reshape(input_tensor, (1, self.max_input_length))
-                    predictions = self.model.predict(input_tensor_reshaped, verbose=0)[0]
-                    last_token_prediction = predictions[len(generated_sequence) - 1]
+            generated_chars.append(next_char)
+            input_indices = tf.concat([input_indices[1:], [next_char_index]], axis=0)
 
-                    if i == 0:
-                        top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
-                        top_5_chars = [self.tokenizer.index_to_char[idx] for idx in top_5_indices]
-                        top_5_probs = last_token_prediction[top_5_indices]
-                        print("Top 5 predictions for the next token:")
-                        for char, prob in zip(top_5_chars, top_5_probs):
-                            print(f"{char}: {prob:.4f}")
-
-                    predicted_index = self._select_top_character(last_token_prediction, self.temperature)
-                    predicted_char = self.tokenizer.index_to_char[predicted_index]
-                    confidence = last_token_prediction[predicted_index]
-                    
-                    color_coded_char = self._color_code(predicted_char, confidence)
-                    color_coded_sequence.append(color_coded_char)
-                    generated_sequence.append(predicted_char)
-                    
-                    input_tensor = np.roll(input_tensor, -1)
-                    input_tensor[-1] = predicted_index
-                    
-                    if predicted_char == SPECIAL_END or len(generated_sequence) == self.max_input_length:
-                        break
-                    
-                except Exception as e:
-                    print(f"Error during prediction: {e}")
-                    traceback.print_exc()
-                    break
-            
-            predicted_sequence = ''.join(generated_sequence[len(input_sequence):])
-            print(f"Predicted: {self.tokenizer.indices_to_string(self.tokenizer.tokenize(predicted_sequence))}")
-            print(f"Color    : {''.join(color_coded_sequence)}")
-            print("\n")
-
-    def _color_code(self, char, confidence):
-        if confidence > 0.92:
-            return f"\033[30;42m{char}\033[0m"  # Green background, black text
-        elif confidence > 0.7:
-            return f"\033[30;43m{char}\033[0m"  # Yellow background, black text
-        else:
-            return f"\033[30;41m{char}\033[0m"  # Red background, black text
+        return ''.join(generated_chars)
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
     cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
@@ -1032,7 +991,7 @@ def compute_files_hash(files):
 
 
 
-class CommitChangesToGitCallback(keras.callbacks.Callback):
+class CommitChangesToGitCallback(Callback):
     def __init__(self, logs_dir):
         super().__init__()
         self.has_run = False
@@ -1049,7 +1008,7 @@ class CommitChangesToGitCallback(keras.callbacks.Callback):
                 self.has_run = True
 
 
-class TensorBoardBatchLogger(keras.callbacks.Callback):
+class TensorBoardBatchLogger(Callback):
     def __init__(self, log_dir, update_freq=100):
         super().__init__()
         self.log_dir = log_dir
@@ -1134,7 +1093,7 @@ class CosineLearningRateScheduler(tf.keras.callbacks.Callback):
         self.model.optimizer.learning_rate.assign(new_lr)
         
 
-class ScheduledLearningRateCallback(keras.callbacks.Callback):
+class ScheduledLearningRateCallback(Callback):
     """Set learning rate according to the provided schedule."""
 
     def __init__(self, schedule):
