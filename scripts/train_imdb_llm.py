@@ -42,6 +42,7 @@ tf_version = tf.__version__
 SPECIAL_PAD = '\u200C'
 SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
+SPECIAL_SEP = '\u200F'
 
 
 def main(args):
@@ -53,37 +54,37 @@ def character_llm_training():
     batch_size = project_config['llm']['batch_size']
     character_embedding_dim = project_config['llm']['character_embedding_dim']
     num_epochs = project_config['llm']['epochs']
+    jsonl_files = [data_dir / jsonl_file for jsonl_file in project_config['dataset']['jsonl_files']]
 
-    dataset_text_file = project_config['llm'].get('dataset_text_file', None)
-    dataset_text_file = data_dir / dataset_text_file
-
-    alphabet = get_alphabet(dataset_text_file)
     print_project_config(project_config)
 
+    alphabet = get_alphabet(jsonl_files)
+    alphabet += [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
     print(f"Alphabet size: {len(alphabet)}")
 
     char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
     index_to_char = {index: char for char, index in char_to_index.items()}
 
-    fresh_model = kermit_language_model(
+    model = kermit_language_model(
         input_length=input_length,
         alphabet_size=len(alphabet),
         character_embedding_dim=character_embedding_dim
     )
+    
+    tokenizer = Tokenizer(char_to_index=char_to_index, max_input_length=input_length)
 
-    model_path = data_dir / "models" / "imdb_autoencoder.keras"
-    # loaded_model = try_load_model(model_path)
-    loaded_model = None
+    # Create a generator for the JSONL files
+    dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer)
 
-    if loaded_model is None:
-        print("\n> No model found, using new model\n")
-        model = fresh_model
-    elif not are_models_same(fresh_model, loaded_model):
-        print("\n> Loaded model is out of date, using new model\n")
-        model = fresh_model
-    else:
-        print("\n> Using loaded model\n")
-        model = loaded_model
+    reconstruct_callback = ReconstructCallback(
+        char_to_index=char_to_index,
+        index_to_char=index_to_char,
+        max_input_length=input_length,
+        num_samples=5,
+        frequency=1000,
+        gen_length=200,
+        jsonl_files=jsonl_files
+    )
 
     print("\n> compiling model\n")
     model.compile(
@@ -93,27 +94,6 @@ def character_llm_training():
     )
 
     model.summary()
-
-    dataset = load_text_file_dataset(dataset_text_file)
-    tf_dataset = create_tf_dataset(dataset, char_to_index, input_length, batch_size)
-
-    save_model_callback = keras.callbacks.ModelCheckpoint(
-        filepath=str(model_path),
-        save_best_only=False,
-        monitor="loss",
-        verbose=1,
-        save_freq=1000
-    )
-
-    reconstruct_callback = ReconstructCallback(
-        char_to_index=char_to_index,
-        index_to_char=index_to_char,
-        max_input_length=input_length,
-        num_samples=5,
-        frequency=1000,
-        gen_length=200,
-        text_file=dataset_text_file
-    )
 
     now_int = int(datetime.now().timestamp())
     folder_suggestion = suggest_folder_name()
@@ -137,28 +117,124 @@ def character_llm_training():
         ]
     )
 
-    steps_per_epoch = calculate_steps_per_epoch(dataset_text_file, input_length, batch_size)
-
-    starting_lr = 0.0002
-    cosine_lr_scheduler = CosineLearningRateScheduler(
-        total_batches=steps_per_epoch,
-        initial_lr=starting_lr,
-        min_lr=starting_lr
-    )
+    steps_per_epoch = calculate_steps_per_epoch(jsonl_files, input_length, batch_size)
 
     model.fit(
-        tf_dataset,
+        dataset,
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
         callbacks=[
             learning_rate_callback,
-            save_model_callback,
             commit_changes_to_git_callback,
             tensorboard_callback,
             reconstruct_callback,
             keras.callbacks.TensorBoard('./logs', update_freq=5)
         ]
     )
+
+
+def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
+    """
+    Efficient batch generator for autoencoder training using multiple JSONL files.
+    Uses character-level tokenization with special Unicode characters for tokens.
+    """
+    
+    # Ensure special tokens are in the tokenizer
+    for token in [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]:
+        if token not in tokenizer.char_to_index:
+            tokenizer.add_token(token)
+    
+    # Load all JSONL data into memory
+    all_data = []
+    dataset_sizes = []
+
+    # Load data from each JSONL file and store in memory
+    for jsonl_path in jsonl_files:
+        with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
+            data = [json.loads(line) for line in jsonl_file]
+            all_data.append(data)
+            dataset_sizes.append(len(data))
+    
+    # Calculate sampling probabilities based on dataset sizes
+    total_size = sum(dataset_sizes)
+    sampling_probs = [size / total_size for size in dataset_sizes]
+
+    # Generate batches
+    data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
+    x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
+    y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
+
+    batch_index = 0
+
+    while True:
+        # Randomly choose a dataset based on sampling probabilities
+        dataset_choice = random.choices(range(len(jsonl_files)), weights=sampling_probs, k=1)[0]
+
+        # Check if we've exhausted the chosen dataset
+        if data_indices[dataset_choice] >= dataset_sizes[dataset_choice]:
+            data_indices[dataset_choice] = 0  # Reset index if exhausted
+        
+        # Fetch data point from chosen dataset
+        data_point = all_data[dataset_choice][data_indices[dataset_choice]]
+        data_indices[dataset_choice] += 1
+
+        query = data_point.get('query', '').strip()
+        result = data_point.get('result', '').strip()
+
+        if not query or not result:
+            continue
+
+        # Combine query and result with special separator
+        full_text = f"{query}{SPECIAL_SEP}{result}"
+
+        try:
+            # Tokenize the full text
+            input_chars = list(full_text)
+            input_token_indices = [tokenizer.char_to_index.get(char, tokenizer.char_to_index[SPECIAL_PAD]) for char in input_chars]
+
+            # Prepare shifted output (next character prediction)
+            output_token_indices = input_token_indices[1:] + [tokenizer.char_to_index[SPECIAL_END]]
+
+            # Generate multiple prefixes
+            for start_idx in range(0, len(input_token_indices), tokenizer.max_input_length // 2):
+                end_idx = start_idx + tokenizer.max_input_length
+
+                prefix_input = input_token_indices[start_idx:end_idx]
+                prefix_output = output_token_indices[start_idx:end_idx]
+
+                # Pad if necessary
+                if len(prefix_input) < tokenizer.max_input_length:
+                    pad_length = tokenizer.max_input_length - len(prefix_input)
+                    prefix_input += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+                    prefix_output += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+
+                # Update the batch
+                x_batch[batch_index] = prefix_input
+                
+                # One-hot encode the output
+                for i, token_index in enumerate(prefix_output):
+                    y_batch[batch_index, i, token_index] = 1
+
+                batch_index += 1
+
+                # Yield a full batch
+                if batch_index == batch_size:
+                    yield x_batch, y_batch
+                    # Reset for next batch
+                    batch_index = 0
+                    x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
+                    y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
+
+        except Exception as e:
+            traceback.print_exc()
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
+            print(f"\nFailed to process entity: {query}\n")
+        
+        # Check if all datasets are exhausted
+        if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
+            # Reset all indices and continue
+            data_indices = [0] * len(jsonl_files)
 
 
 def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
@@ -178,27 +254,43 @@ def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
     # Return the mean loss, with the mask applied
     return tf.reduce_mean(masked_loss)
 
-class TokenProcessor:
+
+class Tokenizer:
     def __init__(self, char_to_index, max_input_length):
         self.char_to_index = char_to_index
-        self.index_to_char = {index: char for char, index in char_to_index.items()}
+        self.index_to_char = {index: char for char,
+                              index in char_to_index.items()}
+        self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
         self.max_input_length = max_input_length
 
-    def tokenize(self, input_string, truncate=False):
-        input_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
-        
-        if truncate:
-            # Truncate or pad the sequence to max_input_length
-            if len(input_indices) > self.max_input_length:
-                input_indices = input_indices[:self.max_input_length]
-            elif len(input_indices) < self.max_input_length:
-                input_indices += [self.char_to_index[SPECIAL_PAD]] * (self.max_input_length - len(input_indices))
-        else:
-            # Only pad if necessary, don't truncate
-            if len(input_indices) < self.max_input_length:
-                input_indices += [self.char_to_index[SPECIAL_PAD]] * (self.max_input_length - len(input_indices))
-        
+    def tokenize(self, input_string):
+        if len(input_string) > self.max_input_length:
+            print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
+            input_string = input_string[:self.max_input_length]
+        input_indices = [self.char_to_index.get(
+            char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
+
+        # Pad the input to max_input_length using zeros
+        total_pad = self.max_input_length - len(input_indices)
+        # num_to_pad_left = random.randint(0, total_pad)
+        num_to_pad_left = 0
+        num_to_pad_right = total_pad - num_to_pad_left
+
+        input_indices = [self.char_to_index[SPECIAL_PAD]]*num_to_pad_left + \
+            input_indices + [self.char_to_index[SPECIAL_PAD]]*num_to_pad_right
+
+        if len(input_indices) != self.max_input_length:
+            raise ValueError(
+                f"Input string is unexpected length: {input_string}: {len(input_indices)}")
+
         return np.array(input_indices)
+
+    def indices_to_string(self, indices):
+        return "".join([self.index_to_char[index] for index in indices])
+
+    def tokenize_and_mask_input(self, input_string):
+        input_tensor = self.tokenize(input_string)
+        return input_tensor
     
 
 class NextTokenAccuracy(tf.keras.metrics.Metric):
@@ -228,56 +320,6 @@ class NextTokenAccuracy(tf.keras.metrics.Metric):
     def reset_state(self):
         self.total.assign(0.)
         self.count.assign(0.)
-
-
-def load_text_file_dataset(file_path, chunk_size=1024 * 1024):  # 1MB chunks
-    def generate_chunks():
-        with open(file_path, 'r', encoding='utf-8') as file:
-            while True:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-
-    return tf.data.Dataset.from_generator(
-        generate_chunks,
-        output_types=tf.string,
-        output_shapes=()
-    )
-
-def preprocess_text(text):
-    text = remove_excessive_whitespace(text)
-    return text
-
-
-def remove_excessive_whitespace(text):
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-
-def create_tf_dataset(dataset, char_to_index, max_input_length, batch_size):
-    token_processor = TokenProcessor(char_to_index, max_input_length)
-
-    def generate_samples(text_chunk):
-        text = preprocess_text(text_chunk.numpy().decode('utf-8'))
-        tokenized = token_processor.tokenize(text)
-        for i in range(len(tokenized) - max_input_length):
-            input_sequence = tokenized[i:i+max_input_length]
-            target_sequence = tokenized[i+1:i+max_input_length+1]
-            if len(target_sequence) < max_input_length:
-                target_sequence = np.pad(target_sequence, (0, max_input_length - len(target_sequence)), 'constant', constant_values=char_to_index[SPECIAL_PAD])
-            yield input_sequence, target_sequence
-
-    def generator():
-        for chunk in dataset:
-            yield from generate_samples(chunk)
-
-    return tf.data.Dataset.from_generator(
-        generator,
-        output_types=(tf.int32, tf.int32),
-        output_shapes=((max_input_length,), (max_input_length,))
-    ).map(lambda x, y: (x, tf.one_hot(y, depth=len(char_to_index)))
-    ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
 class ReduceSum(tf.keras.layers.Layer):
@@ -665,48 +707,84 @@ def linformer_language_model(input_length, alphabet_size, character_embedding_di
     model = tf.keras.Model(inputs=inputs, outputs=x, name="LinformerLanguageModel")
     return model
 
+
+def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
+    # Self-attention
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    attention_output = layers.Dropout(dropout_rate)(attention_output)
+    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
+    
+    # Feed-forward network
+    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
+    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
+    ff_output = layers.Dropout(dropout_rate)(ff_output)
+    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
+    
+    return ff_output
+
+
+def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
+    # Self-attention to get attention scores
+
+    positional_encoded = positional_encoding + inputs
+    attention_scores = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=dropout_rate)(positional_encoded, inputs)
+    attention_scores = layers.Softmax(axis=1)(attention_scores)  # Normalize scores across the sequence
+    
+    # Apply attention scores as a mask and multiply
+    masked_inputs = layers.Multiply()([inputs, attention_scores])
+    
+    # reduce sum over the masked input sequence
+    pooled_output = ReduceSum(axis=1)(masked_inputs)
+    
+    return pooled_output
+
+
+def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
+    # Self-attention
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    attention_output = layers.Dropout(dropout_rate)(attention_output)
+    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
+    
+    # Feed-forward network
+    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
+    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
+    ff_output = layers.Dropout(dropout_rate)(ff_output)
+    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
+    
+    return ff_output
+
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 #.....................................................................................................................................
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=4):
-    activation = 'leaky_relu'
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
+    num_decoder_blocks = 4
+    num_heads = 1
 
-    inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name=n("input_layer"))
-    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name=n("embedding_layer"))
-    embedding = embedding_layer(inputs)
-    
-    head_dim = character_embedding_dim // num_heads
+    inputs = Input(shape=(input_length,), dtype=tf.int32)
+    embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
+    embedding = layers.Dropout(dropout_rate)(embedding)
 
-    # Downsample the sequence
-    x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_1"))(embedding)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n("channel_reduction"))(x)
-    x = Conv1D(filters=character_embedding_dim*4, kernel_size=3, strides=2, padding='same', activation=None, name=n("conv_downsample_2"))(x)
-    x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=activation, name=n("channel_reduction_2"))(x)
-    x = LayerNormalization(name=n("layer_norm_downsample"))(x)
+    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
+    reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
 
-    positional_encoding = sinusoidal_encoding(input_length//4, character_embedding_dim//num_heads)
+    reduced_to_quarter = LayerNormalization()(reduced_to_quarter)
 
-    for i in range(num_blocks):
-        # Apply self-attention and feed-forward layers to the entire sequence
-        head_dim_experts = create_experts(head_dim, head_dim, num_experts=16)
-        x = additive_self_attention(character_embedding_dim, num_heads=num_heads, experts=head_dim_experts, positional_encoding=positional_encoding)(x)
-        x = ff_layer(character_embedding_dim, activation)(x)
- 
-    # Up-convolution: Restore the sequence length to the original input_length
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_1"))(x)
-    x = Conv1DTranspose(filters=character_embedding_dim, kernel_size=3, strides=2, padding='same', name=n("conv_upsample_2"))(x)
-    x = LayerNormalization(name=n("layer_norm_upsample"))(x)
-    embedding_residual = Conv1D(filters=character_embedding_dim, kernel_size=5, padding='same', activation=None, name=n("conv_embedding_residual"))(embedding)
-    x = Add(name=n("add_embedding_residual"))([x, embedding_residual])
-    # Apply the embedding layer to convert the output to logits over the vocabulary
-    x = Lambda(lambda x: tf.matmul(x, embedding_layer.embeddings, transpose_b=True), name=n("lambda_final_matmul"), output_shape=(input_length, alphabet_size))(x)
+    x = reduced_to_quarter
 
-    # Apply softmax to get the probability distribution over the vocabulary for each token in the sequence
-    x = Softmax(name=n("softmax_output"))(x)
+    # Decoder blocks
+    for _ in range(num_decoder_blocks):
+        x = transformer_decoder_block(x, num_heads, ff_dim=character_embedding_dim, dropout_rate=dropout_rate)
 
-    model = tf.keras.Model(inputs=inputs, outputs=x, name="KermitLanguageModel")
+    back_to_half = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
+    back_to_full = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(back_to_half)
+
+    # Final output layer
+    outputs = Dense(alphabet_size, activation='softmax')(back_to_full)
+
+    model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_combined_attention_pooling")
     return model
+
 
 
 
@@ -756,14 +834,15 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
             print("Reached the end of the dataset.")
             break
 
+
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, text_file, temperature=1.0, gen_length=100):
+    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0, gen_length=100):
         self.char_to_index = char_to_index
         self.index_to_char = index_to_char
         self.max_input_length = max_input_length
         self.num_samples = num_samples
         self.frequency = frequency
-        self.dataset = load_text_file_dataset(text_file)
+        self.jsonl_files = jsonl_files
         self.temperature = temperature
         self.gen_length = gen_length
 
@@ -777,12 +856,18 @@ class ReconstructCallback(keras.callbacks.Callback):
             self._print_predictions()
 
     def _get_random_sequence(self):
-        chunk = next(iter(self.dataset.take(1)))
-        text = chunk.numpy().decode('utf-8')
-        if len(text) > self.max_input_length:
-            start = np.random.randint(0, len(text) - self.max_input_length)
-            return text[start:start+self.max_input_length]
-        return text.ljust(self.max_input_length)  # Pad if shorter than max_input_length
+        random_file = random.choice(self.jsonl_files)
+        with open(random_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            random_line = random.choice(lines)
+            data = json.loads(random_line)
+            query = data.get('query', '').strip()
+            result = data.get('result', '').strip()
+            full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+            if len(full_text) > self.max_input_length:
+                start = random.randint(0, len(full_text) - self.max_input_length)
+                return full_text[start:start+self.max_input_length]
+            return full_text.ljust(self.max_input_length, SPECIAL_PAD)
     
     def _tokenize(self, sequence):
         return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence], dtype=np.int32)
@@ -846,10 +931,8 @@ class ReconstructCallback(keras.callbacks.Callback):
             return f"\033[30;41m{char}\033[0m"  # Red background, black text
 
 
-
-
-def calculate_steps_per_epoch(file_path: Path, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
-    cache_key = f"file_{hashlib.md5(str(file_path).encode()).hexdigest()}"
+def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
+    cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
@@ -858,15 +941,19 @@ def calculate_steps_per_epoch(file_path: Path, max_input_length, batch_size, cac
                 print(f"Using cached total windows: {total_windows}")
                 return total_windows // batch_size
 
-    dataset = load_text_file_dataset(file_path)
-
     total_windows = 0
 
-    for chunk in tqdm(dataset, desc="Calculating windows", unit="chunk"):
-        text_length = len(chunk.numpy().decode('utf-8'))
-        # Calculate the number of windows in this chunk
-        chunk_windows = max(0, (text_length - max_input_length) + 1)
-        total_windows += chunk_windows
+    for jsonl_file in tqdm(jsonl_files, desc="Calculating windows", unit="file"):
+        with open(jsonl_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line)
+                query = data.get('query', '')
+                result = data.get('result', '')
+                full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+                text_length = len(full_text)
+                # Calculate the number of windows in this line
+                line_windows = max(0, (text_length - max_input_length) + 1)
+                total_windows += line_windows
 
     # Cache the result
     if os.path.exists(cache_file):
@@ -881,57 +968,66 @@ def calculate_steps_per_epoch(file_path: Path, max_input_length, batch_size, cac
 
     steps_per_epoch = total_windows // batch_size
 
-    print(f"Total windows across all chunks: {total_windows}")
+    print(f"Total windows across all JSONL files: {total_windows}")
     print(f"Batch size: {batch_size}")
     print(f"Steps per epoch: {steps_per_epoch}")
 
     return steps_per_epoch
 
 
-def get_alphabet(file_path: Path, cache_file: str = 'overall_unique_chars.json') -> Set[str]:
-    cache_key = f"file_{hashlib.md5(str(file_path).encode()).hexdigest()}"
-    if os.path.exists(cache_file):
-        with open(cache_file, 'r') as f:
-            cached_data = json.load(f)
-            if cache_key in cached_data:
-                alphabet = set(cached_data[cache_key])
-                print(f"Using cached alphabet for {cache_key}")
-                alphabet.update([SPECIAL_PAD, SPECIAL_START, SPECIAL_END])
-                return alphabet
-
-    dataset = load_text_file_dataset(file_path)
+def get_alphabet(jsonl_files, cache_file='alphabet_cache.json'):
+    """
+    Extracts all unique characters from multiple JSONL files to create an alphabet.
+    Checks for a cached version first.
+    """
+    # Compute a hash of the JSONL files to use as a cache key
+    hash_key = compute_files_hash(jsonl_files)
     
-    alphabet = set()
-    for chunk in tqdm(dataset, desc="Processing dataset", unit="chunk"):
-        alphabet.update(set(chunk.numpy().decode('utf-8')))
+    # Check if the cache file exists and is up-to-date
+    if Path(cache_file).exists():
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+            if cache_data.get('hash_key') == hash_key:
+                print("Loading alphabet from cache.")
+                return cache_data['alphabet']
 
-    if os.path.exists(cache_file):
-        with open(cache_file, 'r') as f:
-            cached_data = json.load(f)
-    else:
-        cached_data = {}
-    
-    cached_data[cache_key] = list(alphabet)
-    with open(cache_file, 'w') as f:
-        json.dump(cached_data, f)
+    # Initialize a set to collect all unique characters
+    alphabet_set = set()
 
-    # Add special tokens to the alphabet
-    alphabet.update([SPECIAL_PAD, SPECIAL_START, SPECIAL_END])
+    # Process each JSONL file to compute the alphabet
+    for jsonl_path in jsonl_files:
+        with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
+            for line in jsonl_file:
+                data = json.loads(line)
+                query = data.get('query', '').strip()
+                result = data.get('result', '').strip()
+
+                # Ensure that the strings are not empty and add their characters to the set
+                if query:
+                    alphabet_set.update(query)
+                if result:
+                    alphabet_set.update(result)
+
+    # Convert the set to a sorted list of characters
+    alphabet = sorted(alphabet_set)
+
+    # Cache the computed alphabet along with the hash key
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        json.dump({'hash_key': hash_key, 'alphabet': alphabet}, f)
+
     return alphabet
 
+def compute_files_hash(files):
+    """
+    Computes a hash of the contents of the given files to use as a cache key.
+    """
+    hasher = hashlib.sha256()
+    for file_path in files:
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(8192):
+                hasher.update(chunk)
+    return hasher.hexdigest()
 
-def gelu_activation(x):
-    return tf.keras.activations.gelu(x, approximate=True)
-
-
-class SinActivation(Layer):
-    def call(self, inputs):
-        return tf.math.sin(inputs)
-
-
-class Sigmoid(Layer):
-    def call(self, inputs):
-        return tf.math.sigmoid(inputs)
 
 
 class CommitChangesToGitCallback(keras.callbacks.Callback):
