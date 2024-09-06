@@ -65,6 +65,7 @@ def character_llm_training():
     char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
     index_to_char = {index: char for char, index in char_to_index.items()}
 
+
     model = kermit_language_model(
         input_length=input_length,
         alphabet_size=len(alphabet),
@@ -77,8 +78,7 @@ def character_llm_training():
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer)
 
     reconstruct_callback = ReconstructCallback(
-        char_to_index=char_to_index,
-        index_to_char=index_to_char,
+        tokenizer=tokenizer,
         max_input_length=input_length,
         num_samples=5,
         frequency=100,
@@ -837,9 +837,8 @@ def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch
 
 
 class ReconstructCallback(keras.callbacks.Callback):
-    def __init__(self, char_to_index, index_to_char, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0):
-        self.char_to_index = char_to_index
-        self.index_to_char = index_to_char
+    def __init__(self, tokenizer, max_input_length, num_samples, frequency, jsonl_files, temperature=1.0):
+        self.tokenizer = tokenizer
         self.max_input_length = max_input_length
         self.num_samples = num_samples
         self.frequency = frequency
@@ -866,17 +865,6 @@ class ReconstructCallback(keras.callbacks.Callback):
             full_text = f"{query}{SPECIAL_SEP}{result}"
             return full_text
 
-    def _tokenize(self, sequence):
-        token_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence]
-        if len(token_indices) < self.max_input_length:
-            token_indices += [self.char_to_index[SPECIAL_PAD]] * (self.max_input_length - len(token_indices))
-        else:
-            token_indices = token_indices[:self.max_input_length]
-        return np.array(token_indices, dtype=np.int32)
-
-    def _detokenize(self, token_indices):
-        return ''.join([self.index_to_char.get(idx, SPECIAL_PAD) for idx in token_indices])
-
     def _select_top_character(self, predictions, temperature=1.0):
         predictions = np.asarray(predictions).astype('float64')
         predictions = np.log(predictions) / temperature
@@ -892,10 +880,10 @@ class ReconstructCallback(keras.callbacks.Callback):
             input_sequence, target_result = full_sequence.split(SPECIAL_SEP, 1)
             input_sequence += SPECIAL_SEP
             
-            full_target = self._detokenize(self._tokenize(full_sequence))
+            full_target = self.tokenizer.indices_to_string(self.tokenizer.tokenize(full_sequence))
             print(f"Full Target: {full_target}")
             
-            input_tensor = self._tokenize(input_sequence)
+            input_tensor = self.tokenizer.tokenize(input_sequence)
             generated_sequence = list(input_sequence)
             color_coded_sequence = []
             
@@ -907,14 +895,14 @@ class ReconstructCallback(keras.callbacks.Callback):
 
                     if i == 0:
                         top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
-                        top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
+                        top_5_chars = [self.tokenizer.index_to_char[idx] for idx in top_5_indices]
                         top_5_probs = last_token_prediction[top_5_indices]
                         print("Top 5 predictions for the next token:")
                         for char, prob in zip(top_5_chars, top_5_probs):
                             print(f"{char}: {prob:.4f}")
 
                     predicted_index = self._select_top_character(last_token_prediction, self.temperature)
-                    predicted_char = self.index_to_char[predicted_index]
+                    predicted_char = self.tokenizer.index_to_char[predicted_index]
                     confidence = last_token_prediction[predicted_index]
                     
                     color_coded_char = self._color_code(predicted_char, confidence)
@@ -932,7 +920,8 @@ class ReconstructCallback(keras.callbacks.Callback):
                     traceback.print_exc()
                     break
             
-            print(f"Predicted: {''.join(generated_sequence[len(input_sequence):])}")
+            predicted_sequence = ''.join(generated_sequence[len(input_sequence):])
+            print(f"Predicted: {self.tokenizer.indices_to_string(self.tokenizer.tokenize(predicted_sequence))}")
             print(f"Color    : {''.join(color_coded_sequence)}")
             print("\n")
 
