@@ -869,7 +869,16 @@ class ReconstructCallback(keras.callbacks.Callback):
             return input_text, result
     
     def _tokenize(self, sequence):
-        return np.array([self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence], dtype=np.int32)
+        # Convert characters to indices
+        token_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence]
+        
+        # Pad or truncate the sequence to max_input_length
+        if len(token_indices) < self.max_input_length:
+            token_indices += [self.char_to_index[SPECIAL_PAD]] * (self.max_input_length - len(token_indices))
+        else:
+            token_indices = token_indices[:self.max_input_length]
+        
+        return np.array(token_indices, dtype=np.int32)
 
     def _select_top_character(self, predictions):
         return np.argmax(predictions, axis=-1)
