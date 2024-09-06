@@ -863,70 +863,67 @@ class ReconstructCallback(keras.callbacks.Callback):
             data = json.loads(random_line)
             query = data.get('query', '').strip()
             result = data.get('result', '').strip()
-            input_text = f"{query}{SPECIAL_SEP}"
-            if len(input_text) > self.max_input_length:
-                input_text = input_text[:self.max_input_length]
-            return input_text, result
-    
+            full_text = f"{query}{SPECIAL_SEP}{result}"
+            return full_text
+
     def _tokenize(self, sequence):
-        # Convert characters to indices
         token_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in sequence]
-        
-        # Pad or truncate the sequence to max_input_length
         if len(token_indices) < self.max_input_length:
             token_indices += [self.char_to_index[SPECIAL_PAD]] * (self.max_input_length - len(token_indices))
         else:
             token_indices = token_indices[:self.max_input_length]
-        
         return np.array(token_indices, dtype=np.int32)
 
-    def _select_top_character(self, predictions):
-        return np.argmax(predictions, axis=-1)
+    def _detokenize(self, token_indices):
+        return ''.join([self.index_to_char.get(idx, SPECIAL_PAD) for idx in token_indices])
+
+    def _select_top_character(self, predictions, temperature=1.0):
+        predictions = np.asarray(predictions).astype('float64')
+        predictions = np.log(predictions) / temperature
+        exp_preds = np.exp(predictions)
+        predictions = exp_preds / np.sum(exp_preds)
+        probas = np.random.multinomial(1, predictions, 1)
+        return np.argmax(probas)
 
     def _print_predictions(self):
         for sample in range(self.num_samples):
             print(f"\nSample {sample + 1}:")
-            input_sequence, target_result = self._get_random_sequence()
+            full_sequence = self._get_random_sequence()
+            input_sequence, target_result = full_sequence.split(SPECIAL_SEP, 1)
+            input_sequence += SPECIAL_SEP
+            
+            full_target = self._detokenize(self._tokenize(full_sequence))
+            print(f"Full Target: {full_target}")
             
             input_tensor = self._tokenize(input_sequence)
-            
             generated_sequence = list(input_sequence)
             color_coded_sequence = []
             
             for i in range(self.max_input_length - len(input_sequence)):
                 try:
                     input_tensor_reshaped = np.reshape(input_tensor, (1, self.max_input_length))
-                    
                     predictions = self.model.predict(input_tensor_reshaped, verbose=0)[0]
-
-                    # Focus on the prediction for the last token in the sequence
                     last_token_prediction = predictions[len(generated_sequence) - 1]
 
                     if i == 0:
                         top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
                         top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
                         top_5_probs = last_token_prediction[top_5_indices]
+                        print("Top 5 predictions for the next token:")
                         for char, prob in zip(top_5_chars, top_5_probs):
-                            bar_length = 40
-                            bar_fill = int(prob * bar_length)
-                            bar = '#' * bar_fill + '-' * (bar_length - bar_fill)
-                            print(f"{char}: {prob:.4f} | {bar}")
+                            print(f"{char}: {prob:.4f}")
 
-                    predicted_index = self._select_top_character(last_token_prediction)
+                    predicted_index = self._select_top_character(last_token_prediction, self.temperature)
                     predicted_char = self.index_to_char[predicted_index]
                     confidence = last_token_prediction[predicted_index]
                     
-                    
                     color_coded_char = self._color_code(predicted_char, confidence)
                     color_coded_sequence.append(color_coded_char)
-                    
-                    # Append the predicted character to the generated sequence
                     generated_sequence.append(predicted_char)
                     
-                    # Update input_tensor to reflect the new prediction
-                    input_tensor = np.concatenate([input_tensor[1:], [predicted_index]])
+                    input_tensor = np.roll(input_tensor, -1)
+                    input_tensor[-1] = predicted_index
                     
-                    # Stop if we've reached the end token or the maximum length
                     if predicted_char == SPECIAL_END or len(generated_sequence) == self.max_input_length:
                         break
                     
@@ -935,10 +932,8 @@ class ReconstructCallback(keras.callbacks.Callback):
                     traceback.print_exc()
                     break
             
-            print(f"Input    | {input_sequence}")
-            print(f"Target   | {target_result}")
-            print(f"Predicted| {''.join(generated_sequence[len(input_sequence):])}")
-            print(f"Color    | {''.join(color_coded_sequence)}")
+            print(f"Predicted: {''.join(generated_sequence[len(input_sequence):])}")
+            print(f"Color    : {''.join(color_coded_sequence)}")
             print("\n")
 
     def _color_code(self, char, confidence):
@@ -948,7 +943,6 @@ class ReconstructCallback(keras.callbacks.Callback):
             return f"\033[30;43m{char}\033[0m"  # Yellow background, black text
         else:
             return f"\033[30;41m{char}\033[0m"  # Red background, black text
-
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
     cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
