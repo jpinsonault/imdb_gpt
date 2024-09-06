@@ -887,11 +887,8 @@ class ReconstructCallback(keras.callbacks.Callback):
         for sample in range(self.num_samples):
             print(f"\nSample {sample + 1}:")
             input_sequence, target_result = self._get_random_sequence()
-            print(f"Input sequence: {input_sequence}")
-            print(f"Target result: {target_result}")
             
             input_tensor = self._tokenize(input_sequence)
-            print(f"Input tensor shape: {input_tensor.shape}")
             
             generated_sequence = list(input_sequence)
             color_coded_sequence = []
@@ -899,20 +896,16 @@ class ReconstructCallback(keras.callbacks.Callback):
             for i in range(self.max_input_length - len(input_sequence)):
                 try:
                     input_tensor_reshaped = np.reshape(input_tensor, (1, self.max_input_length))
-                    print(f"Input tensor reshaped: {input_tensor_reshaped.shape}")
                     
                     predictions = self.model.predict(input_tensor_reshaped, verbose=0)[0]
-                    print(f"Predictions shape: {predictions.shape}")
 
                     # Focus on the prediction for the last token in the sequence
                     last_token_prediction = predictions[len(generated_sequence) - 1]
-                    print(f"Last token prediction shape: {last_token_prediction.shape}")
 
                     if i == 0:
                         top_5_indices = np.argsort(last_token_prediction)[-5:][::-1]
                         top_5_chars = [self.index_to_char[idx] for idx in top_5_indices]
                         top_5_probs = last_token_prediction[top_5_indices]
-                        print(f"Step {i} - Top 5 predictions for the next token:")
                         for char, prob in zip(top_5_chars, top_5_probs):
                             bar_length = 40
                             bar_fill = int(prob * bar_length)
@@ -923,7 +916,6 @@ class ReconstructCallback(keras.callbacks.Callback):
                     predicted_char = self.index_to_char[predicted_index]
                     confidence = last_token_prediction[predicted_index]
                     
-                    print(f"Predicted char: {predicted_char}, Confidence: {confidence:.4f}")
                     
                     color_coded_char = self._color_code(predicted_char, confidence)
                     color_coded_sequence.append(color_coded_char)
@@ -936,7 +928,6 @@ class ReconstructCallback(keras.callbacks.Callback):
                     
                     # Stop if we've reached the end token or the maximum length
                     if predicted_char == SPECIAL_END or len(generated_sequence) == self.max_input_length:
-                        print("Reached end token or maximum length. Stopping generation.")
                         break
                     
                 except Exception as e:
