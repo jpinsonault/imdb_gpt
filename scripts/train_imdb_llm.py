@@ -271,9 +271,9 @@ class Tokenizer:
                           for char in input_string ]
 
         # Pad the input to max_input_length using zeros
-        total_pad = self.max_input_length - len(input_indices)
+        total_pad = self.max_input_length - len(input_indices) 
 
-        input_indices = [self.char_to_index[SPECIAL_START]] + [self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
+        input_indices = [self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
 
         if len(input_indices) != self.max_input_length:
             raise ValueError(
@@ -606,103 +606,6 @@ def create_experts(input_dim, output_dim, num_experts):
     
     return expert_weights
 
-class LinformerSelfAttention(Layer):
-    def __init__(self, embed_dim, num_heads, seq_len, k=64, dropout=0.1):
-        super(LinformerSelfAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.seq_len = seq_len
-        self.k = k
-        self.dropout = dropout
-
-        assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by the number of heads"
-
-        self.head_dim = embed_dim // num_heads
-
-        # Linear projections for queries, keys, and values
-        self.query = Dense(embed_dim)
-        self.key = Dense(embed_dim)
-        self.value = Dense(embed_dim)
-
-        # Low-rank projection matrices
-        self.proj_k = Dense(self.head_dim)  # Adjust projection to match head_dim
-        self.proj_v = Dense(self.head_dim)  # Adjust projection to match head_dim
-
-        # Output linear layer
-        self.out = Dense(embed_dim)
-        self.dropout = Dropout(dropout)
-
-    def build(self, input_shape):
-        # No additional weights are needed here, but this method marks the layer as built.
-        super(LinformerSelfAttention, self).build(input_shape)
-
-    def call(self, x, mask=None):
-        batch_size = tf.shape(x)[0]
-
-        # Project input to queries, keys, and values
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
-
-        # Split the embedding into multiple heads
-        Q = tf.reshape(Q, (batch_size, self.seq_len, self.num_heads, self.head_dim))
-        K = tf.reshape(K, (batch_size, self.seq_len, self.num_heads, self.head_dim))
-        V = tf.reshape(V, (batch_size, self.seq_len, self.num_heads, self.head_dim))
-
-        # Apply low-rank projection
-        K = self.proj_k(K)
-        V = self.proj_v(V)
-
-        # Reshape K and V to align with Q for matmul
-        Q = tf.transpose(Q, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, head_dim]
-        K = tf.transpose(K, perm=[0, 2, 1, 3])  # [batch_size, num_heads, k, head_dim]
-        V = tf.transpose(V, perm=[0, 2, 1, 3])  # [batch_size, num_heads, k, head_dim]
-
-        # Compute attention scores
-        attention_scores = tf.matmul(Q, K, transpose_b=True) / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
-
-        if mask is not None:
-            attention_scores += (mask * -1e9)
-
-        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
-        attention_weights = self.dropout(attention_weights)
-
-        # Combine heads
-        attention_output = tf.matmul(attention_weights, V)
-        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # Back to original shape
-        attention_output = tf.reshape(attention_output, (batch_size, self.seq_len, self.embed_dim))
-
-        # Final linear projection
-        output = self.out(attention_output)
-
-        return output
-
-    def compute_output_shape(self, input_shape):
-        return (input_shape[0], self.seq_len, self.embed_dim)
-
-def linformer_language_model(input_length, alphabet_size, character_embedding_dim, num_blocks=4, num_heads=4, k=64):
-    inputs = tf.keras.Input(shape=(input_length,), dtype=tf.int32, name="input_layer")
-    embedding_layer = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim, name="embedding_layer")
-    embedding = embedding_layer(inputs)
-    
-    x = embedding
-    for i in range(num_blocks):
-        attention_output = LinformerSelfAttention(
-            embed_dim=character_embedding_dim,
-            num_heads=num_heads,
-            seq_len=input_length,
-            k=k
-        )(x)
-        x = Add()([x, attention_output])
-        x = LayerNormalization()(x)
-        x = Dense(character_embedding_dim, activation='relu')(x)
-    
-    # The final Dense layer should output a probability distribution over the alphabet for each token
-    x = Dense(alphabet_size, activation='softmax', name="output_layer")(x)
-
-    model = tf.keras.Model(inputs=inputs, outputs=x, name="LinformerLanguageModel")
-    return model
-
 
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     # Self-attention
@@ -789,48 +692,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 ######################################################################################################################################
 
 
-def print_debug_batches(dataset, index_to_char, num_batches=5, samples_per_batch=3):
-    """
-    Print debug information for a specified number of batches from the generator.
-    
-    Args:
-    dataset: The TensorFlow dataset
-    index_to_char: Dictionary mapping indices to characters
-    num_batches: Number of batches to print (default: 5)
-    samples_per_batch: Number of samples to print from each batch (default: 3)
-    """
-    batch_iterator = iter(dataset)
-    
-    for batch_num in range(num_batches):
-        print(f"\n{'='*40}\nBatch {batch_num + 1}\n{'='*40}")
-        
-        try:
-            batch = next(batch_iterator)
-            inputs, targets = batch
-            
-            for sample in range(min(samples_per_batch, len(inputs))):
-                print(f"\nSample {sample + 1}:")
-                input_sequence = inputs[sample].numpy()
-                target = targets[sample].numpy()
-                
-                print("Input sequence:")
-                print(input_sequence)
-                print("\nInput decoded:")
-                print(''.join([index_to_char[idx] for idx in input_sequence]))
-                
-                print("\nTarget:")
-                print(target)
-                print("\nTarget decoded:")
-                target_index = np.argmax(target)
-                print(f"Index: {target_index}, Character: {index_to_char[target_index]}")
-                
-                print("\n" + "-"*30)
-        
-        except StopIteration:
-            print("Reached the end of the dataset.")
-            break
-
-
 class ReconstructCallback(Callback):
     def __init__(self, tokenizer: Tokenizer, max_input_length, num_samples=5, frequency=100, jsonl_files=None):
         super().__init__()
@@ -858,7 +719,7 @@ class ReconstructCallback(Callback):
         result = data['result']
 
         # Construct the prompt
-        prompt = f"{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
+        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nInput query:")
