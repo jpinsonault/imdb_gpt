@@ -844,9 +844,9 @@ class ReconstructCallback(Callback):
         self.frequency = frequency
         self.jsonl_files = jsonl_files
 
-    def on_epoch_end(self, epoch, logs=None):
-        if (epoch + 1) % self.frequency == 0:
-            print(f"\nEpoch {epoch + 1} - Reconstruction samples:")
+    def on_batch_end(self, batch, logs=None):
+        if (batch + 1) % self.frequency == 0:
+            print(f"\nbatch {batch + 1} - Reconstruction samples:")
             for _ in range(self.num_samples):
                 self.generate_sample()
 
