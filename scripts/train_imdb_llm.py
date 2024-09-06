@@ -728,8 +728,8 @@ class ReconstructCallback(Callback):
         print("\nExpected result:")
         print(result)
 
-        print("\nModel prediction:")
         generated_text = self.generate_continuation(input_indices)
+        print("\nModel prediction:")
         print(generated_text)
 
         print("-" * 50)
@@ -740,7 +740,6 @@ class ReconstructCallback(Callback):
 
         for _ in range(self.max_input_length):
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-            print(f"prediction shape: {prediction.shape}")
             print("prediction: ", self.tokenizer.untokenize(tf.argmax(prediction[0, :, :], axis=-1).numpy()))
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char[next_char_index]
