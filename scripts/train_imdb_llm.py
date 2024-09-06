@@ -273,7 +273,7 @@ class Tokenizer:
         # Pad the input to max_input_length using zeros
         total_pad = self.max_input_length - len(input_indices)
 
-        input_indices = [[self.char_to_index[SPECIAL_START]] + self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
+        input_indices = [self.char_to_index[SPECIAL_START]] + [self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
 
         if len(input_indices) != self.max_input_length:
             raise ValueError(
@@ -877,7 +877,6 @@ class ReconstructCallback(Callback):
         generated_chars = []
         for _ in range(self.max_input_length):
             prediction = self.model.predict(tf.expand_dims(input_indices, 0), verbose=0)
-            print(f"prediction size: {prediction.shape}")
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char[next_char_index]
             
