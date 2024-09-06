@@ -267,17 +267,13 @@ class Tokenizer:
         if len(input_string) > self.max_input_length:
             print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
             input_string = input_string[:self.max_input_length]
-        input_indices = [self.char_to_index.get(
-            char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
+        input_indices = [ self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) 
+                          for char in input_string ]
 
         # Pad the input to max_input_length using zeros
         total_pad = self.max_input_length - len(input_indices)
-        # num_to_pad_left = random.randint(0, total_pad)
-        num_to_pad_left = 0
-        num_to_pad_right = total_pad - num_to_pad_left
 
-        input_indices = [self.char_to_index[SPECIAL_PAD]]*num_to_pad_left + \
-            input_indices + [self.char_to_index[SPECIAL_PAD]]*num_to_pad_right
+        input_indices = [self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
 
         if len(input_indices) != self.max_input_length:
             raise ValueError(
@@ -845,7 +841,7 @@ class ReconstructCallback(Callback):
         self.jsonl_files = jsonl_files
 
     def on_batch_end(self, batch, logs=None):
-        if (batch + 1) % self.frequency == 0:
+        if batch % self.frequency == 0:
             print(f"\nbatch {batch + 1} - Reconstruction samples:")
             for _ in range(self.num_samples):
                 self.generate_sample()
