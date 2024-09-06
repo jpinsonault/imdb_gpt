@@ -736,8 +736,10 @@ class ReconstructCallback(Callback):
 
     def generate_continuation(self, input_indices):
         generated_chars = []
+        current_input = input_indices.copy()
+
         for _ in range(self.max_input_length):
-            prediction = self.model.predict(tf.expand_dims(input_indices, 0), verbose=0)
+            prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
             print(f"prediction shape: {prediction.shape}")
             print("prediction: ", self.tokenizer.untokenize(tf.argmax(prediction[0, :, :], axis=-1).numpy()))
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
@@ -747,7 +749,7 @@ class ReconstructCallback(Callback):
                 break
             
             generated_chars.append(next_char)
-            input_indices = tf.concat([input_indices[1:], [next_char_index]], axis=0)
+            current_input = tf.concat([current_input, [next_char_index]], axis=0)[-self.max_input_length:]
 
         return ''.join(generated_chars)
 
