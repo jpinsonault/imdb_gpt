@@ -250,7 +250,7 @@ class Tokenizer:
 
     def tokenize(self, input_string):
         if len(input_string) > self.max_input_length:
-            print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
+            # print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
             input_string = input_string[:self.max_input_length]
         input_indices = [ self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) 
                           for char in input_string ]
