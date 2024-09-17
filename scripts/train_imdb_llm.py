@@ -250,53 +250,6 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
             data_indices = [0] * len(jsonl_files)
 
 
-def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
-    # Get the shape of the predictions
-    sequence_length = tf.shape(y_pred)[1]
-    
-    # Create a linear mask that decreases from mask_start to mask_end
-    mask = tf.linspace(mask_start, mask_end, sequence_length)
-    
-    # Expand the mask to match the shape of y_pred
-    mask = tf.reshape(mask, [1, sequence_length])
-    
-    # Apply the mask to the loss
-    loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
-    masked_loss = loss * mask
-    
-    # Return the mean loss, with the mask applied
-    return tf.reduce_mean(masked_loss)
-
-
-class NextTokenAccuracy(tf.keras.metrics.Metric):
-    def __init__(self, name='next_token_accuracy', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.total = self.add_weight(name='total', initializer='zeros')
-        self.count = self.add_weight(name='count', initializer='zeros')
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        # Focus on the last token in the sequence
-        y_true_last = tf.argmax(y_true[:, -1, :], axis=-1)
-        y_pred_last = tf.argmax(y_pred[:, -1, :], axis=-1)
-        
-        # Calculate the accuracy for the last token
-        values = tf.cast(tf.equal(y_true_last, y_pred_last), tf.float32)
-        
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, tf.float32)
-            values = tf.multiply(values, sample_weight)
-        
-        self.total.assign_add(tf.reduce_sum(values))
-        self.count.assign_add(tf.cast(tf.size(y_true_last), tf.float32))
-
-    def result(self):
-        return self.total / self.count
-
-    def reset_state(self):
-        self.total.assign(0.)
-        self.count.assign(0.)
-
-
 class ReduceSum(tf.keras.layers.Layer):
     def __init__(self, axis, keepdims=False, **kwargs):
         super().__init__(**kwargs)
@@ -663,9 +616,6 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_combined_attention_pooling")
     return model
 
-
-
-
 #......................................................................................................................................
 #-------------------------------------------------------------------------------------------------------------------------------------
 ######################################################################################################################################
@@ -717,24 +667,41 @@ class ReconstructCallback(Callback):
         generated_indices = []  # Store all predicted indices
         current_input = input_indices.copy()
 
-        for _ in range(self.max_input_length):
+        for step in range(self.max_input_length):
+            # Get the model's prediction for the current input
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
+
+            # Convert all predicted tokens into their corresponding characters
+            predicted_chars = [self.tokenizer.index_to_char.get(tf.argmax(prediction[0, i, :]).numpy(), 'UNKNOWN') for i in range(prediction.shape[1])]
+
+            # Print the full untokenized output at this step
+            full_prediction_string = "".join(predicted_chars)
+            print(f"\nStep {step + 1}:")
+            print(f"Current input indices: {current_input.numpy()}")
+            print(f"Full model prediction (untokenized): {full_prediction_string}")
+
+            # Extract the next character to generate
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
 
+            # Add the predicted index to the list
+            generated_indices.append(next_char_index)
+
             if next_char == SPECIAL_END:
                 break
-            
-            generated_indices.append(next_char_index)  # Store the index for full sequence debugging
+
+            # Update the input for the next prediction step
             current_input = tf.concat([current_input, [next_char_index]], axis=0)[-self.max_input_length:]
 
-        # Convert the full list of indices back to characters
+        # Convert the full list of indices back to characters once more for the final output
         full_output_string = self.tokenizer.untokenize(generated_indices)
-        print("\nFull output sequence untokenized back to characters:")
+        print("\nFinal full output sequence untokenized back to characters:")
         print(full_output_string)
 
-        # Return the readable text as well
-        return ''.join(self.tokenizer.index_to_char.get(idx, 'UNKNOWN') for idx in generated_indices)
+        # Return the final readable text as well
+        return full_output_string
+
+
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
     cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
