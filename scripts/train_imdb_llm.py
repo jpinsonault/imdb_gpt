@@ -50,32 +50,33 @@ def main(args):
     character_llm_training()
 
 def character_llm_training():
+    # Initialize paths and configuration
     data_dir = Path(project_config['data_dir'])
     input_length = project_config['llm']['input_length']
     batch_size = project_config['llm']['batch_size']
     character_embedding_dim = project_config['llm']['character_embedding_dim']
     num_epochs = project_config['llm']['epochs']
     jsonl_files = [data_dir / jsonl_file for jsonl_file in project_config['dataset']['jsonl_files']]
+    
+    steps_per_epoch = calculate_steps_per_epoch(jsonl_files, input_length, batch_size)
 
     print_project_config(project_config)
 
-    alphabet = get_alphabet(jsonl_files)
-    alphabet += [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
-    print(f"Alphabet size: {len(alphabet)}")
-
-    char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
-
+    tokenizer = Tokenizer.from_files(jsonl_files, input_length)
     model = kermit_language_model(
         input_length=input_length,
-        alphabet_size=len(alphabet),
+        alphabet_size=tokenizer.alphabet_size,
         character_embedding_dim=character_embedding_dim
     )
     
-    tokenizer = Tokenizer(char_to_index=char_to_index, max_input_length=input_length)
-
-    # Create a generator for the JSONL files
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer)
+    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epochs)
+    
+    # Compile and train model
+    compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbacks)
 
+
+def get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epochs):
     reconstruct_callback = ReconstructCallback(
         tokenizer=tokenizer,
         max_input_length=input_length,
@@ -84,64 +85,87 @@ def character_llm_training():
         jsonl_files=jsonl_files
     )
 
-    print("\n> compiling model\n")
+    logs_dir = create_logs_dir()
+    tensorboard_callback = TensorBoardBatchLogger(log_dir=str(logs_dir), update_freq=5)
+    commit_changes_to_git_callback = CommitChangesToGitCallback(logs_dir)
+
+    return [
+        commit_changes_to_git_callback,
+        tensorboard_callback,
+        reconstruct_callback,
+        keras.callbacks.TensorBoard('./logs', update_freq=5)
+    ]
+
+
+def compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbacks):
+    initial_learning_rate = 0.0002
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=initial_learning_rate,
+        decay_steps=steps_per_epoch * num_epochs,
+        alpha=0.0
+    )
+
+    print("\n> Compiling model\n")
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.0001),
-        loss=linear_mask_loss,
-        metrics=[NextTokenAccuracy()],
+        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy'],
     )
 
     model.summary()
 
-    now_int = int(datetime.now().timestamp())
-    folder_suggestion = suggest_folder_name()
-    folder_suggestion = f"{now_int}_{folder_suggestion}"
-    logs_dir = Path("logs") / folder_suggestion
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    tensorboard_callback = TensorBoardBatchLogger(log_dir=str(logs_dir), update_freq=5)
-
-    commit_changes_to_git_callback = CommitChangesToGitCallback(logs_dir)
-
-    learning_rate_callback = ScheduledLearningRateCallback(
-        schedule=[
-            (0, 0.0002),
-            (1, 0.0001),
-            (2, 0.00005),
-            (3, 0.00002),
-            (4, 0.00001),
-            (5, 0.000005),
-            (6, 0.000002),
-        ]
-    )
-
-    steps_per_epoch = calculate_steps_per_epoch(jsonl_files, input_length, batch_size)
-
+    print("\n> Training model\n")
     model.fit(
         dataset,
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
-        callbacks=[
-            learning_rate_callback,
-            commit_changes_to_git_callback,
-            tensorboard_callback,
-            reconstruct_callback,
-            keras.callbacks.TensorBoard('./logs', update_freq=5)
-        ]
+        callbacks=callbacks
     )
 
 
-def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
+def create_logs_dir():
+    now_int = int(datetime.now().timestamp())
+    folder_suggestion = f"{now_int}_{suggest_folder_name()}"
+    logs_dir = Path("logs") / folder_suggestion
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
+class Tokenizer:
+    def __init__(self, char_to_index, max_input_length):
+        self.char_to_index = char_to_index
+        self.alphabet_size = len(char_to_index)
+        self.index_to_char = {index: char for char, index in char_to_index.items()}
+        self.max_input_length = max_input_length
+
+    @classmethod
+    def from_files(cls, jsonl_files, max_input_length):
+        alphabet = get_alphabet(jsonl_files) + [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
+        char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
+        return cls(char_to_index, max_input_length)
+
+    def tokenize(self, input_string, pad_to_max_length=True):
+        input_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
+        if pad_to_max_length:
+            input_indices = input_indices[:self.max_input_length]
+            pad_length = self.max_input_length - len(input_indices)
+            if pad_length > 0:
+                input_indices = [self.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
+        return input_indices  # Return as list for concatenation
+
+    def untokenize(self, indices):
+        return "".join(self.index_to_char.get(index, '') for index in indices)
+    
+
+
+logging.basicConfig(level=logging.DEBUG )
+
+def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
     """
     Efficient batch generator for autoencoder training using multiple JSONL files.
     Uses character-level tokenization with special Unicode characters for tokens.
     """
-    
-    # Ensure special tokens are in the tokenizer
-    for token in [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]:
-        if token not in tokenizer.char_to_index:
-            tokenizer.add_token(token)
-    
+
     # Load all JSONL data into memory
     all_data = []
     dataset_sizes = []
@@ -152,7 +176,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
             data = [json.loads(line) for line in jsonl_file]
             all_data.append(data)
             dataset_sizes.append(len(data))
-    
+
     # Calculate sampling probabilities based on dataset sizes
     total_size = sum(dataset_sizes)
     sampling_probs = [size / total_size for size in dataset_sizes]
@@ -160,7 +184,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
     # Generate batches
     data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
     x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
-    y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
+    y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)  # Changed
 
     batch_index = 0
 
@@ -171,7 +195,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
         # Check if we've exhausted the chosen dataset
         if data_indices[dataset_choice] >= dataset_sizes[dataset_choice]:
             data_indices[dataset_choice] = 0  # Reset index if exhausted
-        
+
         # Fetch data point from chosen dataset
         data_point = all_data[dataset_choice][data_indices[dataset_choice]]
         data_indices[dataset_choice] += 1
@@ -180,44 +204,51 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer):
         result = data_point.get('result', '').strip()
 
         if not query or not result:
+            logging.debug("Skipping data point due to empty query or result")
             continue
 
-        # Combine query and result with special separator
-        full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+        # Build input and target sequences
+        input_prefix = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
+        input_prefix_indices = tokenizer.tokenize(input_prefix, pad_to_max_length=False)
+        result_indices = tokenizer.tokenize(result + SPECIAL_END, pad_to_max_length=False)
 
-        # Tokenize the full text
-        full_text_tokens = tokenizer.tokenize(full_text)
+        # Build input sequence: input_prefix_indices + result_indices[:-1]
+        input_indices = input_prefix_indices + result_indices[:-1]
+        target_indices = result_indices
 
-        # Create sliding window prefixes
-        for i in range(1, len(full_text_tokens)):
-            input_tokens = full_text_tokens[:i]
-            target_token = full_text_tokens[i]
+        # Truncate sequences to max_input_length
+        if len(input_indices) > tokenizer.max_input_length:
+            input_indices = input_indices[-tokenizer.max_input_length:]
+        else:
+            # Pad input_indices at the beginning with padding tokens
+            pad_length = tokenizer.max_input_length - len(input_indices)
+            input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
 
-            # Pad input if necessary
-            if len(input_tokens) < tokenizer.max_input_length:
-                input_tokens = np.pad(input_tokens, (0, tokenizer.max_input_length - len(input_tokens)), 
-                                      mode='constant', constant_values=tokenizer.char_to_index[SPECIAL_PAD])
-            else:
-                input_tokens = input_tokens[-tokenizer.max_input_length:]
+        if len(target_indices) > tokenizer.max_input_length:
+            target_indices = target_indices[-tokenizer.max_input_length:]
+        else:
+            # Pad target_indices at the beginning with padding tokens
+            pad_length = tokenizer.max_input_length - len(target_indices)
+            target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
 
-            # Update batch
-            x_batch[batch_index] = input_tokens
-            y_batch[batch_index, :, target_token] = 1
+        # Set x_batch and y_batch
+        x_batch[batch_index, :] = input_indices
+        y_batch[batch_index, :] = target_indices  # Changed
 
-            batch_index += 1
+        batch_index += 1
 
-            # Yield a full batch
-            if batch_index == batch_size:
-                yield x_batch, y_batch
-                # Reset for next batch
-                batch_index = 0
-                x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
-                y_batch = np.zeros((batch_size, tokenizer.max_input_length, len(tokenizer.char_to_index)), dtype=np.float32)
+        # Yield a full batch
+        if batch_index == batch_size:
+            yield x_batch, y_batch
+            batch_index = 0
+            x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
+            y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)  # Changed
 
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
             # Reset all indices and continue
             data_indices = [0] * len(jsonl_files)
+
 
 def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
     # Get the shape of the predictions
@@ -236,43 +267,6 @@ def linear_mask_loss(y_true, y_pred, mask_start=0.25, mask_end=1.0):
     # Return the mean loss, with the mask applied
     return tf.reduce_mean(masked_loss)
 
-
-class Tokenizer:
-    def __init__(self, char_to_index, max_input_length):
-        self.char_to_index = char_to_index
-        self.index_to_char = {index: char for char,
-                              index in char_to_index.items()}
-        self.index_to_char[char_to_index[SPECIAL_PAD]] = '@'
-        self.index_to_char[char_to_index[SPECIAL_START]] = '^'
-        self.index_to_char[char_to_index[SPECIAL_END]] = '$'
-        self.index_to_char[char_to_index[SPECIAL_SEP]] = '#'
-        self.max_input_length = max_input_length
-
-    def tokenize(self, input_string):
-        if len(input_string) > self.max_input_length:
-            # print(f"Warning: Input string is longer than max input length of {self.max_input_length}: {input_string}")
-            input_string = input_string[:self.max_input_length]
-        input_indices = [ self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) 
-                          for char in input_string ]
-
-        # Pad the input to max_input_length using zeros
-        total_pad = self.max_input_length - len(input_indices) 
-
-        input_indices = [self.char_to_index[SPECIAL_PAD]]*total_pad + input_indices
-
-        if len(input_indices) != self.max_input_length:
-            raise ValueError(
-                f"Input string is unexpected length: {input_string}: {len(input_indices)}")
-
-        return np.array(input_indices)
-
-    def untokenize(self, one_hot_indices):
-        return "".join([self.index_to_char[index] for index in one_hot_indices])
-
-    def tokenize_and_mask_input(self, input_string):
-        input_tensor = self.tokenize(input_string)
-        return input_tensor
-    
 
 class NextTokenAccuracy(tf.keras.metrics.Metric):
     def __init__(self, name='next_token_accuracy', **kwargs):
@@ -794,7 +788,10 @@ def get_alphabet(jsonl_files, cache_file='alphabet_cache.json'):
         with open(cache_file, 'r', encoding='utf-8') as f:
             cache_data = json.load(f)
             if cache_data.get('hash_key') == hash_key:
-                print("Loading alphabet from cache.")
+                # format = "x minutes ago"
+                last_modified = datetime.fromtimestamp(Path(cache_file).stat().st_mtime)
+                last_modified_ago = datetime.now() - last_modified
+                print(f"Loading alphabet from cache. Last modified {last_modified_ago}")
                 return cache_data['alphabet']
 
     # Initialize a set to collect all unique characters
@@ -835,7 +832,6 @@ def compute_files_hash(files):
     return hasher.hexdigest()
 
 
-
 class CommitChangesToGitCallback(Callback):
     def __init__(self, logs_dir):
         super().__init__()
@@ -874,89 +870,6 @@ class TensorBoardBatchLogger(Callback):
                     tf.summary.scalar(name, value, step=self.step)
                 self.writer.flush()
         self.step += 1
-
-
-def are_models_same(model1, model2):
-    """
-    Compare two Keras models to check if they have the same architecture and weights.
-    
-    :param model1: First Keras model
-    :param model2: Second Keras model
-    :return: Boolean indicating if the models are the same
-    """
-    # Check if the models have the same number of layers
-    if len(model1.layers) != len(model2.layers):
-        return False
-    
-    # Compare each layer
-    for layer1, layer2 in zip(model1.layers, model2.layers):
-        # Check if layer types are the same
-        if type(layer1) != type(layer2):
-            return False
-        
-        # Check if layer configurations are the same
-        if layer1.get_config() != layer2.get_config():
-            return False
-        
-        # Check if weights are the same
-        weights1 = layer1.get_weights()
-        weights2 = layer2.get_weights()
-        
-        if len(weights1) != len(weights2):
-            return False
-        
-        for w1, w2 in zip(weights1, weights2):
-            if not np.allclose(w1, w2, atol=1e-5):
-                return False
-    
-    return True
-
-def try_load_model(model_path: Path):
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        custom_objects = {
-        }
-        return keras.models.load_model(model_path, custom_objects=custom_objects)
-    except Exception as e:
-        traceback.print_exc()
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        print(f"{exc_type} {exc_obj} {exc_tb.tb_lineno}")
-        print(f"Failed to load model from {model_path}")
-        return None
-
-
-class CosineLearningRateScheduler(tf.keras.callbacks.Callback):
-    def __init__(self, total_batches, initial_lr, min_lr=1e-6):
-        super(CosineLearningRateScheduler, self).__init__()
-        self.total_batches = total_batches
-        self.initial_lr = initial_lr
-        self.min_lr = min_lr
-
-    def on_batch_end(self, batch, logs=None):
-        # Compute the cosine learning rate
-        new_lr = self.min_lr + 0.5 * (self.initial_lr - self.min_lr) * (1 + math.cos(math.pi * batch / self.total_batches))
-        self.model.optimizer.learning_rate.assign(new_lr)
-        
-
-class ScheduledLearningRateCallback(Callback):
-    """Set learning rate according to the provided schedule."""
-
-    def __init__(self, schedule):
-        """
-        schedule: List of tuples (epoch, learning_rate)
-        """
-        super().__init__()
-        self.schedule = sorted(schedule, key=lambda x: x[0])
-
-    def on_epoch_begin(self, epoch, logs=None):
-        for scheduled_epoch, new_learning_rate in reversed(self.schedule):
-            if epoch >= scheduled_epoch:
-                if hasattr(self.model.optimizer, "learning_rate"):
-                    self.model.optimizer.learning_rate.assign(
-                        new_learning_rate)
-                elif hasattr(self.model.optimizer, "lr"):
-                    self.model.optimizer.lr.assign(new_learning_rate)
-                break
 
 
 if __name__ == "__main__":
