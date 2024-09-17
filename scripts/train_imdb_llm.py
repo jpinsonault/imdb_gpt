@@ -714,22 +714,27 @@ class ReconstructCallback(Callback):
         print("-" * 50)
 
     def generate_continuation(self, input_indices):
-        generated_chars = []
+        generated_indices = []  # Store all predicted indices
         current_input = input_indices.copy()
 
         for _ in range(self.max_input_length):
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-            print(f"untokenized prediction: {self.tokenizer.untokenize(tf.argmax(prediction[0, -1, :]).numpy())}")
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
-            next_char = self.tokenizer.index_to_char[next_char_index]
-            
+            next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
+
             if next_char == SPECIAL_END:
                 break
             
-            generated_chars.append(next_char)
+            generated_indices.append(next_char_index)  # Store the index for full sequence debugging
             current_input = tf.concat([current_input, [next_char_index]], axis=0)[-self.max_input_length:]
 
-        return ''.join(generated_chars)
+        # Convert the full list of indices back to characters
+        full_output_string = self.tokenizer.untokenize(generated_indices)
+        print("\nFull output sequence untokenized back to characters:")
+        print(full_output_string)
+
+        # Return the readable text as well
+        return ''.join(self.tokenizer.index_to_char.get(idx, 'UNKNOWN') for idx in generated_indices)
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
     cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
