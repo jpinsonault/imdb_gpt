@@ -719,7 +719,6 @@ class ReconstructCallback(Callback):
 
         for _ in range(self.max_input_length):
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-            print("prediction: ", self.tokenizer.untokenize(tf.argmax(prediction[0, :, :], axis=-1).numpy()))
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char[next_char_index]
             
