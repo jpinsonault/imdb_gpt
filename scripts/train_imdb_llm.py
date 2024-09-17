@@ -158,7 +158,7 @@ class Tokenizer:
     
 
 
-logging.basicConfig(level=logging.DEBUG )
+logging.basicConfig(level=logging.ERROR)
 
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
     """
@@ -676,8 +676,6 @@ class ReconstructCallback(Callback):
 
             # Print the full untokenized output at this step
             full_prediction_string = "".join(predicted_chars)
-            print(f"\nStep {step + 1}:")
-            print(f"Current input indices: {current_input.numpy()}")
             print(f"Full model prediction (untokenized): {full_prediction_string}")
 
             # Extract the next character to generate
