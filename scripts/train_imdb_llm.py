@@ -724,9 +724,7 @@ def verify_batch_generator(batch_generator, tokenizer, num_samples=5):
         target_text = tokenizer.untokenize(target_sequence)
         
         print("\nSample {}:".format(idx + 1))
-        print("Input sequence (indices):", input_sequence)
         print("Input sequence (text):", input_text)
-        print("Target sequence (indices):", target_sequence)
         print("Target sequence (text):", target_text)
         print("-" * 50)
 
