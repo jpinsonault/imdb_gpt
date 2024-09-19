@@ -11,7 +11,7 @@ project_config = {
         'jsonl_files': [
             "movie.jsonl",
             "tvSeries.jsonl",
-            "episode.jsonl",
+            # "episode.jsonl",
             "person.jsonl",
             "character.jsonl",
         ],
