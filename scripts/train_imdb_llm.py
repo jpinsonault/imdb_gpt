@@ -144,10 +144,12 @@ class Tokenizer:
         alphabet = get_alphabet(jsonl_files) + [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
         char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
         index_to_char = {index: char for char, index in char_to_index.items()}
-        index_to_char[SPECIAL_PAD] = '@'
-        index_to_char[SPECIAL_START] = '<|'
-        index_to_char[SPECIAL_END] = '|>'
-        index_to_char[SPECIAL_SEP] = '<|>'
+
+        index_to_char[char_to_index[SPECIAL_PAD]] = '@'
+        index_to_char[char_to_index[SPECIAL_START]] = '<|'
+        index_to_char[char_to_index[SPECIAL_END]] = '|>'
+        index_to_char[char_to_index[SPECIAL_SEP]] = '<|>'
+
         return cls(char_to_index, index_to_char, max_input_length)
 
     def tokenize(self, input_string, pad_to_max_length=True):
