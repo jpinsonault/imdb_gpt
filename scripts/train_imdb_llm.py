@@ -163,8 +163,10 @@ logging.basicConfig(level=logging.ERROR)
 
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
     """
-    Batch generator that splits each JSONL line into multiple training examples.
-    Generates input-target pairs by sliding a window over the full sequence.
+    Batch generator that generates input-target pairs for language modeling.
+    For each position in the full sequence, generates an input sequence consisting
+    of the tokens up to that position, left-padded to max_input_length.
+    The target sequence is the input sequence shifted one token to the right.
     """
     # Load all JSONL data into memory
     all_data = []
@@ -214,39 +216,31 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
         # Build full sequence
         full_sequence = input_prefix_indices + result_indices
 
-        # Now generate all possible windows
         sequence_length = len(full_sequence)
         max_len = tokenizer.max_input_length
 
         if sequence_length < 2:
             continue  # Skip sequences that are too short
 
-        # Number of windows to generate
-        num_windows = max(1, sequence_length - 1)  # Ensure at least one window
+        for i in range(sequence_length - 1):
+            # Input sequence is from the start to position i (inclusive)
+            input_indices = full_sequence[:i+1]
+            # Target sequence is from the start to position i+1 (inclusive)
+            target_indices = full_sequence[:i+2]
 
-        for i in range(num_windows):
-            # Determine the start and end indices for the input and target sequences
-            start_idx = i
-            end_idx = min(i + max_len, sequence_length)
-            target_end_idx = min(end_idx + 1, sequence_length)
-
-            # Slice the sequences
-            input_indices = full_sequence[start_idx:end_idx]
-            target_indices = full_sequence[start_idx + 1:target_end_idx]
-
-            # Pad input_indices to length max_len
+            # Pad input_indices on the left to length max_len
             if len(input_indices) < max_len:
                 pad_length = max_len - len(input_indices)
                 input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
             else:
-                input_indices = input_indices[:max_len]
+                input_indices = input_indices[-max_len:]
 
-            # Pad target_indices to length max_len
+            # Pad target_indices on the left to length max_len
             if len(target_indices) < max_len:
                 pad_length = max_len - len(target_indices)
                 target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
             else:
-                target_indices = target_indices[:max_len]
+                target_indices = target_indices[-max_len:]
 
             # Assign to batch arrays
             x_batch[batch_index, :] = input_indices
