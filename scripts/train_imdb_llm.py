@@ -163,10 +163,9 @@ logging.basicConfig(level=logging.ERROR)
 
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
     """
-    Efficient batch generator for autoencoder training using multiple JSONL files.
-    Uses character-level tokenization with special Unicode characters for tokens.
+    Batch generator that splits each JSONL line into multiple training examples.
+    Generates input-target pairs by sliding a window over the full sequence.
     """
-
     # Load all JSONL data into memory
     all_data = []
     dataset_sizes = []
@@ -182,11 +181,10 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
     total_size = sum(dataset_sizes)
     sampling_probs = [size / total_size for size in dataset_sizes]
 
-    # Generate batches
+    # Initialize variables
     data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
     x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
-    y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)  # Changed
-
+    y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
     batch_index = 0
 
     while True:
@@ -213,37 +211,54 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
         input_prefix_indices = tokenizer.tokenize(input_prefix, pad_to_max_length=False)
         result_indices = tokenizer.tokenize(result + SPECIAL_END, pad_to_max_length=False)
 
-        # Build input sequence: input_prefix_indices + result_indices[:-1]
-        input_indices = input_prefix_indices + result_indices[:-1]
-        target_indices = result_indices
+        # Build full sequence
+        full_sequence = input_prefix_indices + result_indices
 
-        # Truncate sequences to max_input_length
-        if len(input_indices) > tokenizer.max_input_length:
-            input_indices = input_indices[-tokenizer.max_input_length:]
-        else:
-            # Pad input_indices at the beginning with padding tokens
-            pad_length = tokenizer.max_input_length - len(input_indices)
-            input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
+        # Now generate all possible windows
+        sequence_length = len(full_sequence)
+        max_len = tokenizer.max_input_length
 
-        if len(target_indices) > tokenizer.max_input_length:
-            target_indices = target_indices[-tokenizer.max_input_length:]
-        else:
-            # Pad target_indices at the beginning with padding tokens
-            pad_length = tokenizer.max_input_length - len(target_indices)
-            target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
+        if sequence_length < 2:
+            continue  # Skip sequences that are too short
 
-        # Set x_batch and y_batch
-        x_batch[batch_index, :] = input_indices
-        y_batch[batch_index, :] = target_indices  # Changed
+        # Number of windows to generate
+        num_windows = max(1, sequence_length - 1)  # Ensure at least one window
 
-        batch_index += 1
+        for i in range(num_windows):
+            # Determine the start and end indices for the input and target sequences
+            start_idx = i
+            end_idx = min(i + max_len, sequence_length)
+            target_end_idx = min(end_idx + 1, sequence_length)
 
-        # Yield a full batch
-        if batch_index == batch_size:
-            yield x_batch, y_batch
-            batch_index = 0
-            x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
-            y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)  # Changed
+            # Slice the sequences
+            input_indices = full_sequence[start_idx:end_idx]
+            target_indices = full_sequence[start_idx + 1:target_end_idx]
+
+            # Pad input_indices to length max_len
+            if len(input_indices) < max_len:
+                pad_length = max_len - len(input_indices)
+                input_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+            else:
+                input_indices = input_indices[:max_len]
+
+            # Pad target_indices to length max_len
+            if len(target_indices) < max_len:
+                pad_length = max_len - len(target_indices)
+                target_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+            else:
+                target_indices = target_indices[:max_len]
+
+            # Assign to batch arrays
+            x_batch[batch_index, :] = input_indices
+            y_batch[batch_index, :] = target_indices
+
+            batch_index += 1
+
+            if batch_index == batch_size:
+                yield x_batch, y_batch
+                batch_index = 0
+                x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
+                y_batch = np.zeros((batch_size, max_len), dtype=np.int32)
 
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
@@ -704,7 +719,7 @@ class ReconstructCallback(Callback):
 def verify_batch_generator(batch_generator, tokenizer, num_samples=5):
     print("\nVerifying batch generator by printing {} random examples...".format(num_samples))
     
-    # Fetch one batch (assuming batch_generator is a generator)
+    # Fetch one batch
     x_batch, y_batch = next(batch_generator)
     
     # Choose `num_samples` random indices from the batch
@@ -727,7 +742,13 @@ def verify_batch_generator(batch_generator, tokenizer, num_samples=5):
 
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
+    """
+    Calculate steps per epoch by counting the number of possible windows in the dataset.
+    The function checks for cached results to avoid recalculating on subsequent runs.
+    """
     cache_key = f"files_{hashlib.md5(str(jsonl_files).encode()).hexdigest()}"
+    
+    # Load cache if available
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
@@ -738,25 +759,32 @@ def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_f
 
     total_windows = 0
 
+    # Process each file and calculate the total number of windows
     for jsonl_file in tqdm(jsonl_files, desc="Calculating windows", unit="file"):
         with open(jsonl_file, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line)
-                query = data.get('query', '')
-                result = data.get('result', '')
+                query = data.get('query', '').strip()
+                result = data.get('result', '').strip()
+                if not query or not result:
+                    continue
+
+                # Full sequence including special characters
                 full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
                 text_length = len(full_text)
-                # Calculate the number of windows in this line
-                line_windows = max(0, (text_length - max_input_length) + 1)
+                
+                # Calculate the number of possible windows of length max_input_length
+                line_windows = max(1, text_length - max_input_length + 1)
                 total_windows += line_windows
 
-    # Cache the result
+    # Cache the result for future use
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached_data = json.load(f)
     else:
         cached_data = {}
-    
+
+    # Store the total windows count in the cache
     cached_data[cache_key] = total_windows
     with open(cache_file, 'w') as f:
         json.dump(cached_data, f)
