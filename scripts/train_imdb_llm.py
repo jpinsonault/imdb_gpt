@@ -587,7 +587,7 @@ def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
 
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     # Self-attention
-    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input, use_causal_mask=True)
     attention_output = layers.Dropout(dropout_rate)(attention_output)
     attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
     
@@ -605,7 +605,7 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_decoder_blocks = 4
-    num_heads = 4
+    num_heads = 1
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
