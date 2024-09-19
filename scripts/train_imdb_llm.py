@@ -216,12 +216,10 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
             continue
 
         # Build input and target sequences
-        input_prefix = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
-        input_prefix_indices = tokenizer.tokenize(input_prefix, pad_to_max_length=False)
-        result_indices = tokenizer.tokenize(result + SPECIAL_END, pad_to_max_length=False)
+        input_string = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
 
         # Build full sequence
-        full_sequence = input_prefix_indices + result_indices
+        full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
 
         sequence_length = len(full_sequence)
         max_len = tokenizer.max_input_length
