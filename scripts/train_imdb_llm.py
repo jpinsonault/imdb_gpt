@@ -605,7 +605,7 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_decoder_blocks = 4
-    num_heads = 1
+    num_heads = 4
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
