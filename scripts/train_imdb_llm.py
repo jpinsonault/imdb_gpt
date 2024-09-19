@@ -681,13 +681,6 @@ class ReconstructCallback(Callback):
             # Get the model's prediction for the current input
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
 
-            # Convert all predicted tokens into their corresponding characters
-            predicted_chars = [self.tokenizer.index_to_char.get(tf.argmax(prediction[0, i, :]).numpy(), 'UNKNOWN') for i in range(prediction.shape[1])]
-
-            # Print the full untokenized output at this step
-            full_prediction_string = "".join(predicted_chars)
-            print(f"Full model prediction (untokenized): {full_prediction_string}")
-
             # Extract the next character to generate
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
@@ -703,8 +696,6 @@ class ReconstructCallback(Callback):
 
         # Convert the full list of indices back to characters once more for the final output
         full_output_string = self.tokenizer.untokenize(generated_indices)
-        print("\nFinal full output sequence untokenized back to characters:")
-        print(full_output_string)
 
         # Return the final readable text as well
         return full_output_string
