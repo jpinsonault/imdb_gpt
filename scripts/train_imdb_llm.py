@@ -70,6 +70,7 @@ def character_llm_training():
     )
     
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer)
+    verify_batch_generator(dataset, tokenizer)
     callbacks = get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epochs)
     
     # Compile and train model
@@ -699,6 +700,30 @@ class ReconstructCallback(Callback):
         # Return the final readable text as well
         return full_output_string
 
+
+def verify_batch_generator(batch_generator, tokenizer, num_samples=5):
+    print("\nVerifying batch generator by printing {} random examples...".format(num_samples))
+    
+    # Fetch one batch (assuming batch_generator is a generator)
+    x_batch, y_batch = next(batch_generator)
+    
+    # Choose `num_samples` random indices from the batch
+    sample_indices = random.sample(range(x_batch.shape[0]), num_samples)
+    
+    for idx in sample_indices:
+        input_sequence = x_batch[idx]
+        target_sequence = y_batch[idx]
+        
+        # Convert indices back to characters
+        input_text = tokenizer.untokenize(input_sequence)
+        target_text = tokenizer.untokenize(target_sequence)
+        
+        print("\nSample {}:".format(idx + 1))
+        print("Input sequence (indices):", input_sequence)
+        print("Input sequence (text):", input_text)
+        print("Target sequence (indices):", target_sequence)
+        print("Target sequence (text):", target_text)
+        print("-" * 50)
 
 
 def calculate_steps_per_epoch(jsonl_files, max_input_length, batch_size, cache_file='dataset_size_cache.json'):
