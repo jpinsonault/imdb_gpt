@@ -10,10 +10,10 @@ project_config = {
     'dataset': {
         'jsonl_files': [
             "movie.jsonl",
-            # "tvSeries.jsonl",
-            # "episode.jsonl",
-            # "person.jsonl",
-            # "character.jsonl",
+            "tvSeries.jsonl",
+            "episode.jsonl",
+            "person.jsonl",
+            "character.jsonl",
         ],
     },
     
@@ -42,9 +42,8 @@ project_config = {
 
     'llm': {
         'input_length'            : 128,
-        'character_embedding_dim' : 128,
+        'character_embedding_dim' : 256,
         'epochs'                  : 4,
         'batch_size'              : 512,
-        'dataset_text_file'       : 'TinyStoriesV2-GPT4-train.txt',
     },
 }
