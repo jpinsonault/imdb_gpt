@@ -133,17 +133,22 @@ def create_logs_dir():
 
 
 class Tokenizer:
-    def __init__(self, char_to_index, max_input_length):
+    def __init__(self, char_to_index, index_to_char, max_input_length):
         self.char_to_index = char_to_index
         self.alphabet_size = len(char_to_index)
-        self.index_to_char = {index: char for char, index in char_to_index.items()}
+        self.index_to_char = index_to_char
         self.max_input_length = max_input_length
 
     @classmethod
     def from_files(cls, jsonl_files, max_input_length):
         alphabet = get_alphabet(jsonl_files) + [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
         char_to_index = {char: index for index, char in enumerate(sorted(alphabet))}
-        return cls(char_to_index, max_input_length)
+        index_to_char = {index: char for char, index in char_to_index.items()}
+        index_to_char[SPECIAL_PAD] = '@'
+        index_to_char[SPECIAL_START] = '<|'
+        index_to_char[SPECIAL_END] = '|>'
+        index_to_char[SPECIAL_SEP] = '<|>'
+        return cls(char_to_index, index_to_char, max_input_length)
 
     def tokenize(self, input_string, pad_to_max_length=True):
         input_indices = [self.char_to_index.get(char, self.char_to_index[SPECIAL_PAD]) for char in input_string]
