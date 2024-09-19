@@ -609,7 +609,13 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
-    embedding = layers.Dropout(dropout_rate)(embedding)
+    
+    # Add positional encoding to embedding
+    pos_encoding = sinusoidal_encoding(input_length, character_embedding_dim)
+    embedding_with_pos = embedding + pos_encoding
+    
+    embedding_with_pos = layers.Dropout(dropout_rate)(embedding_with_pos)
+
 
     reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
     reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
@@ -693,7 +699,7 @@ class ReconstructCallback(Callback):
             # Add the predicted index to the list
             generated_indices.append(next_char_index)
 
-            if next_char == SPECIAL_END:
+            if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
                 break
 
             # Update the input for the next prediction step

@@ -43,7 +43,7 @@ project_config = {
     'llm': {
         'input_length'            : 128,
         'character_embedding_dim' : 128,
-        'epochs'                  : 16,
+        'epochs'                  : 4,
         'batch_size'              : 512,
         'dataset_text_file'       : 'TinyStoriesV2-GPT4-train.txt',
     },
