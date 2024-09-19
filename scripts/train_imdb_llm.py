@@ -237,14 +237,14 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
             # Pad input_indices to length max_len
             if len(input_indices) < max_len:
                 pad_length = max_len - len(input_indices)
-                input_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+                input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
             else:
                 input_indices = input_indices[:max_len]
 
             # Pad target_indices to length max_len
             if len(target_indices) < max_len:
                 pad_length = max_len - len(target_indices)
-                target_indices += [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length
+                target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
             else:
                 target_indices = target_indices[:max_len]
 
