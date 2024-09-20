@@ -591,11 +591,13 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input, use_causal_mask=True)
     attention_output = layers.Dropout(dropout_rate)(attention_output)
     attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
+    attention_output += input
     
     # Feed-forward network
     ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
     ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
+    ff_output += attention_output
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
     
     return ff_output
