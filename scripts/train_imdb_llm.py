@@ -217,7 +217,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
             continue
 
         # Build input and target sequences
-        input_string = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+        input_string = f"{SPECIAL_START}{SPECIAL_START}{SPECIAL_START}{query}{SPECIAL_SEP}{SPECIAL_SEP}{SPECIAL_SEP}{result}{SPECIAL_END}{SPECIAL_END}{SPECIAL_END}"
 
         # Build full sequence
         full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
@@ -611,11 +611,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
     
-    # Add positional encoding to embedding
-    pos_encoding = sinusoidal_encoding(input_length, character_embedding_dim)
-    embedding_with_pos = embedding + pos_encoding
-    
-    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding_with_pos)
+    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
     reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
 
     reduced_to_quarter = LayerNormalization()(reduced_to_quarter)
@@ -667,7 +663,7 @@ class ReconstructCallback(Callback):
         result = data['result']
 
         # Construct the prompt
-        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
+        prompt = f"{SPECIAL_START}{SPECIAL_START}{SPECIAL_START}{query}{SPECIAL_SEP}{SPECIAL_SEP}{SPECIAL_SEP}"  # query + SPECIAL_SEP
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nInput query:")
