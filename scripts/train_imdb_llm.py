@@ -620,7 +620,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
     x = reduced_to_quarter
 
-    # Decoder blocks
+    # Decoder blocksa
     for _ in range(num_decoder_blocks):
         x = transformer_decoder_block(x, num_heads, ff_dim=character_embedding_dim, dropout_rate=dropout_rate)
 

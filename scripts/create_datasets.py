@@ -16,46 +16,45 @@ jinja_env = create_jinja_environment()
 
 # Dynamic Jinja2 templates with conditional logic
 templates = {
-    'movie': jinja_env.from_string(
-        """
-        Title: {{ title }}
-        {% if year %}Year{{ 's' if '-' in str(year) else '' }}: {{ year }}{% endif %}
-        {% if genres %}Genre{{ 's' if ',' in genres else '' }}: {{ genres | replace(',', ', ') }}{% endif %}
-        {% if rating %}Rating: {{ rating }}{% endif %}
-        {% if isAdult and isAdult == 1 %}Note: Adult Content{% endif %}
-        """
-    ),
-    'tvSeries': jinja_env.from_string(
-        """
-        TV Series: {{ title }}
-        {% if startYear or endYear %}Year{{ 's' if startYear and endYear and str(startYear) != str(endYear) else '' }}: {{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}{% endif %}
-        {% if genres %}Genre{{ 's' if ',' in genres else '' }}: {{ genres | replace(',', ', ') }}{% endif %}
-        {% if rating %}Rating: {{ rating }}{% endif %}
-        """
-    ),
-    'episode': jinja_env.from_string(
-        """
-        Episode: {{ title }}
-        {% if parentTitle %}Series: {{ parentTitle }}{% endif %}
-        {% if seasonNumber %}Season: {{ seasonNumber }}{% endif %}
-        {% if episodeNumber %}Episode: {{ episodeNumber }}{% endif %}
-        """
-    ),
-    'person': jinja_env.from_string(
-        """
-        Name: {{ primaryName }}
-        {% if primaryProfession %}Profession{{ 's' if ',' in primaryProfession else '' }}: {{ primaryProfession | replace(',', ', ') }}{% endif %}
-        {% if knownForTitles %}Known for: {{ knownForTitles | replace(',', '\n') }}{% endif %}
-        """
-    ),
-    'character': jinja_env.from_string(
-        """
-        Character: {{ character }}
-        {% if name %}Played by: {{ name }}{% endif %}
-        {% if title %}Show: {{ title }}{% endif %}
-        {% if job %}Job: {{ job }}{% endif %}
-        """
-    )
+'movie': jinja_env.from_string(
+"""
+Movie
+=====
+{{ title }} {% if year %}({{ year }}){% endif %})
+{% if year %}Year{{ 's' if '-' in str(year) else '' }}: {{ year }}{% endif %}
+{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} |
+{% if rating %}Rating: {{ rating }}{% endif %}
+{% if isAdult and isAdult == 1 %}Note: Adult Content{% endif %}
+"""
+),
+'tvSeries': jinja_env.from_string(
+"""
+TV Show
+=======
+{ title }} {% if startYear or endYear %}({{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}){% endif %}
+{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} |
+{% if rating %}Rating: {{ rating }}{% endif %}
+"""
+),
+'person': jinja_env.from_string(
+"""
+Person
+======
+{{ primaryName }}
+{% if primaryProfession %}{{ primaryProfession | replace(',', ', ') }}{% endif %}
+{% if knownForTitles %}Known for
+=========
+{{ knownForTitles | replace(',', '\n') }}{% endif %}
+"""
+),
+'character': jinja_env.from_string(
+"""
+Character
+=========
+{{ character }} {% if title %}in {{ title }}{% endif %}
+{% if name %}Played by {{ name }}{% endif %}
+"""
+)
 }
 
 def load_dictionaries(cursor):
@@ -90,20 +89,20 @@ def save_datasets(db_path, output_dir):
             SELECT m.tconst, m.title, m.year, m.genres, m.rating, m.numVotes, m.isAdult, m.runtimeMinutes
             FROM search_movies m
         """,
-        # 'tvSeries': """
-        #     SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
-        #     FROM search_shows s
-        # """,
-        # 'episode': """
-        #     SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
-        #     FROM search_episodes e
-        # """,
+        'tvSeries': """
+            SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
+            FROM search_shows s
+        """,
+        'episode': """
+            SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
+            FROM search_episodes e
+        """,
         'person': """
             SELECT p.nconst, p.primaryName, p.birthYear, p.deathYear, p.primaryProfession, p.knownForTitles
             FROM search_people p
         """,
         'character': """
-            SELECT c.tconst, c.nconst, c.name, c.character, c.category, c.job
+            SELECT c.tconst, c.nconst, c.name, c.character, c.category
             FROM search_characters c
         """
     }
@@ -202,7 +201,7 @@ def save_datasets(db_path, output_dir):
                     name = nconst_to_name.get(row[1], 'Unknown')
                     data = {
                         'tconst': row[0], 'nconst': row[1], 'name': name, 'character': row[2],
-                        'title': title, 'category': row[3], 'job': row[4]
+                        'title': title, 'category': row[3]
                     }
                     query_value = row[2]
 
