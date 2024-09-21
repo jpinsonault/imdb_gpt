@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 from collections import defaultdict
 import tensorflow as tf
+from collections import deque
+
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.losses import categorical_crossentropy
@@ -46,6 +48,7 @@ SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
 
 
+
 def main(args):
     character_llm_training()
 
@@ -70,21 +73,22 @@ def character_llm_training():
         character_embedding_dim=character_embedding_dim
     )
     
-    dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer)
+    shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
+    dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
     verify_batch_generator(dataset, tokenizer)
-    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epochs)
+    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, steps_per_epoch, num_epochs)
     
     # Compile and train model
-    compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbacks)
+    compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks)
 
 
-def get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epochs):
+def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, steps_per_epoch, num_epochs):
     reconstruct_callback = ReconstructCallback(
         tokenizer=tokenizer,
+        shared_buffer=shared_buffer,
         max_input_length=input_length,
         num_samples=5,
         frequency=100,
-        jsonl_files=jsonl_files
     )
 
     logs_dir = create_logs_dir()
@@ -99,7 +103,7 @@ def get_callbacks(tokenizer, jsonl_files, input_length, steps_per_epoch, num_epo
     ]
 
 
-def compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbacks):
+def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks):
     initial_learning_rate = 0.0002
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=initial_learning_rate,
@@ -110,7 +114,7 @@ def compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbac
     print("\n> Compiling model\n")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
-        loss='sparse_categorical_crossentropy',
+        loss=partial(weighted_loss_with_padding, tokenizer=tokenizer),
         metrics=['accuracy'],
     )
 
@@ -123,6 +127,40 @@ def compile_and_train_model(model, dataset, steps_per_epoch, num_epochs, callbac
         epochs=num_epochs,
         callbacks=callbacks
     )
+
+
+def weighted_loss_with_padding(y_true, y_pred, tokenizer):
+    """
+    Custom loss function that downweights the padding characters.
+
+    Parameters:
+    - y_true: True labels (target sequences).
+    - y_pred: Predicted probabilities from the model.
+    - tokenizer: Tokenizer object containing the padding token index.
+    - pad_weight: The weight to apply to the padding tokens. Should be a small number (e.g., 0.1).
+
+    Returns:
+    - A loss value where padding tokens contribute less to the overall loss.
+    """
+    pad_weight = 0.1
+    # Get the index of the padding token
+    pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
+
+    # Compute sparse categorical cross-entropy loss
+    loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+
+    # Create a mask that downweights the padding tokens
+    # If y_true == pad_token_index, then we apply the pad_weight
+    mask = tf.cast(tf.not_equal(y_true, pad_token_index), tf.float32)
+    
+    # Apply the mask: downweight padding tokens
+    weights = mask + pad_weight * (1 - mask)
+    
+    # Apply the weights to the loss
+    weighted_loss = loss * weights
+    
+    # Return the mean loss over the batch
+    return tf.reduce_mean(weighted_loss)
 
 
 def create_logs_dir():
@@ -169,7 +207,7 @@ class Tokenizer:
 
 logging.basicConfig(level=logging.ERROR)
 
-def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
+def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, shared_buffer: deque):
     """
     Batch generator that generates input-target pairs for language modeling.
     For each position in the full sequence, generates an input sequence consisting
@@ -207,6 +245,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
 
         # Fetch data point from chosen dataset
         data_point = all_data[dataset_choice][data_indices[dataset_choice]]
+        shared_buffer.append(data_point)
         data_indices[dataset_choice] += 1
 
         query = data_point.get('query', '').strip()
@@ -639,33 +678,32 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
 
 
 class ReconstructCallback(Callback):
-    def __init__(self, tokenizer: Tokenizer, max_input_length, num_samples=5, frequency=100, jsonl_files=None):
+    def __init__(self, tokenizer: Tokenizer, shared_buffer: deque, max_input_length, num_samples=5, frequency=100):
         super().__init__()
         self.tokenizer = tokenizer
+        self.shared_buffer = shared_buffer
         self.max_input_length = max_input_length
         self.num_samples = num_samples
         self.frequency = frequency
-        self.jsonl_files = jsonl_files
 
     def on_batch_end(self, batch, logs=None):
-        if batch % self.frequency == 0:
+        if batch % self.frequency == 0 and len(self.shared_buffer) > 0:
             print(f"\nbatch {batch + 1} - Reconstruction samples:")
             for _ in range(self.num_samples):
                 self.generate_sample()
 
     def generate_sample(self):
-        # Randomly select a JSONL file and a line from it
-        jsonl_file = random.choice(self.jsonl_files)
-        with open(jsonl_file, 'r') as f:
-            lines = f.readlines()
-            line = random.choice(lines)
-            data = json.loads(line)
+        # Sample a data point from the shared buffer
+        data_point = random.choice(list(self.shared_buffer))
 
-        query = data['query']
-        result = data['result']
+        query = data_point.get('query', '').strip()
+        result = data_point.get('result', '').strip()
+
+        if not query or not result:
+            return  # Skip invalid samples
 
         # Construct the prompt
-        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
+        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nInput query:")
@@ -681,30 +719,22 @@ class ReconstructCallback(Callback):
         print("-" * 50)
 
     def generate_continuation(self, input_indices):
-        generated_indices = []  # Store all predicted indices
+        generated_indices = []
         current_input = input_indices.copy()
 
-        for step in range(self.max_input_length):
-            # Get the model's prediction for the current input
+        for _ in range(self.max_input_length):
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-
-            # Extract the next character to generate
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
 
-            # Add the predicted index to the list
             generated_indices.append(next_char_index)
 
             if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
                 break
 
-            # Update the input for the next prediction step
             current_input = tf.concat([current_input, [next_char_index]], axis=0)[-self.max_input_length:]
 
-        # Convert the full list of indices back to characters once more for the final output
         full_output_string = self.tokenizer.untokenize(generated_indices)
-
-        # Return the final readable text as well
         return full_output_string
 
 
