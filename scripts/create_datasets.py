@@ -29,7 +29,7 @@ Movie
 """
 TV Show
 =======
-{ title }} {% if startYear or endYear %}({{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}){% endif %}
+{{ title }} {% if startYear or endYear %}({{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}){% endif %}
 {% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} | {% endif %}{% if rating %}{{ rating }}/10{% endif %}
 """
 ),
