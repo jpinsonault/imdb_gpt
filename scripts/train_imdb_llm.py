@@ -217,7 +217,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer):
             continue
 
         # Build input and target sequences
-        input_string = f"{SPECIAL_START}{SPECIAL_START}{SPECIAL_START}{query}{SPECIAL_SEP}{SPECIAL_SEP}{SPECIAL_SEP}{result}{SPECIAL_END}{SPECIAL_END}{SPECIAL_END}"
+        input_string = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
 
         # Build full sequence
         full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
@@ -665,7 +665,7 @@ class ReconstructCallback(Callback):
         result = data['result']
 
         # Construct the prompt
-        prompt = f"{SPECIAL_START}{SPECIAL_START}{SPECIAL_START}{query}{SPECIAL_SEP}{SPECIAL_SEP}{SPECIAL_SEP}"  # query + SPECIAL_SEP
+        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"  # query + SPECIAL_SEP
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nInput query:")
