@@ -21,9 +21,7 @@ templates = {
 Movie
 =====
 {{ title }} {% if year %}({{ year }}){% endif %})
-{% if year %}Year{{ 's' if '-' in str(year) else '' }}: {{ year }}{% endif %}
-{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} |
-{% if rating %}Rating: {{ rating }}{% endif %}
+{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} | {% endif %}{% if rating %}{{ rating }}/10{% endif %}
 {% if isAdult and isAdult == 1 %}Note: Adult Content{% endif %}
 """
 ),
@@ -32,8 +30,7 @@ Movie
 TV Show
 =======
 { title }} {% if startYear or endYear %}({{ startYear }}{% if endYear and endYear != '\\\\N' %} - {{ endYear }}{% endif %}){% endif %}
-{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} |
-{% if rating %}Rating: {{ rating }}{% endif %}
+{% if genres %}{{ genres | replace(',', ', ') }}{% endif %}{% if genres and rating %} | {% endif %}{% if rating %}{{ rating }}/10{% endif %}
 """
 ),
 'person': jinja_env.from_string(
@@ -93,10 +90,6 @@ def save_datasets(db_path, output_dir):
             SELECT s.tconst, s.title, s.startYear, s.endYear, s.genres, s.rating, s.numVotes, s.isAdult, s.runtimeMinutes
             FROM search_shows s
         """,
-        'episode': """
-            SELECT e.tconst, e.parentTconst, e.title, e.seasonNumber, e.episodeNumber, e.isAdult
-            FROM search_episodes e
-        """,
         'person': """
             SELECT p.nconst, p.primaryName, p.birthYear, p.deathYear, p.primaryProfession, p.knownForTitles
             FROM search_people p
@@ -140,11 +133,6 @@ def save_datasets(db_path, output_dir):
                         included_movies.add(row[0])  # Add tconst of the movie to the set
                     elif entity_type == 'tvSeries':
                         included_shows.add(row[0])  # Add tconst of the show to the set
-
-                # Check if episode's parentTconst is in included shows
-                if entity_type == 'episode' and row[1] not in included_shows:
-                    filtered_counts[entity_type] += 1
-                    continue
 
                 # Check if person's known titles are in included movies or shows
                 if entity_type == 'person':
