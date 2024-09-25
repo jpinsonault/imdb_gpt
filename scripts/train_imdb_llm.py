@@ -207,6 +207,14 @@ class Tokenizer:
 
 logging.basicConfig(level=logging.ERROR)
 
+
+query_type_to_query_fieldname = {
+    'movie': 'title',
+    'tvSeries': 'title',
+    'person': 'primaryName',
+    'character': 'character',
+}
+
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, shared_buffer: deque):
     """
     Batch generator that generates input-target pairs for language modeling.
@@ -248,12 +256,16 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
         shared_buffer.append(data_point)
         data_indices[dataset_choice] += 1
 
-        query = data_point.get('query', '').strip()
-        result = data_point.get('result', '').strip()
+        query_type = data_point.get('type')
 
-        if not query or not result:
-            logging.debug("Skipping data point due to empty query or result")
+        if query_type not in ['movie', 'tvSeries', 'person', 'character']:
+            logging.debug(f"Skipping data point due to unknown query type: {query_type}")
             continue
+
+        query_fieldname = query_type_to_query_fieldname[query_type]
+        query = data_point.get(query_fieldname, '').strip()
+
+        result = json.dumps(data_point)
 
         # Build input and target sequences
         input_string = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
@@ -423,73 +435,7 @@ def dynamic_self_attention(input_vector, hidden_dim):
     output = Reshape((vector_dim,), name=n("self_attention_output"))(output)
 
     return output
-
-def attention_cross_attention(input_vector, context_vector, hidden_dim):
-    vector_dim = input_vector.shape[-1]
-    
-    def generate_weights(context_vec):
-        weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(context_vec)
-        return weights
-    
-    reduced_context = Dense(hidden_dim, activation=None, name=n("dense_reduced_context"))(context_vector)
-    weight_matrix = generate_weights(reduced_context)
-
-    weight_matrix = Reshape((vector_dim, vector_dim))(weight_matrix)
-
-    reshaped_input = Reshape((1, vector_dim))(input_vector)
-    output = Lambda(lambda x: tf.matmul(x[0], x[1]), name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
-    output = Reshape((vector_dim,), name=n("attention_output"))(output)
-
-    return output
-
-
-def additive_self_attention(character_embedding_dim, num_heads, experts, positional_encoding, activation=None):
-    def apply_attention(input_sequence):
-        head_dim = character_embedding_dim // num_heads
-
-        if num_heads == 1:
-            split_inputs = [input_sequence]
-        else:
-            split_inputs = Lambda(lambda x: tf.split(x, num_heads, axis=-1), name=n("lambda_split_inputs"))(input_sequence)
-
-        head_outputs = []
-        for i in range(num_heads):
-            head_input_tokens = split_inputs[i]
-            tf.print(f"head_input_tokens: {head_input_tokens.shape}")
-
-            input_positional_mask = create_combined_positional_mask(head_input_tokens, positional_encoding=positional_encoding)            
-
-            masked_input_tokens = head_input_tokens * input_positional_mask
-
-            global_query = create_global_token(masked_input_tokens, head_dim)
-
-            global_query = moe_self_attention(global_query, head_dim, experts, head_dim, activation=activation)
-            global_query = Reshape((1, head_dim), name=n("reshape_global_query"))(global_query)
-
-            queried_tokens = masked_input_tokens * global_query
-            
-            output_tokens = Conv1D(filters=head_dim, kernel_size=1, padding='same', activation=None, name=n("conv_attention"))(queried_tokens)
-            head_outputs.append(output_tokens)
-
-        head_outputs = Concatenate(name=n("concatenate_heads"))(head_outputs)
-
-        output_tokens = Add(name=n("add_and_norm_attention"))([head_outputs, input_sequence])
-    
-        return output_tokens
-    
-    return apply_attention
-
-
-def ff_layer(character_embedding_dim, activation):
-    def apply_ff_layer(input_sequence):
-        x = Dense(character_embedding_dim * 4, activation=activation, name=n("dense_ff_1"))(input_sequence)
-        x = Conv1D(filters=character_embedding_dim, kernel_size=1, padding='same', activation=None, name=n("conv_ff_2"))(x)
-        x = Add(name=n("add_ff"))([x, input_sequence])
-        x = LayerNormalization(name=n("layer_norm_ff"))(x)
-        return x
-
-    return apply_ff_layer
-
+ 
 
 def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
     # Stack the expert weights into a single tensor of shape (num_experts, D, D)
@@ -785,10 +731,16 @@ def calculate_steps_per_epoch(jsonl_files, tokenizer, cache_file='dataset_size_c
         with open(jsonl_file, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line)
-                query = data.get('query', '').strip()
-                result = data.get('result', '').strip()
-                if not query or not result:
+                query_type = data.get('type')
+
+                if query_type not in ['movie', 'tvSeries', 'person', 'character']:
+                    logging.debug(f"Skipping data point due to unknown query type: {query_type}")
                     continue
+
+                query_fieldname = query_type_to_query_fieldname[query_type]
+                query = data.get(query_fieldname, '').strip()
+
+                result = json.dumps(data)
 
                 # Full sequence including special characters
                 full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
