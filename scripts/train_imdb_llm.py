@@ -642,8 +642,14 @@ class ReconstructCallback(Callback):
         # Sample a data point from the shared buffer
         data_point = random.choice(list(self.shared_buffer))
 
-        query = data_point.get('query', '').strip()
-        result = data_point.get('result', '').strip()
+        query_type = data_point.get('type')
+
+        if query_type not in query_type_to_query_fieldname:
+            return  # Skip invalid sample
+
+        query_fieldname = query_type_to_query_fieldname[query_type]
+        query = data_point.get(query_fieldname, '').strip()
+        result = json.dumps(data_point)
 
         if not query or not result:
             return  # Skip invalid samples
@@ -678,10 +684,11 @@ class ReconstructCallback(Callback):
             if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
                 break
 
-            current_input = tf.concat([current_input, [next_char_index]], axis=0)[-self.max_input_length:]
+            current_input = np.concatenate([current_input, [next_char_index]])[-self.max_input_length:]
 
         full_output_string = self.tokenizer.untokenize(generated_indices)
         return full_output_string
+
 
 
 def verify_batch_generator(batch_generator, tokenizer, num_samples=5):
