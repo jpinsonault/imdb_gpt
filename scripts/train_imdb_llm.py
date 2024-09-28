@@ -674,23 +674,30 @@ class ReconstructCallback(Callback):
         generated_indices = []
         current_input = input_indices.copy()
 
-        for _ in range(self.max_input_length):
+        for step in range(self.max_input_length):
+            # Get model prediction
             prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-            all_char_indices = tf.argmax(prediction).numpy()
-            untokenized = self.tokenizer.untokenize(all_char_indices)
-            print(f"untokenized: {untokenized}")
             next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
             next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
 
+            # Add the predicted index to generated indices
             generated_indices.append(next_char_index)
 
+            # Print the current prediction progress
+            current_generated_string = self.tokenizer.untokenize(generated_indices)
+            print(f"Step {step + 1} - Current generated string: {current_generated_string}")
+
+            # Check for end token
             if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
                 break
 
+            # Update current input by appending the next predicted character
             current_input = np.concatenate([current_input, [next_char_index]])[-self.max_input_length:]
 
+        # Once the loop finishes, convert the generated indices to a full string
         full_output_string = self.tokenizer.untokenize(generated_indices)
         return full_output_string
+
 
 
 
