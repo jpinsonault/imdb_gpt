@@ -71,6 +71,7 @@ def character_llm_training():
 
     # Define the checkpoint path
     checkpoint_path = data_dir / "checkpoints" / "kermit_language_model.keras"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Check if the checkpoint exists
     if os.path.exists(checkpoint_path):
@@ -237,8 +238,8 @@ logging.basicConfig(level=logging.ERROR)
 query_type_to_query_fieldname = {
     'movie': 'title',
     'tvSeries': 'title',
-    'person': 'primaryName',
-    'character': 'character',
+    'person': 'name',
+    'character': 'name',
 }
 
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, shared_buffer: deque):
