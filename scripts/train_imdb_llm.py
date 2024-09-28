@@ -18,6 +18,8 @@ import numpy as np
 from collections import defaultdict
 import tensorflow as tf
 from collections import deque
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.models import load_model
 
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -60,29 +62,45 @@ def character_llm_training():
     character_embedding_dim = project_config['llm']['character_embedding_dim']
     num_epochs = project_config['llm']['epochs']
     jsonl_files = [data_dir / jsonl_file for jsonl_file in project_config['dataset']['jsonl_files']]
-    
+
     print_project_config(project_config)
 
     tokenizer = Tokenizer.from_files(jsonl_files, input_length)
     total_samples = calculate_steps_per_epoch(jsonl_files, tokenizer)
     steps_per_epoch = total_samples // batch_size
 
-    model = kermit_language_model(
-        input_length=input_length,
-        alphabet_size=tokenizer.alphabet_size,
-        character_embedding_dim=character_embedding_dim
-    )
-    
+    # Define the checkpoint path
+    checkpoint_path = data_dir / "checkpoints" / "kermit_language_model.keras"
+
+    # Check if the checkpoint exists
+    if os.path.exists(checkpoint_path):
+        print(f"Loading model from {checkpoint_path}")
+        # Provide custom objects for any custom layers or functions
+        custom_objects = {
+            # Include any other custom layers or functions
+            'transformer_decoder_block': transformer_decoder_block,
+            # Add any activation functions if custom
+        }
+        # Load the model
+        model = load_model(checkpoint_path, custom_objects=custom_objects)
+    else:
+        print("No saved model found. Building a new model.")
+        model = kermit_language_model(
+            input_length=input_length,
+            alphabet_size=tokenizer.alphabet_size,
+            character_embedding_dim=character_embedding_dim
+        )
+
     shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
     verify_batch_generator(dataset, tokenizer)
-    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, steps_per_epoch, num_epochs)
-    
+    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, checkpoint_path)
+
     # Compile and train model
     compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks)
 
 
-def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, steps_per_epoch, num_epochs):
+def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_filepath):
     reconstruct_callback = ReconstructCallback(
         tokenizer=tokenizer,
         shared_buffer=shared_buffer,
@@ -95,11 +113,19 @@ def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, steps_per
     tensorboard_callback = TensorBoardBatchLogger(log_dir=str(logs_dir), update_freq=5)
     commit_changes_to_git_callback = CommitChangesToGitCallback(logs_dir)
 
+    # Define the checkpoint callback
+    checkpoint_callback = ModelCheckpoint(
+        filepath=model_filepath,
+        save_weights_only=False,
+        save_freq='epoch'
+    )
+
     return [
         commit_changes_to_git_callback,
         tensorboard_callback,
         reconstruct_callback,
-        keras.callbacks.TensorBoard('./logs', update_freq=5)
+        keras.callbacks.TensorBoard('./logs', update_freq=5),
+        checkpoint_callback  # Add the checkpoint callback here
     ]
 
 
@@ -317,35 +343,6 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
             data_indices = [0] * len(jsonl_files)
 
 
-class ReduceSum(tf.keras.layers.Layer):
-    def __init__(self, axis, keepdims=False, **kwargs):
-        super().__init__(**kwargs)
-        self.axis = axis
-        self.keepdims = keepdims
-
-    def call(self, inputs):
-        return tf.reduce_sum(inputs, axis=self.axis, keepdims=self.keepdims)
-    
-class Stack(tf.keras.layers.Layer):
-    def __init__(self, axis, **kwargs):
-        super().__init__(**kwargs)
-        self.axis = axis
-
-    def call(self, inputs):
-        return tf.stack(inputs, axis=self.axis)
-    
-class Squeeze(tf.keras.layers.Layer):
-    def __init__(self, axis, **kwargs):
-        super().__init__(**kwargs)
-        self.axis = axis
-
-    def call(self, inputs):
-        return tf.squeeze(inputs, axis=self.axis)
-    
-    def compute_output_shape(self, input_shape):
-        return input_shape[:self.axis] + input_shape[self.axis + 1:]
-
-
 def create_name_generator():
     name_counts = defaultdict(int)
 
@@ -372,29 +369,6 @@ def sinusoidal_encoding(input_length, embedding_dim):
     pos_encoding = pos_encoding[tf.newaxis, ...]
     
     return pos_encoding
-
-def create_combined_positional_mask(input_sequence, positional_encoding):
-    token_dim = input_sequence.shape[-1]
-    last_token = input_sequence[:, -1, :]
-
-    input_length = input_sequence.shape[1]
-
-    expert_weights = create_experts(token_dim, input_length, num_experts=16)
-
-    last_token_positional_mask = moe_self_attention(input_vector=last_token, hidden_dim=token_dim, expert_weights=expert_weights, output_dim=input_length, activation=None)
-    last_token_positional_mask = Reshape((input_length, 1), name=n("reshape_last_token_positional_mask_2"))(last_token_positional_mask)
-
-    tokenwise_positional_mask = moe_1x1_projection(input_dim=token_dim, output_dim=1, num_experts=16, activation=None)(input_sequence)
-
-    positional_mask = Softmax(axis=1, name=n("softmax_positional_mask"))(tokenwise_positional_mask + last_token_positional_mask)
-
-    return positional_mask
-
-def create_global_token(input_sequence, token_dim):
-    query_tokens = Conv1D(filters=token_dim, kernel_size=1, padding='same', activation=None, name=n("conv_query_tokens"))(input_sequence)
-    global_token = ReduceSum(axis=1, keepdims=True, name=n("reduce_sum_global_token"))(query_tokens)
-    
-    return global_token
 
 
 def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
@@ -435,109 +409,7 @@ def dynamic_self_attention(input_vector, hidden_dim):
     output = Reshape((vector_dim,), name=n("self_attention_output"))(output)
 
     return output
- 
 
-def moe_1x1_projection(input_dim, output_dim, num_experts, activation=None):
-    # Stack the expert weights into a single tensor of shape (num_experts, D, D)
-    expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=n(f"expert_{i}_weight")) for i in range(num_experts)]
-    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
-
-    # Expand dimensions of expert_weights for broadcasting
-    expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
-    
-    def apply_moe_layer(input_sequence):
-        input_length = input_sequence.shape[1]
-
-        last_token = input_sequence[:, -1, :]
-
-        expert_scores = Dense(input_dim, activation='leaky_relu', name=n("dense_last_token"))(last_token)
-        expert_scores += last_token
-
-        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(last_token)
-        
-        # Softmax the scores
-        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
-        
-        # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1)
-        expert_scores_softmax = Reshape((num_experts, 1, 1), name=n("reshape_scores"))(expert_scores_softmax)
-
-        # Multiply the expert weight matrices by the scores and sum them up
-        combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
-                                        output_shape=(input_dim, output_dim),
-                                        name=n("combine_weights"))([expert_scores_softmax, expert_weights])
-        
-        # Apply the combined weight matrix as the 1x1 projection for each token
-        output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
-                        output_shape=(input_length, output_dim),
-                        name=n("lambda_matmul_projection"))([input_sequence, combined_weight_matrix])
-        
-        if activation is not None:
-            output = Activation(activation, name=n("moe_activation"))(output)
-        
-        return output
-
-    return apply_moe_layer
-
-
-def moe_self_attention(input_vector, hidden_dim, expert_weights, output_dim, activation=None):
-    """Applies a Mixture of Experts (MoE) self-attention mechanism to the input vector. 
-
-    The function projects the input vector to a set of scores over a group of expert weight matrices.
-    These scores are used to combine the expert matrices dynamically, creating a custom weight matrix for each input vector.
-    The input vector is then projected to the output dimension using this dynamically generated weight matrix.
-    """
-    num_experts = expert_weights.shape[0]
-    input_dim = input_vector.shape[-1]
-
-    # Expand dimensions of expert_weights for broadcasting
-    expert_weights = Lambda(lambda x: tf.expand_dims(x, axis=0), name=n("expand_expert_weights"))(expert_weights)
-    
-    def generate_weights(input_vec):
-        # Project the input vector to a set of scores for the experts
-        expert_scores = Dense(input_dim, activation='leaky_relu', name=n("expert_score_projection"))(input_vec)
-        expert_scores += input_vec
-
-        expert_scores = Dense(num_experts, activation=None, name=n("expert_score_projection"))(expert_scores)
-
-        expert_scores_softmax = Softmax(name=n("expert_score_softmax"))(expert_scores)
-        
-        # Reshape the softmax scores to match the shape needed for multiplication (batch_size, num_experts, 1, 1)
-        expert_scores_softmax = Lambda(lambda x: tf.reshape(x, (-1, num_experts, 1, 1)), name=n("reshape_scores"))(expert_scores_softmax)
-        
-        # Multiply and sum using broadcasting
-        combined_weight_matrix = Lambda(lambda x: tf.reduce_sum(x[0] * x[1], axis=1),
-                                        output_shape=(hidden_dim, output_dim),
-                                        name=n("combine_weights"))([expert_scores_softmax, expert_weights])
-        
-        return combined_weight_matrix
-    
-    # Squeeze the input vector to a hidden dimension
-    squeezed_input = Dense(hidden_dim, activation=None, name=n("dense_squeezed_input"))(input_vector)
-
-    # Generate the dynamic weight matrix using the MoE approach
-    weight_matrix = generate_weights(squeezed_input)
-
-    # Reshape the input vector for matrix multiplication
-    reshaped_input = Reshape((1, hidden_dim))(squeezed_input)
-    
-    # Apply the dynamic weight matrix to the input vector
-    output = Lambda(lambda x: tf.matmul(x[0], x[1]), 
-                    output_shape=(1, output_dim),
-                    name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
-    
-    if activation is not None:
-        output = Activation(activation, name=n("self_attention_activation"))(output)
-    
-    output = Reshape((output_dim,), name=n("self_attention_output"))(output)
-
-    return output
-
-
-def create_experts(input_dim, output_dim, num_experts):
-    expert_weights = [tf.Variable(tf.random.normal([input_dim, output_dim]), name=f"expert_{i}_weight") for i in range(num_experts)]
-    expert_weights = Stack(axis=0, name=n("stack_expert_weights"))(expert_weights)
-    
-    return expert_weights
 
 
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
@@ -553,22 +425,6 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
     
     return ff_output
-
-
-def attention_pooling(inputs, num_heads, positional_encoding, dropout_rate=0.1):
-    # Self-attention to get attention scores
-
-    positional_encoded = positional_encoding + inputs
-    attention_scores = layers.MultiHeadAttention(num_heads=num_heads, key_dim=inputs.shape[-1], dropout=dropout_rate)(positional_encoded, inputs)
-    attention_scores = layers.Softmax(axis=1)(attention_scores)  # Normalize scores across the sequence
-    
-    # Apply attention scores as a mask and multiply
-    masked_inputs = layers.Multiply()([inputs, attention_scores])
-    
-    # reduce sum over the masked input sequence
-    pooled_output = ReduceSum(axis=1)(masked_inputs)
-    
-    return pooled_output
 
 
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
@@ -656,7 +512,6 @@ class ReconstructCallback(Callback):
 
         # Construct the prompt
         prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
-        print(f"prompt: {prompt}")
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nprompt:")
