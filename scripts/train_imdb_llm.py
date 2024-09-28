@@ -651,6 +651,10 @@ class ReconstructCallback(Callback):
         query = data_point.get(query_fieldname, '').strip()
         result = json.dumps(data_point)
 
+        print(f"field: {query_fieldname}")
+        print(f"query: {query}")
+        print(f"result: {result}")
+
         if not query or not result:
             return  # Skip invalid samples
 
@@ -682,10 +686,6 @@ class ReconstructCallback(Callback):
 
             # Add the predicted index to generated indices
             generated_indices.append(next_char_index)
-
-            # Print the current prediction progress
-            current_generated_string = self.tokenizer.untokenize(generated_indices)
-            print(f"Step {step + 1} - Current generated string: {current_generated_string}")
 
             # Check for end token
             if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
