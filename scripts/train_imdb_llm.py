@@ -651,18 +651,15 @@ class ReconstructCallback(Callback):
         query = data_point.get(query_fieldname, '').strip()
         result = json.dumps(data_point)
 
-        print(f"field: {query_fieldname}")
-        print(f"query: {query}")
-        print(f"result: {result}")
-
         if not query or not result:
             return  # Skip invalid samples
 
         # Construct the prompt
         prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
+        print(f"prompt: {prompt}")
         input_indices = self.tokenizer.tokenize(prompt)
 
-        print("\nInput query:")
+        print("\nprompt:")
         print(self.tokenizer.untokenize(input_indices))
 
         print("\nExpected result:")
@@ -810,15 +807,7 @@ def get_alphabet(jsonl_files, cache_file='alphabet_cache.json'):
     for jsonl_path in jsonl_files:
         with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
             for line in jsonl_file:
-                data = json.loads(line)
-                query = data.get('query', '').strip()
-                result = data.get('result', '').strip()
-
-                # Ensure that the strings are not empty and add their characters to the set
-                if query:
-                    alphabet_set.update(query)
-                if result:
-                    alphabet_set.update(result)
+                alphabet_set.update(line)
 
     # Convert the set to a sorted list of characters
     alphabet = sorted(alphabet_set)
