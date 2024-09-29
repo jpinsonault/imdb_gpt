@@ -591,65 +591,56 @@ class AlibiMultiHeadAttention(layers.Layer):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.key_dim))
         return tf.transpose(x, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
     
+    
     def call(self, query, value, key, training=False):
-        """
-        Forward pass for the ALiBi Multi-Head Attention layer.
-
-        Args:
-            query (tf.Tensor): Query tensor of shape [batch_size, seq_len, dim].
-            value (tf.Tensor): Value tensor of shape [batch_size, seq_len, dim].
-            key (tf.Tensor): Key tensor of shape [batch_size, seq_len, dim].
-            training (bool): Whether the layer is in training mode.
-
-        Returns:
-            tf.Tensor: Output tensor after applying ALiBi attention.
-        """
         batch_size = tf.shape(query)[0]
         
         # Linear projections
-        query = self.query_dense(query)  # [batch_size, seq_len, num_heads * key_dim]
-        key = self.key_dense(key)        # [batch_size, seq_len, num_heads * key_dim]
-        value = self.value_dense(value)  # [batch_size, seq_len, num_heads * key_dim]
+        query = self.query_dense(query)
+        key = self.key_dense(key)
+        value = self.value_dense(value)
         
         # Split into heads
-        query = self.split_heads(query, batch_size)  # [batch_size, num_heads, seq_len, key_dim]
-        key = self.split_heads(key, batch_size)      # [batch_size, num_heads, seq_len, key_dim]
-        value = self.split_heads(value, batch_size)  # [batch_size, num_heads, seq_len, key_dim]
+        query = self.split_heads(query, batch_size)
+        key = self.split_heads(key, batch_size)
+        value = self.split_heads(value, batch_size)
         
         # Compute attention scores
-        matmul_qk = tf.matmul(query, key, transpose_b=True)  # [batch_size, num_heads, seq_len, seq_len]
-        
+        matmul_qk = tf.matmul(query, key, transpose_b=True)
         dk = tf.cast(self.key_dim, tf.float32)
-        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)  # Scaling
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
         
-        # Create ALiBi bias
+        # Compute distances without absolute value
         seq_len = tf.shape(query)[2]
         position_ids = tf.range(seq_len)[None, :]  # [1, seq_len]
-        # Compute pairwise distances
-        distance = tf.abs(position_ids[:, None, :] - position_ids[:, :, None])  # [1, seq_len, seq_len]
+        distance = position_ids[:, None, :] - position_ids[:, :, None]  # [1, seq_len, seq_len]
+        
+        # Expand dimensions and tile to match heads
         distance = tf.tile(distance, [self.num_heads, 1, 1])  # [num_heads, seq_len, seq_len]
         distance = tf.expand_dims(distance, 0)  # [1, num_heads, seq_len, seq_len]
         
-        alibi = self.alibi_slopes * tf.cast(distance, tf.float32)  # [1, num_heads, seq_len, seq_len]
-        scaled_attention_logits += -alibi  # ALiBi biases are negative to prioritize closer tokens
+        # Compute ALiBi bias
+        alibi = self.alibi_slopes * tf.cast(-distance, tf.float32)  # Multiply by -(j - i)
+        scaled_attention_logits += alibi  # Add the bias
         
         # Softmax to get attention weights
-        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # [batch_size, num_heads, seq_len, seq_len]
+        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
         
         # Apply dropout to attention weights
         attention_weights = self.dropout_layer(attention_weights, training=training)
         
         # Weighted sum of values
-        attention_output = tf.matmul(attention_weights, value)  # [batch_size, num_heads, seq_len, key_dim]
+        attention_output = tf.matmul(attention_weights, value)
         
         # Concatenate heads
-        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # [batch_size, seq_len, num_heads, key_dim]
-        concat_attention = tf.reshape(attention_output, (batch_size, -1, self.num_heads * self.key_dim))  # [batch_size, seq_len, num_heads * key_dim]
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])
+        concat_attention = tf.reshape(attention_output, (batch_size, -1, self.num_heads * self.key_dim))
         
         # Final linear layer
-        output = self.output_dense(concat_attention)  # [batch_size, seq_len, num_heads * key_dim]
+        output = self.output_dense(concat_attention)
         
         return output
+
 
     def get_config(self):
         """
