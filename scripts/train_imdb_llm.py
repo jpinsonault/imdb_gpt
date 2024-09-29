@@ -79,7 +79,6 @@ def character_llm_training():
 
     shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
-    verify_batch_generator(dataset, tokenizer)
     callbacks = get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, checkpoint_path)
 
     # Compile and train model
@@ -439,11 +438,21 @@ def dynamic_self_attention(input_vector, hidden_dim):
 
     return output
 
-
-
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
-    # Self-attention
-    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input)
+    """
+    Transformer Encoder Block with ALiBi Multi-Head Attention.
+
+    Args:
+        input (tf.Tensor): Input tensor.
+        num_heads (int): Number of attention heads.
+        ff_dim (int): Dimensionality of the feed-forward layer.
+        dropout_rate (float): Dropout rate.
+
+    Returns:
+        tf.Tensor: Output tensor after applying the encoder block.
+    """
+    # ALiBi Multi-Head Attention
+    attention_output = AlibiMultiHeadAttention(num_heads=num_heads, key_dim=ff_dim, dropout=dropout_rate)(input, input, input)
     attention_output = layers.Dropout(dropout_rate)(attention_output)
     attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
     
@@ -454,58 +463,209 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
     
     return ff_output
-
 
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
-    # Self-attention
-    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=ff_dim)(input, input, use_causal_mask=True)
+    model_dim = input.shape[-1]
+    key_dim = model_dim // num_heads  # Ensure key_dim divides model_dim evenly
+    
+    attention_output = AlibiMultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        model_dim=model_dim,
+        dropout=dropout_rate
+    )(input, input, input)
+    
     attention_output = layers.Dropout(dropout_rate)(attention_output)
     attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
-    attention_output += input
     
     # Feed-forward network
     ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
-    ff_output = layers.Dense(input.shape[-1], activation='gelu')(ff_output)
+    ff_output = layers.Dense(model_dim, activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
-    ff_output += attention_output
     ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
     
     return ff_output
+
 
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
-#.....................................................................................................................................
+#......................................................................................................................................
 
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
     num_decoder_blocks = 8
-    num_heads = 1
-
+    num_heads = 4  # Adjust as appropriate
+    
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
     
-    reduced_to_half = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
-    reduced_to_quarter = Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
-
-    reduced_to_quarter = LayerNormalization()(reduced_to_quarter)
-
+    reduced_to_half = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
+    reduced_to_quarter = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
+    reduced_to_quarter = layers.LayerNormalization()(reduced_to_quarter)
+    
     x = reduced_to_quarter
-
-    # Decoder blocksa
+    
+    # Decoder blocks using ALiBi
     for _ in range(num_decoder_blocks):
         x = transformer_decoder_block(x, num_heads, ff_dim=character_embedding_dim, dropout_rate=dropout_rate)
-
-    back_to_half = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
-    back_to_full = Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(back_to_half)
-
+    
+    back_to_half = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
+    back_to_full = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(back_to_half)
+    
     # Final output layer
-    outputs = Dense(alphabet_size, activation='softmax')(back_to_full)
-
-    model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_combined_attention_pooling")
+    outputs = layers.Dense(alphabet_size, activation='softmax')(back_to_full)
+    
+    model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_alibi_attention")
     return model
+
+
 
 #......................................................................................................................................
 #-------------------------------------------------------------------------------------------------------------------------------------
 ######################################################################################################################################
+
+import tensorflow as tf
+from tensorflow.keras import layers
+import math
+
+class AlibiMultiHeadAttention(layers.Layer):
+    def __init__(self, num_heads, key_dim, model_dim, dropout=0.0, **kwargs):
+        super(AlibiMultiHeadAttention, self).__init__(**kwargs)
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.model_dim = model_dim
+        self.dropout = dropout
+        self.projection_dim = key_dim
+        self.dropout_layer = layers.Dropout(dropout)
+        
+        # Define the query, key, value dense layers
+        self.query_dense = layers.Dense(self.num_heads * self.key_dim, use_bias=True)
+        self.key_dense = layers.Dense(self.num_heads * self.key_dim, use_bias=True)
+        self.value_dense = layers.Dense(self.num_heads * self.key_dim, use_bias=True)
+        
+        # Define the output dense layer to project back to model_dim
+        self.output_dense = layers.Dense(self.model_dim)
+        
+        # ALiBi slopes
+        self.alibi_slopes = self._get_slopes(self.num_heads)
+
+    
+    def _get_slopes(self, n):
+        """
+        Computes the ALiBi slopes for each attention head.
+
+        Args:
+            n (int): Number of attention heads.
+
+        Returns:
+            tf.Tensor: A tensor of shape (num_heads, 1, 1) containing slopes.
+        """
+        def get_slopes(n):
+            def get_pow2_slopes(n):
+                start = 2 ** (-2 ** -(math.log2(n) - 3))
+                ratio = start
+                return [start * ratio ** i for i in range(n)]
+            
+            if math.log2(n).is_integer():
+                return get_pow2_slopes(n)
+            else:
+                closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                slopes = get_pow2_slopes(closest_power_of_2)
+                extra_slopes = get_pow2_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2]
+                return slopes + extra_slopes
+
+        slopes = get_slopes(n)
+        slopes = tf.constant(slopes, dtype=tf.float32)[:, None, None]  # Shape: [num_heads, 1, 1]
+        return slopes
+    
+    def split_heads(self, x, batch_size):
+        """
+        Splits the last dimension into (num_heads, key_dim).
+
+        Args:
+            x (tf.Tensor): Input tensor of shape [batch_size, seq_len, num_heads * key_dim].
+            batch_size (tf.Tensor): Batch size.
+
+        Returns:
+            tf.Tensor: Reshaped tensor of shape [batch_size, num_heads, seq_len, key_dim].
+        """
+        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.key_dim))
+        return tf.transpose(x, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
+    
+    def call(self, query, value, key, training=False):
+        """
+        Forward pass for the ALiBi Multi-Head Attention layer.
+
+        Args:
+            query (tf.Tensor): Query tensor of shape [batch_size, seq_len, dim].
+            value (tf.Tensor): Value tensor of shape [batch_size, seq_len, dim].
+            key (tf.Tensor): Key tensor of shape [batch_size, seq_len, dim].
+            training (bool): Whether the layer is in training mode.
+
+        Returns:
+            tf.Tensor: Output tensor after applying ALiBi attention.
+        """
+        batch_size = tf.shape(query)[0]
+        
+        # Linear projections
+        query = self.query_dense(query)  # [batch_size, seq_len, num_heads * key_dim]
+        key = self.key_dense(key)        # [batch_size, seq_len, num_heads * key_dim]
+        value = self.value_dense(value)  # [batch_size, seq_len, num_heads * key_dim]
+        
+        # Split into heads
+        query = self.split_heads(query, batch_size)  # [batch_size, num_heads, seq_len, key_dim]
+        key = self.split_heads(key, batch_size)      # [batch_size, num_heads, seq_len, key_dim]
+        value = self.split_heads(value, batch_size)  # [batch_size, num_heads, seq_len, key_dim]
+        
+        # Compute attention scores
+        matmul_qk = tf.matmul(query, key, transpose_b=True)  # [batch_size, num_heads, seq_len, seq_len]
+        
+        dk = tf.cast(self.key_dim, tf.float32)
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)  # Scaling
+        
+        # Create ALiBi bias
+        seq_len = tf.shape(query)[2]
+        position_ids = tf.range(seq_len)[None, :]  # [1, seq_len]
+        # Compute pairwise distances
+        distance = tf.abs(position_ids[:, None, :] - position_ids[:, :, None])  # [1, seq_len, seq_len]
+        distance = tf.tile(distance, [self.num_heads, 1, 1])  # [num_heads, seq_len, seq_len]
+        distance = tf.expand_dims(distance, 0)  # [1, num_heads, seq_len, seq_len]
+        
+        alibi = self.alibi_slopes * tf.cast(distance, tf.float32)  # [1, num_heads, seq_len, seq_len]
+        scaled_attention_logits += -alibi  # ALiBi biases are negative to prioritize closer tokens
+        
+        # Softmax to get attention weights
+        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)  # [batch_size, num_heads, seq_len, seq_len]
+        
+        # Apply dropout to attention weights
+        attention_weights = self.dropout_layer(attention_weights, training=training)
+        
+        # Weighted sum of values
+        attention_output = tf.matmul(attention_weights, value)  # [batch_size, num_heads, seq_len, key_dim]
+        
+        # Concatenate heads
+        attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])  # [batch_size, seq_len, num_heads, key_dim]
+        concat_attention = tf.reshape(attention_output, (batch_size, -1, self.num_heads * self.key_dim))  # [batch_size, seq_len, num_heads * key_dim]
+        
+        # Final linear layer
+        output = self.output_dense(concat_attention)  # [batch_size, seq_len, num_heads * key_dim]
+        
+        return output
+
+    def get_config(self):
+        """
+        Returns the configuration of the layer for serialization.
+
+        Returns:
+            dict: Configuration dictionary.
+        """
+        config = super(AlibiMultiHeadAttention, self).get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "dropout": self.dropout,
+        })
+        return config
+
 
 
 class ReconstructCallback(Callback):
