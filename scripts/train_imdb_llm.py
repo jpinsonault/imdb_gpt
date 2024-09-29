@@ -49,6 +49,7 @@ SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
 
+logging.basicConfig(level=logging.DEBUG)
 
 def main(args):
     character_llm_training()
@@ -260,7 +261,6 @@ class Tokenizer:
     
 
 
-logging.basicConfig(level=logging.ERROR)
 
 
 query_type_to_query_fieldname = {
