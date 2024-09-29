@@ -41,6 +41,7 @@ import random
 from typing import Set, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from track_changes import commit_changes_to_git, suggest_folder_name
+from copy import deepcopy
 
 tf_version = tf.__version__
 
@@ -48,44 +49,74 @@ SPECIAL_PAD = '\u200C'
 SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
+import itertools
 
 logging.basicConfig(level=logging.DEBUG)
 
-def main(args):
-    character_llm_training()
+def main():
+    configs = generate_param_combinations(project_config)
+    for idx, config in enumerate(configs):
+        print(f"\nRunning configuration {idx + 1}/{len(configs)}:")
+        name_prefix = f"{config['llm']['input_length']}_{config['llm']['num_heads']}"
+
+        character_llm_training(config, name_prefix)
 
 
-def character_llm_training():
+def generate_param_combinations(config):
+    sweep_params = {}
+    fixed_params = {}
+
+    for key, value in config['llm'].items():
+        if isinstance(value, list):
+            sweep_params[key] = value
+        else:
+            fixed_params[key] = value
+
+    keys, values = zip(*sweep_params.items()) if sweep_params else ([], [])
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)] if keys else [{}]
+
+    configs = []
+    for combo in combinations:
+        new_config = deepcopy(config)
+        new_config['llm'].update(fixed_params)
+        new_config['llm'].update(combo)
+        configs.append(new_config)
+
+    return configs
+
+def character_llm_training(config, name_prefix):
     # Initialize paths and configuration
-    data_dir = Path(project_config['data_dir'])
-    input_length = project_config['llm']['input_length']
-    batch_size = project_config['llm']['batch_size']
-    character_embedding_dim = project_config['llm']['character_embedding_dim']
-    num_epochs = project_config['llm']['epochs']
-    jsonl_files = [data_dir / jsonl_file for jsonl_file in project_config['dataset']['jsonl_files']]
+    data_dir = Path(config['data_dir'])
+    input_length = config['llm']['input_length']
+    batch_size = config['llm']['batch_size']
+    character_embedding_dim = config['llm']['character_embedding_dim']
+    num_epochs = config['llm']['epochs']
+    num_heads = config['llm']['num_heads']
+    jsonl_files = [data_dir / jsonl_file for jsonl_file in config['dataset']['jsonl_files']]
 
-    print_project_config(project_config)
+    print_project_config(config)
 
     tokenizer = Tokenizer.from_files(jsonl_files, input_length)
     total_samples = calculate_steps_per_epoch(jsonl_files, tokenizer)
     steps_per_epoch = total_samples // batch_size
 
-    # Define the checkpoint path
-    checkpoint_path = data_dir / "checkpoints" / "kermit_language_model.keras"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # Define the checkpoint path (modify to include parameters if needed)
+    checkpoint_dir = data_dir / "checkpoints" / f"input{input_length}_embed{character_embedding_dim}_batch{batch_size}_epochs{num_epochs}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / "kermit_language_model.keras"
 
     # Load or create the model
-    model = load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim)
+    model = load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim, num_heads)
 
     shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
-    callbacks = get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, checkpoint_path)
+    callbacks = get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, checkpoint_path)
 
     # Compile and train model
     compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks)
 
 
-def load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim):
+def load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim, num_heads):
     """
     Attempt to load the model from the checkpoint. If it fails, create a new model.
     Logs the process and any errors encountered during model loading.
@@ -106,12 +137,12 @@ def load_or_create_model(checkpoint_path, tokenizer, input_length, character_emb
     except Exception as e:
         logging.error(f"Failed to load model from {checkpoint_path}. Error: {e}")
         logging.info("Creating a new model.")
-        model = create_new_model(tokenizer, input_length, character_embedding_dim)
+        model = create_new_model(tokenizer, input_length, character_embedding_dim, num_heads)
 
     return model
 
 
-def create_new_model(tokenizer, input_length, character_embedding_dim):
+def create_new_model(tokenizer, input_length, character_embedding_dim, num_heads):
     """
     Creates a new model instance and logs the creation process.
     """
@@ -119,12 +150,13 @@ def create_new_model(tokenizer, input_length, character_embedding_dim):
     model = kermit_language_model(
         input_length=input_length,
         alphabet_size=tokenizer.alphabet_size,
-        character_embedding_dim=character_embedding_dim
+        character_embedding_dim=character_embedding_dim,
+        num_heads=num_heads,
     )
     logging.info("New model created.")
     return model
 
-def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_filepath):
+def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_filepath):
     reconstruct_callback = ReconstructCallback(
         tokenizer=tokenizer,
         shared_buffer=shared_buffer,
@@ -133,7 +165,7 @@ def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_fil
         frequency=100,
     )
 
-    logs_dir = create_logs_dir()
+    logs_dir = create_logs_dir(name_prefix=name_prefix)
     tensorboard_callback = TensorBoardBatchLogger(log_dir=str(logs_dir), update_freq=5)
     commit_changes_to_git_callback = CommitChangesToGitCallback(logs_dir)
 
@@ -219,9 +251,9 @@ class WeightedLossWithPadding(tf.keras.losses.Loss):
         return cls(**config)
 
 
-def create_logs_dir():
+def create_logs_dir(name_prefix):
     now_int = int(datetime.now().timestamp())
-    folder_suggestion = f"{now_int}_{suggest_folder_name()}"
+    folder_suggestion = f"{now_int}_{name_prefix}_{suggest_folder_name()}"
     logs_dir = Path("logs") / folder_suggestion
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir
@@ -492,9 +524,8 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 #-------------------------------------------------------------------------------------------------------------------------------------
 #......................................................................................................................................
 
-def kermit_language_model(input_length, alphabet_size, character_embedding_dim, dropout_rate=0.001):
+def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_heads, dropout_rate=0.001):
     num_decoder_blocks = 8
-    num_heads = 4  # Adjust as appropriate
     
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
@@ -895,4 +926,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main(args)
+    main()
