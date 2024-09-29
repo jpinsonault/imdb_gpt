@@ -458,26 +458,30 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     
     return ff_output
 
+
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     model_dim = input.shape[-1]
-    key_dim = model_dim //4 // num_heads  # Ensure key_dim divides model_dim evenly
-    
+    key_dim = model_dim // 4 // num_heads  # Ensure key_dim divides model_dim evenly
+
+    # Pre-Layer Normalization before Multi-Head Attention
+    norm_input = layers.LayerNormalization(epsilon=1e-6)(input)
     attention_output = AlibiMultiHeadAttention(
         num_heads=num_heads,
         key_dim=key_dim,
         model_dim=model_dim,
         dropout=dropout_rate
-    )(input, input, input)
-    
+    )(norm_input, norm_input, norm_input)
+
     attention_output = layers.Dropout(dropout_rate)(attention_output)
-    attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output + input)
-    
-    # Feed-forward network
-    ff_output = layers.Dense(ff_dim, activation='gelu')(attention_output)
+    attention_output = layers.Add()([attention_output, input])  # Residual connection
+
+    # Pre-Layer Normalization before Feed-Forward Network
+    norm_attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output)
+    ff_output = layers.Dense(ff_dim, activation='gelu')(norm_attention_output)
     ff_output = layers.Dense(model_dim, activation='gelu')(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
-    ff_output = layers.LayerNormalization(epsilon=1e-6)(ff_output + attention_output)
-    
+    ff_output = layers.Add()([ff_output, attention_output])  # Residual connection
+
     return ff_output
 
 
