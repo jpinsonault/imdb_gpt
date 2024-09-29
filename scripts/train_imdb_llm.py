@@ -79,6 +79,8 @@ def character_llm_training():
         # Provide custom objects for any custom layers or functions
         custom_objects = {
             # Include any other custom layers or functions
+            'WeightedLossWithPadding': WeightedLossWithPadding,
+
             'transformer_decoder_block': transformer_decoder_block,
             # Add any activation functions if custom
         }
@@ -116,9 +118,9 @@ def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_fil
 
     # Define the checkpoint callback
     checkpoint_callback = ModelCheckpoint(
-        filepath=model_filepath,
+        filepath=str(model_filepath),
         save_weights_only=False,
-        save_freq='epoch'
+        save_freq=100,
     )
 
     return [
@@ -126,7 +128,7 @@ def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_fil
         tensorboard_callback,
         reconstruct_callback,
         keras.callbacks.TensorBoard('./logs', update_freq=5),
-        checkpoint_callback  # Add the checkpoint callback here
+        checkpoint_callback
     ]
 
 
@@ -138,10 +140,16 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
         alpha=0.0
     )
 
+    # Get the padding token index from the tokenizer
+    pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
+
+    # Instantiate the custom loss function
+    loss_fn = WeightedLossWithPadding(pad_token_index=pad_token_index, pad_weight=0.1)
+
     print("\n> Compiling model\n")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
-        loss=partial(weighted_loss_with_padding, tokenizer=tokenizer),
+        loss=loss_fn,
         metrics=['accuracy'],
     )
 
@@ -156,39 +164,25 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
     )
 
 
-def weighted_loss_with_padding(y_true, y_pred, tokenizer):
-    """
-    Custom loss function that downweights the padding characters.
+class WeightedLossWithPadding(tf.keras.losses.Loss):
+    def __init__(self, pad_token_index, pad_weight=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.pad_token_index = pad_token_index
+        self.pad_weight = pad_weight
 
-    Parameters:
-    - y_true: True labels (target sequences).
-    - y_pred: Predicted probabilities from the model.
-    - tokenizer: Tokenizer object containing the padding token index.
-    - pad_weight: The weight to apply to the padding tokens. Should be a small number (e.g., 0.1).
+    def call(self, y_true, y_pred):
+        # Compute the standard sparse categorical cross-entropy loss
+        loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
 
-    Returns:
-    - A loss value where padding tokens contribute less to the overall loss.
-    """
-    pad_weight = 0.1
-    # Get the index of the padding token
-    pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
+        # Create a mask for padding tokens
+        mask = tf.cast(tf.not_equal(y_true, self.pad_token_index), tf.float32)
+        
+        # Apply the weights to the loss
+        weights = mask + self.pad_weight * (1 - mask)
+        weighted_loss = loss * weights
 
-    # Compute sparse categorical cross-entropy loss
-    loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
-
-    # Create a mask that downweights the padding tokens
-    # If y_true == pad_token_index, then we apply the pad_weight
-    mask = tf.cast(tf.not_equal(y_true, pad_token_index), tf.float32)
-    
-    # Apply the mask: downweight padding tokens
-    weights = mask + pad_weight * (1 - mask)
-    
-    # Apply the weights to the loss
-    weighted_loss = loss * weights
-    
-    # Return the mean loss over the batch
-    return tf.reduce_mean(weighted_loss)
-
+        # Return the mean loss over the batch
+        return tf.reduce_mean(weighted_loss)
 
 def create_logs_dir():
     now_int = int(datetime.now().timestamp())
