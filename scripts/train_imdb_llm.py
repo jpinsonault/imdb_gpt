@@ -535,7 +535,6 @@ class AlibiMultiHeadAttention(layers.Layer):
         self.key_dim = key_dim
         self.model_dim = model_dim
         self.dropout = dropout
-        self.projection_dim = key_dim
         self.dropout_layer = layers.Dropout(dropout)
         
         # Define the query, key, value dense layers
@@ -548,112 +547,96 @@ class AlibiMultiHeadAttention(layers.Layer):
         
         # ALiBi slopes
         self.alibi_slopes = self._get_slopes(self.num_heads)
-
     
     def _get_slopes(self, n):
-        """
-        Computes the ALiBi slopes for each attention head.
-
-        Args:
-            n (int): Number of attention heads.
-
-        Returns:
-            tf.Tensor: A tensor of shape (num_heads, 1, 1) containing slopes.
-        """
-        def get_slopes(n):
-            def get_pow2_slopes(n):
-                start = 2 ** (-2 ** -(math.log2(n) - 3))
-                ratio = start
-                return [start * ratio ** i for i in range(n)]
-            
-            if math.log2(n).is_integer():
-                return get_pow2_slopes(n)
-            else:
-                closest_power_of_2 = 2 ** math.floor(math.log2(n))
-                slopes = get_pow2_slopes(closest_power_of_2)
-                extra_slopes = get_pow2_slopes(2 * closest_power_of_2)[0::2][:n - closest_power_of_2]
-                return slopes + extra_slopes
-
-        slopes = get_slopes(n)
-        slopes = tf.constant(slopes, dtype=tf.float32)[:, None, None]  # Shape: [num_heads, 1, 1]
-        return slopes
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-2 ** -(math.log2(n) - 3))
+            ratio = start
+            return [start * ratio ** i for i in range(n)]
+        if math.log2(n).is_integer():
+            return tf.constant(get_slopes_power_of_2(n), dtype=tf.float32)
+        else:
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return tf.constant(
+                get_slopes_power_of_2(closest_power_of_2) +
+                get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:n - closest_power_of_2],
+                dtype=tf.float32
+            )
     
     def split_heads(self, x, batch_size):
-        """
-        Splits the last dimension into (num_heads, key_dim).
-
-        Args:
-            x (tf.Tensor): Input tensor of shape [batch_size, seq_len, num_heads * key_dim].
-            batch_size (tf.Tensor): Batch size.
-
-        Returns:
-            tf.Tensor: Reshaped tensor of shape [batch_size, num_heads, seq_len, key_dim].
-        """
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.key_dim))
-        return tf.transpose(x, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
+        return tf.transpose(x, perm=[0, 2, 1, 3])
     
-
     def call(self, query, value, key, training=False):
         batch_size = tf.shape(query)[0]
-        
+        seq_len = tf.shape(query)[1]
+
         # Linear projections
         query = self.query_dense(query)
         key = self.key_dense(key)
         value = self.value_dense(value)
-        
+
         # Split into heads
         query = self.split_heads(query, batch_size)
         key = self.split_heads(key, batch_size)
         value = self.split_heads(value, batch_size)
-        
+
         # Compute attention scores
         matmul_qk = tf.matmul(query, key, transpose_b=True)
         dk = tf.cast(self.key_dim, tf.float32)
         scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-        
-        # Compute distances without absolute value
-        seq_len = tf.shape(query)[2]
-        position_ids = tf.range(seq_len)[None, :]  # [1, seq_len]
-        distance = position_ids[:, None, :] - position_ids[:, :, None]  # [1, seq_len, seq_len]
-        
-        # Expand dimensions and tile to match heads
-        distance = tf.tile(distance, [self.num_heads, 1, 1])  # [num_heads, seq_len, seq_len]
-        distance = tf.expand_dims(distance, 0)  # [1, num_heads, seq_len, seq_len]
-        
-        # Compute ALiBi bias
-        alibi = self.alibi_slopes * tf.cast(-distance, tf.float32)  # Multiply by -(j - i)
-        scaled_attention_logits += alibi  # Add the bias
-        
+
+        # Create causal mask
+        i = tf.range(seq_len)[:, None]
+        j = tf.range(seq_len)[None, :]
+        causal_mask = tf.where(i >= j, 0.0, -1e9)
+        causal_mask = tf.expand_dims(causal_mask, axis=0)  # [1, seq_len, seq_len]
+        causal_mask = tf.expand_dims(causal_mask, axis=0)  # [1, 1, seq_len, seq_len]
+        causal_mask = tf.tile(causal_mask, [batch_size, self.num_heads, 1, 1])
+
+        # Compute relative positions
+        relative_positions = i - j  # Shape: [seq_len, seq_len]
+        relative_positions = tf.expand_dims(relative_positions, axis=0)  # [1, seq_len, seq_len]
+
+        # Reshape alibi slopes
+        alibi_slopes = tf.reshape(self.alibi_slopes, [self.num_heads, 1, 1])  # [num_heads, 1, 1]
+
+        # Compute ALiBi biases
+        alibi_bias = alibi_slopes * tf.cast(relative_positions, tf.float32)  # [num_heads, seq_len, seq_len]
+        alibi_bias = tf.expand_dims(alibi_bias, axis=0)  # [1, num_heads, seq_len, seq_len]
+        alibi_bias = tf.tile(alibi_bias, [batch_size, 1, 1, 1])  # [batch_size, num_heads, seq_len, seq_len]
+
+        # Combine causal mask and ALiBi biases
+        attention_mask = causal_mask + alibi_bias
+
+        # Add the attention mask to the scaled attention logits
+        scaled_attention_logits += attention_mask
+
         # Softmax to get attention weights
         attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
-        
+
         # Apply dropout to attention weights
         attention_weights = self.dropout_layer(attention_weights, training=training)
-        
-        # Weighted sum of values
+
+        # Compute the attention output
         attention_output = tf.matmul(attention_weights, value)
-        
+
         # Concatenate heads
         attention_output = tf.transpose(attention_output, perm=[0, 2, 1, 3])
         concat_attention = tf.reshape(attention_output, (batch_size, -1, self.num_heads * self.key_dim))
-        
+
         # Final linear layer
         output = self.output_dense(concat_attention)
-        
+
         return output
 
 
     def get_config(self):
-        """
-        Returns the configuration of the layer for serialization.
-
-        Returns:
-            dict: Configuration dictionary.
-        """
         config = super(AlibiMultiHeadAttention, self).get_config()
         config.update({
             "num_heads": self.num_heads,
             "key_dim": self.key_dim,
+            "model_dim": self.model_dim,
             "dropout": self.dropout,
         })
         return config
