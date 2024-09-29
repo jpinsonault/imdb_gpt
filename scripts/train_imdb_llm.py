@@ -432,45 +432,6 @@ def sinusoidal_encoding(input_length, embedding_dim):
     return pos_encoding
 
 
-def dynamic_1x1_convolution(input_tokens, context_token, output_dim):
-    input_dim = input_tokens.shape[-1]
-
-    conv_weights = Dense(input_dim * output_dim, activation=None, name=n("dense_conv_weights"))(context_token)
-    conv_weights = Reshape((input_dim, output_dim), name=n("reshape_conv_weights"))(conv_weights)
-
-    def dynamic_einsum(x):
-        input_tokens, conv_weights = x
-        return tf.einsum('bij,bjk->bik', input_tokens, conv_weights)
-    
-    return Lambda(dynamic_einsum, name=n("lambda_einsum"), output_shape=(input_tokens.shape[1], output_dim))([input_tokens, conv_weights])
-
-
-class CustomDense(Layer):
-    def call(self, args):
-        inputs = args[0]
-        weight_matrix = args[1]
-        return tf.matmul(inputs, weight_matrix)
-
-
-def dynamic_self_attention(input_vector, hidden_dim):
-    vector_dim = input_vector.shape[-1]
-    
-    def generate_weights(input_vec):
-        weights = Dense(vector_dim * vector_dim, activation=None, name=n("dense_weights"))(input_vec)
-        return weights
-    
-    squeezed_input = Dense(hidden_dim, activation=None, name=n("dense_squeezed_input"))(input_vector)
-
-    weight_matrix = generate_weights(squeezed_input)
-
-    weight_matrix = Reshape((vector_dim, vector_dim))(weight_matrix)
-
-    reshaped_input = Reshape((1, vector_dim))(input_vector)
-    output = Lambda(lambda x: tf.matmul(x[0], x[1]), name=n("lambda_matmul_attention"))([reshaped_input, weight_matrix])
-    output = Reshape((vector_dim,), name=n("self_attention_output"))(output)
-
-    return output
-
 def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     """
     Transformer Encoder Block with ALiBi Multi-Head Attention.
