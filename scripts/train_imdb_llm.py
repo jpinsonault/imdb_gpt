@@ -106,7 +106,7 @@ def character_llm_training(config, name_prefix):
     checkpoint_path = checkpoint_dir / "kermit_language_model.keras"
 
     # Load or create the model
-    model = load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim, num_heads)
+    model = create_new_model(tokenizer, input_length, character_embedding_dim, num_heads)
 
     shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
