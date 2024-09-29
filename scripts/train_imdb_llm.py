@@ -50,9 +50,9 @@ SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
 
 
-
 def main(args):
     character_llm_training()
+
 
 def character_llm_training():
     # Initialize paths and configuration
@@ -73,26 +73,8 @@ def character_llm_training():
     checkpoint_path = data_dir / "checkpoints" / "kermit_language_model.keras"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check if the checkpoint exists
-    if os.path.exists(checkpoint_path):
-        print(f"Loading model from {checkpoint_path}")
-        # Provide custom objects for any custom layers or functions
-        custom_objects = {
-            # Include any other custom layers or functions
-            'WeightedLossWithPadding': WeightedLossWithPadding,
-
-            'transformer_decoder_block': transformer_decoder_block,
-            # Add any activation functions if custom
-        }
-        # Load the model
-        model = load_model(checkpoint_path, custom_objects=custom_objects)
-    else:
-        print("No saved model found. Building a new model.")
-        model = kermit_language_model(
-            input_length=input_length,
-            alphabet_size=tokenizer.alphabet_size,
-            character_embedding_dim=character_embedding_dim
-        )
+    # Load or create the model
+    model = load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim)
 
     shared_buffer = deque(maxlen=1000)  # Adjust the size based on memory constraints
     dataset = autoencoder_batch_generator(jsonl_files, batch_size, tokenizer, shared_buffer)
@@ -102,6 +84,44 @@ def character_llm_training():
     # Compile and train model
     compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks)
 
+
+def load_or_create_model(checkpoint_path, tokenizer, input_length, character_embedding_dim):
+    """
+    Attempt to load the model from the checkpoint. If it fails, create a new model.
+    Logs the process and any errors encountered during model loading.
+    """
+    logging.info(f"Trying to load the model from {checkpoint_path}")
+    custom_objects = {
+        'WeightedLossWithPadding': WeightedLossWithPadding,
+    }
+
+    try:
+        if os.path.exists(checkpoint_path):
+            logging.info(f"Checkpoint found at {checkpoint_path}. Loading the model.")
+            model = load_model(checkpoint_path, custom_objects=custom_objects)
+            logging.info("Model loaded successfully.")
+        else:
+            raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+    except Exception as e:
+        logging.error(f"Failed to load model from {checkpoint_path}. Error: {e}")
+        logging.info("Creating a new model.")
+        model = create_new_model(tokenizer, input_length, character_embedding_dim)
+
+    return model
+
+
+def create_new_model(tokenizer, input_length, character_embedding_dim):
+    """
+    Creates a new model instance and logs the creation process.
+    """
+    logging.info("Building a new model.")
+    model = kermit_language_model(
+        input_length=input_length,
+        alphabet_size=tokenizer.alphabet_size,
+        character_embedding_dim=character_embedding_dim
+    )
+    logging.info("New model created.")
+    return model
 
 def get_callbacks(tokenizer, jsonl_files, input_length, shared_buffer, model_filepath):
     reconstruct_callback = ReconstructCallback(
@@ -163,7 +183,6 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
         callbacks=callbacks
     )
 
-
 class WeightedLossWithPadding(tf.keras.losses.Loss):
     def __init__(self, pad_token_index, pad_weight=0.1, **kwargs):
         super().__init__(**kwargs)
@@ -176,13 +195,28 @@ class WeightedLossWithPadding(tf.keras.losses.Loss):
 
         # Create a mask for padding tokens
         mask = tf.cast(tf.not_equal(y_true, self.pad_token_index), tf.float32)
-        
+
         # Apply the weights to the loss
         weights = mask + self.pad_weight * (1 - mask)
         weighted_loss = loss * weights
 
         # Return the mean loss over the batch
         return tf.reduce_mean(weighted_loss)
+
+    def get_config(self):
+        # Return a configuration dictionary that can be used for serialization
+        config = super().get_config()
+        config.update({
+            'pad_token_index': self.pad_token_index,
+            'pad_weight': self.pad_weight,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        # Create an instance from the config
+        return cls(**config)
+
 
 def create_logs_dir():
     now_int = int(datetime.now().timestamp())

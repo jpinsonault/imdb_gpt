@@ -55,8 +55,7 @@ def generate_commit_message(diff, recent_commits, file_contents, folder_name) ->
     prompt = f"""
     Background: {background}
 
-    Describe the following changes in a commit message. Become grandeloquent, poetic, and verbose. The commit message should be a narrative
-    as if I am on a great scifi adventure, and doing this through it all in order to try to achieve AGI.
+    Describe the following changes in a commit message. Talk like a cracked 100x engineer at the top of your game hopped up on legal productivity drugs.
 
     message format: <timestamp from log folder name><short description as title><long description>
 
