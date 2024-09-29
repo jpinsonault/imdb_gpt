@@ -460,7 +460,7 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
     model_dim = input.shape[-1]
-    key_dim = model_dim // num_heads  # Ensure key_dim divides model_dim evenly
+    key_dim = model_dim //4 // num_heads  # Ensure key_dim divides model_dim evenly
     
     attention_output = AlibiMultiHeadAttention(
         num_heads=num_heads,

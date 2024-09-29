@@ -22,6 +22,6 @@ project_config = {
         'epochs': 1,
         'batches': 3000,
         'batch_size': 512,
-        'num_heads': [8, 12, 16],
+        'num_heads': 8,
     },
 }
