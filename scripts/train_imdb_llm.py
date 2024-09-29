@@ -493,7 +493,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     num_decoder_blocks = 8
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
-    embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim)(inputs)
+    embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim//4)(inputs)
 
     reduced_to_half = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
     reduced_to_quarter = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
@@ -506,7 +506,7 @@ def kermit_language_model(input_length, alphabet_size, character_embedding_dim, 
     back_to_half = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
     back_to_half = layers.Add()([back_to_half, reduced_to_half])
 
-    back_to_full = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(back_to_half)
+    back_to_full = layers.Conv1DTranspose(character_embedding_dim//4, 3, strides=2, padding='same', activation='gelu')(back_to_half)
     back_to_full = layers.Add()([back_to_full, embedding])
 
     # Final output layer
