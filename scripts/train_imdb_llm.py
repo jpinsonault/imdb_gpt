@@ -93,6 +93,7 @@ def load_or_create_model(checkpoint_path, tokenizer, input_length, character_emb
     logging.info(f"Trying to load the model from {checkpoint_path}")
     custom_objects = {
         'WeightedLossWithPadding': WeightedLossWithPadding,
+        'AlibiMultiHeadAttention': AlibiMultiHeadAttention,
     }
 
     try:
@@ -591,7 +592,7 @@ class AlibiMultiHeadAttention(layers.Layer):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.key_dim))
         return tf.transpose(x, perm=[0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
     
-    
+
     def call(self, query, value, key, training=False):
         batch_size = tf.shape(query)[0]
         
