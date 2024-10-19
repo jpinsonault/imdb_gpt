@@ -311,8 +311,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     """
     Batch generator that generates input-target pairs for language modeling.
     For each data point, generates two sequences:
-    - Mapping from 'const' to 'name' or 'title'
-    - Mapping from 'name' or 'title' to 'const'
+    - Mapping from 'n/tconst' to 'name' or 'title'
+    - Mapping from 'name' or 'title' to 'n/tconst'
     For each position in the full sequence, generates an input sequence consisting
     of the tokens up to that position, left-padded to max_input_length.
     The target sequence is the input sequence shifted one token to the right.
@@ -693,7 +693,8 @@ class ReconstructCallback(Callback):
 
         query_fieldname = query_type_to_query_fieldname[query_type]
         name_or_title = data_point.get(query_fieldname, '').strip()
-        const = data_point.get('const', '').strip()
+        const_field = query_type_to_const_fieldname[query_type]
+        const = data_point.get(const_field).strip()
 
         if not name_or_title or not const:
             return  # Skip invalid samples
