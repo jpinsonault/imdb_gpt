@@ -317,20 +317,23 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     of the tokens up to that position, left-padded to max_input_length.
     The target sequence is the input sequence shifted one token to the right.
     """
+    logging.info("Loading JSONL data files into memory")
+    
     # Load all JSONL data into memory
     all_data = []
     dataset_sizes = []
 
-    # Load data from each JSONL file and store in memory
     for jsonl_path in jsonl_files:
         with open(jsonl_path, 'r', encoding='utf-8') as jsonl_file:
             data = [json.loads(line) for line in jsonl_file]
             all_data.append(data)
             dataset_sizes.append(len(data))
+        logging.info(f"Loaded {len(data)} entries from {jsonl_path}")
 
     # Calculate sampling probabilities based on dataset sizes
     total_size = sum(dataset_sizes)
     sampling_probs = [size / total_size for size in dataset_sizes]
+    logging.info(f"Total size across all datasets: {total_size}")
 
     # Initialize variables
     data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
@@ -338,12 +341,16 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
     batch_index = 0
 
+    logging.info("Starting batch generation loop")
+    
     while True:
         # Randomly choose a dataset based on sampling probabilities
         dataset_choice = random.choices(range(len(jsonl_files)), weights=sampling_probs, k=1)[0]
+        logging.debug(f"Chosen dataset index: {dataset_choice}")
 
         # Check if we've exhausted the chosen dataset
         if data_indices[dataset_choice] >= dataset_sizes[dataset_choice]:
+            logging.info(f"Resetting dataset index for dataset {dataset_choice}")
             data_indices[dataset_choice] = 0  # Reset index if exhausted
 
         # Fetch data point from chosen dataset
@@ -352,6 +359,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
         data_indices[dataset_choice] += 1
 
         query_type = data_point.get('type')
+        logging.debug(f"Processing data point with query type: {query_type}")
 
         if query_type not in ['movie', 'tvSeries', 'person', 'character']:
             logging.debug(f"Skipping data point due to unknown query type: {query_type}")
@@ -363,7 +371,11 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
         const = data_point.get(const_field).strip()
 
         if not name_or_title or not const:
+            logging.debug("Skipping data point due to missing name or const")
             continue  # Skip invalid data points
+
+        # Log the selected data point information
+        logging.info(f"Generating sequences for data point: {const} <-> {name_or_title}")
 
         # Create two sequences:
         # Sequence 1: const -> name_or_title
@@ -378,6 +390,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
             max_len = tokenizer.max_input_length
 
             if sequence_length < 2:
+                logging.debug(f"Skipping sequence due to short length: {input_string}")
                 continue  # Skip sequences that are too short
 
             for i in range(sequence_length - 1):
@@ -407,6 +420,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                 batch_index += 1
 
                 if batch_index == batch_size:
+                    logging.info(f"Yielding batch of size {batch_size}")
                     yield x_batch, y_batch
                     batch_index = 0
                     x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
@@ -414,7 +428,7 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
 
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
-            # Reset all indices and continue
+            logging.info("All datasets exhausted, resetting indices")
             data_indices = [0] * len(jsonl_files)
 
 
@@ -664,7 +678,7 @@ class ReconstructCallback(Callback):
 
     def on_batch_end(self, batch, logs=None):
         if batch % self.frequency == 0 and len(self.shared_buffer) > 0:
-            print(f"\nbatch {batch + 1} - Reconstruction samples:")
+            print(f"\nBatch {batch + 1} - Reconstruction samples:")
             for _ in range(self.num_samples):
                 self.generate_sample()
 
@@ -679,8 +693,7 @@ class ReconstructCallback(Callback):
 
         query_fieldname = query_type_to_query_fieldname[query_type]
         name_or_title = data_point.get(query_fieldname, '').strip()
-        const_field = query_type_to_const_fieldname[query_type]
-        const = data_point.get(const_field).strip()
+        const = data_point.get('const', '').strip()
 
         if not name_or_title or not const:
             return  # Skip invalid samples
@@ -710,6 +723,32 @@ class ReconstructCallback(Callback):
         print(generated_text)
 
         print("-" * 50)
+
+    def generate_continuation(self, input_indices):
+        generated_indices = []
+        current_input = input_indices.copy()
+
+        for _ in range(self.max_input_length):
+            # Get model prediction
+            prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
+            next_char_logits = prediction[0, -1, :]
+            next_char_index = tf.argmax(next_char_logits).numpy()
+            next_char = self.tokenizer.index_to_char.get(next_char_index, '')
+
+            # Add the predicted index to generated indices
+            generated_indices.append(next_char_index)
+
+            # Check for end token
+            if next_char == SPECIAL_END:
+                break
+
+            # Update current input by appending the next predicted character
+            current_input = np.concatenate([current_input, [next_char_index]])[-self.max_input_length:]
+
+        # Convert the generated indices to a string
+        generated_text = self.tokenizer.untokenize(generated_indices)
+        return generated_text
+
 
 
 
