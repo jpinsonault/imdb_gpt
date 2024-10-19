@@ -299,12 +299,20 @@ query_type_to_query_fieldname = {
     'movie': 'title',
     'tvSeries': 'title',
     'person': 'name',
-    'character': 'name',
+}
+
+query_type_to_const_fieldname = {
+    'movie': 'tconst',
+    'tvSeries': 'tconst',
+    'person': 'nconst',
 }
 
 def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, shared_buffer: deque):
     """
     Batch generator that generates input-target pairs for language modeling.
+    For each data point, generates two sequences:
+    - Mapping from 'const' to 'name' or 'title'
+    - Mapping from 'name' or 'title' to 'const'
     For each position in the full sequence, generates an input sequence consisting
     of the tokens up to that position, left-padded to max_input_length.
     The target sequence is the input sequence shifted one token to the right.
@@ -350,58 +358,65 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
             continue
 
         query_fieldname = query_type_to_query_fieldname[query_type]
-        query = data_point.get(query_fieldname, '').strip()
+        name_or_title = data_point.get(query_fieldname, '').strip()
+        const_field = query_type_to_const_fieldname[query_type]
+        const = data_point.get(const_field).strip()
 
-        result = json.dumps(data_point)
+        if not name_or_title or not const:
+            continue  # Skip invalid data points
 
-        # Build input and target sequences
-        input_string = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
+        # Create two sequences:
+        # Sequence 1: const -> name_or_title
+        input_string1 = f"{SPECIAL_START}{const}{SPECIAL_SEP}{name_or_title}{SPECIAL_END}"
+        # Sequence 2: name_or_title -> const
+        input_string2 = f"{SPECIAL_START}{name_or_title}{SPECIAL_SEP}{const}{SPECIAL_END}"
 
-        # Build full sequence
-        full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
+        for input_string in [input_string1, input_string2]:
+            # Build full sequence
+            full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
+            sequence_length = len(full_sequence)
+            max_len = tokenizer.max_input_length
 
-        sequence_length = len(full_sequence)
-        max_len = tokenizer.max_input_length
+            if sequence_length < 2:
+                continue  # Skip sequences that are too short
 
-        if sequence_length < 2:
-            continue  # Skip sequences that are too short
+            for i in range(sequence_length - 1):
+                # Input sequence is from the start to position i (inclusive)
+                input_indices = full_sequence[:i+1]
+                # Target sequence is from the start to position i+2 (inclusive)
+                target_indices = full_sequence[:i+2]
 
-        for i in range(sequence_length - 1):
-            # Input sequence is from the start to position i (inclusive)
-            input_indices = full_sequence[:i+1]
-            # Target sequence is from the start to position i+1 (inclusive)
-            target_indices = full_sequence[:i+2]
+                # Pad input_indices on the left to length max_len
+                if len(input_indices) < max_len:
+                    pad_length = max_len - len(input_indices)
+                    input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
+                else:
+                    input_indices = input_indices[-max_len:]
 
-            # Pad input_indices on the left to length max_len
-            if len(input_indices) < max_len:
-                pad_length = max_len - len(input_indices)
-                input_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + input_indices
-            else:
-                input_indices = input_indices[-max_len:]
+                # Pad target_indices on the left to length max_len
+                if len(target_indices) < max_len:
+                    pad_length = max_len - len(target_indices)
+                    target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
+                else:
+                    target_indices = target_indices[-max_len:]
 
-            # Pad target_indices on the left to length max_len
-            if len(target_indices) < max_len:
-                pad_length = max_len - len(target_indices)
-                target_indices = [tokenizer.char_to_index[SPECIAL_PAD]] * pad_length + target_indices
-            else:
-                target_indices = target_indices[-max_len:]
+                # Assign to batch arrays
+                x_batch[batch_index, :] = input_indices
+                y_batch[batch_index, :] = target_indices
 
-            # Assign to batch arrays
-            x_batch[batch_index, :] = input_indices
-            y_batch[batch_index, :] = target_indices
+                batch_index += 1
 
-            batch_index += 1
-
-            if batch_index == batch_size:
-                yield x_batch, y_batch
-                batch_index = 0
-                x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
-                y_batch = np.zeros((batch_size, max_len), dtype=np.int32)
+                if batch_index == batch_size:
+                    yield x_batch, y_batch
+                    batch_index = 0
+                    x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
+                    y_batch = np.zeros((batch_size, max_len), dtype=np.int32)
 
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
             # Reset all indices and continue
             data_indices = [0] * len(jsonl_files)
+
 
 
 def create_name_generator():
@@ -663,52 +678,38 @@ class ReconstructCallback(Callback):
             return  # Skip invalid sample
 
         query_fieldname = query_type_to_query_fieldname[query_type]
-        query = data_point.get(query_fieldname, '').strip()
-        result = json.dumps(data_point)
+        name_or_title = data_point.get(query_fieldname, '').strip()
+        const_field = query_type_to_const_fieldname[query_type]
+        const = data_point.get(const_field).strip()
 
-        if not query or not result:
+        if not name_or_title or not const:
             return  # Skip invalid samples
 
-        # Construct the prompt
-        prompt = f"{SPECIAL_START}{query}{SPECIAL_SEP}"
+        # Randomly choose direction
+        direction = random.choice(['const_to_name', 'name_to_const'])
+
+        if direction == 'const_to_name':
+            # Construct the prompt
+            prompt = f"{SPECIAL_START}{const}{SPECIAL_SEP}"
+            expected_result = name_or_title
+        else:
+            # Construct the prompt
+            prompt = f"{SPECIAL_START}{name_or_title}{SPECIAL_SEP}"
+            expected_result = const
+
         input_indices = self.tokenizer.tokenize(prompt)
 
-        print("\nprompt:")
+        print("\nPrompt:")
         print(self.tokenizer.untokenize(input_indices))
 
         print("\nExpected result:")
-        print(result)
+        print(expected_result)
 
         generated_text = self.generate_continuation(input_indices)
         print("\nModel prediction:")
         print(generated_text)
 
         print("-" * 50)
-
-    def generate_continuation(self, input_indices):
-        generated_indices = []
-        current_input = input_indices.copy()
-
-        for step in range(self.max_input_length):
-            # Get model prediction
-            prediction = self.model.predict(tf.expand_dims(current_input, 0), verbose=0)
-            next_char_index = tf.argmax(prediction[0, -1, :]).numpy()
-            next_char = self.tokenizer.index_to_char.get(next_char_index, 'UNKNOWN')
-
-            # Add the predicted index to generated indices
-            generated_indices.append(next_char_index)
-
-            # Check for end token
-            if next_char == self.tokenizer.index_to_char[self.tokenizer.char_to_index[SPECIAL_END]]:
-                break
-
-            # Update current input by appending the next predicted character
-            current_input = np.concatenate([current_input, [next_char_index]])[-self.max_input_length:]
-
-        # Once the loop finishes, convert the generated indices to a full string
-        full_output_string = self.tokenizer.untokenize(generated_indices)
-        return full_output_string
-
 
 
 
@@ -766,21 +767,30 @@ def calculate_steps_per_epoch(jsonl_files, tokenizer, cache_file='dataset_size_c
                     continue
 
                 query_fieldname = query_type_to_query_fieldname[query_type]
-                query = data.get(query_fieldname, '').strip()
+                name_or_title = data.get(query_fieldname, '').strip()
+                const_field = query_type_to_const_fieldname[query_type]
+                const = data.get(const_field).strip()
 
-                result = json.dumps(data)
+                if not name_or_title or not const:
+                    continue  # Skip invalid data points
 
-                # Full sequence including special characters
-                full_text = f"{SPECIAL_START}{query}{SPECIAL_SEP}{result}{SPECIAL_END}"
-                full_sequence = tokenizer.tokenize(full_text, pad_to_max_length=False)
-                sequence_length = len(full_sequence)
+                # Create two sequences
+                input_strings = [
+                    f"{SPECIAL_START}{const}{SPECIAL_SEP}{name_or_title}{SPECIAL_END}",
+                    f"{SPECIAL_START}{name_or_title}{SPECIAL_SEP}{const}{SPECIAL_END}"
+                ]
 
-                if sequence_length < 2:
-                    continue  # Skip sequences that are too short
+                for input_string in input_strings:
+                    # Full sequence including special characters
+                    full_sequence = tokenizer.tokenize(input_string, pad_to_max_length=False)
+                    sequence_length = len(full_sequence)
 
-                # Number of samples for this data point
-                num_samples = sequence_length - 1
-                total_samples += num_samples
+                    if sequence_length < 2:
+                        continue  # Skip sequences that are too short
+
+                    # Number of samples for this data point
+                    num_samples = sequence_length - 1
+                    total_samples += num_samples
 
     # Cache the result for future use
     cached_data = {}
@@ -794,6 +804,7 @@ def calculate_steps_per_epoch(jsonl_files, tokenizer, cache_file='dataset_size_c
     print(f"Total samples across all JSONL files: {total_samples}")
 
     return total_samples
+
 
 def get_alphabet(jsonl_files, cache_file='alphabet_cache.json'):
     """

@@ -12,7 +12,6 @@ project_config = {
             "movie.jsonl",
             "tvSeries.jsonl",
             "person.jsonl",
-            "character.jsonl",
         ],
     },
     
