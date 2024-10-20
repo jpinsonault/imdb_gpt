@@ -510,15 +510,6 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
 
                 # Log the sequences and weights occasionally
                 sample_counter += 1
-                if sample_counter % 1000 == 0:
-                    # Log input and target sequences as strings
-                    input_str = tokenizer.untokenize(input_indices)
-                    target_str = tokenizer.untokenize(target_indices)
-                    logging.info(f"Sample {sample_counter}:")
-                    logging.info(f"Input sequence: {input_str}")
-                    logging.info(f"Target sequence: {target_str}")
-                    logging.info(f"Weights: {weights_seq}")
-
                 batch_index += 1
 
                 if batch_index == batch_size:
