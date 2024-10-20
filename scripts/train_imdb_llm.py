@@ -880,7 +880,7 @@ class ReconstructCallback(Callback):
         )
 
         # Map weights to ASCII characters
-        ascii_weights = map_weights_to_ascii(weights_seq)
+        ascii_weights = map_weights_to_first_digit(weights_seq)
 
         # Print the weights visualization
         print("\nWeights visualization:")
