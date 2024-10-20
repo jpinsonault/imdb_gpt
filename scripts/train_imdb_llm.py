@@ -917,23 +917,27 @@ class ReconstructCallback(Callback):
         return generated_text
 
 
-def map_weights_to_ascii(weights_seq):
+def map_weights_to_first_digit(weights_seq, prompt_length):
     """
-    Map weights to ASCII characters for visualization.
+    Map weights to first digits for visualization.
+    If weight is exactly 0, display '*', and if weight is exactly 1, display '^'.
     """
-    # Define a set of ASCII characters from light to dark
-    ascii_chars = ' .:-=+*#%@'
-
-    # Normalize weights to range [0, 1]
-    min_weight = np.min(weights_seq)
-    max_weight = np.max(weights_seq)
-    normalized_weights = (weights_seq - min_weight) / (max_weight - min_weight + 1e-8)  # Add small epsilon to avoid division by zero
-
-    # Map normalized weights to indices in ascii_chars
-    indices = (normalized_weights * (len(ascii_chars) - 1)).astype(int)
-    ascii_weights = [ascii_chars[idx] for idx in indices]
-
-    return ascii_weights
+    # Truncate the weights_seq to match the prompt length
+    weights_seq = weights_seq[:prompt_length]
+    
+    mapped_weights = []
+    for weight in weights_seq:
+        if weight == 0.0:
+            mapped_weights.append('*')
+        elif weight == 1.0:
+            mapped_weights.append('^')
+        else:
+            # Take the first digit of the weight (e.g., 0.123 -> '1')
+            first_digit = str(int(weight * 10))  # Scale weight by 10 and get integer part
+            mapped_weights.append(first_digit)
+    
+    # Return as a string
+    return ''.join(mapped_weights)
 
 
 
