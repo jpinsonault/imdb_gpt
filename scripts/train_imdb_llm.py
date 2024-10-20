@@ -266,8 +266,8 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             weights_batch[batch_idx] = weights_seq
 
             if self.verbose and batch_idx < 1:  # Only log for the first sequence
-                logging.debug(f"Sequence {batch_idx}: y_seq_np: {y_seq}")
-                logging.debug(f"Sequence {batch_idx}: weights_seq: {weights_seq}")
+                logging.info(f"Sequence {batch_idx}: y_seq_np: {y_seq}")
+                logging.info(f"Sequence {batch_idx}: weights_seq: {weights_seq}")
 
         return weights_batch
 
@@ -281,8 +281,8 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         digit_positions = []
 
         if self.verbose:
-            logging.debug(f"Computing weights for sequence: {y_seq_np}")
-            logging.debug(f"is_digit_seq: {is_digit_seq}")
+            logging.info(f"Computing weights for sequence: {y_seq_np}")
+            logging.info(f"is_digit_seq: {is_digit_seq}")
 
         for i in range(sequence_length):
             is_digit = is_digit_seq[i]
@@ -294,25 +294,25 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             else:
                 if in_number:
                     if self.verbose:
-                        logging.debug(f"Digit positions: {digit_positions}")
+                        logging.info(f"Digit positions: {digit_positions}")
                     self.assign_weights_to_digits(weights_seq, digit_positions)
                     if self.verbose:
-                        logging.debug(f"Weights after assigning digits: {weights_seq}")
+                        logging.info(f"Weights after assigning digits: {weights_seq}")
                     in_number = False
         # Handle last number if sequence ends with digits
         if in_number:
             if self.verbose:
-                logging.debug(f"Digit positions at end: {digit_positions}")
+                logging.info(f"Digit positions at end: {digit_positions}")
             self.assign_weights_to_digits(weights_seq, digit_positions)
             if self.verbose:
-                logging.debug(f"Weights after assigning digits at end: {weights_seq}")
+                logging.info(f"Weights after assigning digits at end: {weights_seq}")
 
         # Apply pad weight
         pad_mask = (y_seq_np == self.pad_token_index_np).astype(np.float32)
         weights_seq = weights_seq * (1 - pad_mask) + self.pad_weight * pad_mask
 
         if self.verbose:
-            logging.debug(f"Final weights_seq: {weights_seq}")
+            logging.info(f"Final weights_seq: {weights_seq}")
 
         return weights_seq
 
@@ -328,8 +328,8 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         weights = self.min_weight + (self.max_weight - self.min_weight) * normalized_positions
 
         if self.verbose:
-            logging.debug(f"Assigning weights to digits at positions {digit_positions}")
-            logging.debug(f"Computed weights: {weights}")
+            logging.info(f"Assigning weights to digits at positions {digit_positions}")
+            logging.info(f"Computed weights: {weights}")
 
         # Assign weights to the respective positions
         for idx, pos in enumerate(digit_positions):
