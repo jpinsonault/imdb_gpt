@@ -123,7 +123,7 @@ def load_or_create_model(checkpoint_path, tokenizer, input_length, character_emb
     """
     logging.info(f"Trying to load the model from {checkpoint_path}")
     custom_objects = {
-        'WeightedLossWithPadding': WeightedLossWithPadding,
+        'WeightedLossWithDigitPosition': WeightedLossWithDigitPosition,
         'AlibiMultiHeadAttention': AlibiMultiHeadAttention,
     }
 
@@ -196,8 +196,14 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
     # Get the padding token index from the tokenizer
     pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
 
-    # Instantiate the custom loss function
-    loss_fn = WeightedLossWithPadding(pad_token_index=pad_token_index, pad_weight=0.1)
+    # Instantiate the custom loss function with digit position awareness
+    loss_fn = WeightedLossWithDigitPosition(
+        pad_token_index=pad_token_index,
+        tokenizer=tokenizer,
+        min_weight=0.5,  # You can configure these values
+        max_weight=1.5,
+        pad_weight=0.1
+    )
 
     print("\n> Compiling model\n")
     model.compile(
@@ -216,25 +222,95 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
         callbacks=callbacks
     )
 
-class WeightedLossWithPadding(tf.keras.losses.Loss):
-    def __init__(self, pad_token_index, pad_weight=0.1, **kwargs):
+
+class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
+    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, **kwargs):
         super().__init__(**kwargs)
         self.pad_token_index = pad_token_index
         self.pad_weight = pad_weight
+        self.min_weight = min_weight
+        self.max_weight = max_weight
+        self.tokenizer = tokenizer
+
+        # Precompute the digit indices for quick lookup
+        self.digit_indices = np.array([tokenizer.char_to_index.get(str(d)) for d in range(10)], dtype=np.int32)
+        self.pad_token_index_np = np.array(pad_token_index, dtype=np.int32)
 
     def call(self, y_true, y_pred):
         # Compute the standard sparse categorical cross-entropy loss
         loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
 
-        # Create a mask for padding tokens
-        mask = tf.cast(tf.not_equal(y_true, self.pad_token_index), tf.float32)
+        # Compute the weights
+        weights = self.compute_weights(y_true)
 
         # Apply the weights to the loss
-        weights = mask + self.pad_weight * (1 - mask)
         weighted_loss = loss * weights
 
         # Return the mean loss over the batch
         return tf.reduce_mean(weighted_loss)
+
+    def compute_weights(self, y_true):
+        # y_true shape: [batch_size, sequence_length]
+        weights = tf.numpy_function(self.compute_weights_batch_np, [y_true], tf.float32)
+        weights.set_shape(y_true.shape)
+        return weights
+
+    def compute_weights_batch_np(self, y_true_np):
+        # y_true_np: numpy array of shape [batch_size, sequence_length]
+        batch_size, sequence_length = y_true_np.shape
+        weights_batch = np.ones_like(y_true_np, dtype=np.float32)
+
+        for batch_idx in range(batch_size):
+            y_seq = y_true_np[batch_idx]
+            weights_seq = self.compute_sequence_weights_np(y_seq)
+            weights_batch[batch_idx] = weights_seq
+
+        return weights_batch
+
+    def compute_sequence_weights_np(self, y_seq_np):
+        # y_seq_np: numpy array of shape [sequence_length]
+        sequence_length = len(y_seq_np)
+        weights_seq = np.ones(sequence_length, dtype=np.float32)
+
+        is_digit_seq = np.isin(y_seq_np, self.digit_indices)
+        in_number = False
+        digit_positions = []
+
+        for i in range(sequence_length):
+            is_digit = is_digit_seq[i]
+            if is_digit:
+                if not in_number:
+                    in_number = True
+                    digit_positions = []
+                digit_positions.append(i)
+            else:
+                if in_number:
+                    self.assign_weights_to_digits(weights_seq, digit_positions)
+                    in_number = False
+        # Handle last number if sequence ends with digits
+        if in_number:
+            self.assign_weights_to_digits(weights_seq, digit_positions)
+
+        # Apply pad weight
+        pad_mask = (y_seq_np == self.pad_token_index_np).astype(np.float32)
+        weights_seq = weights_seq * (1 - pad_mask) + self.pad_weight * pad_mask
+
+        return weights_seq
+
+    def assign_weights_to_digits(self, weights_seq, digit_positions):
+        number_length = len(digit_positions)
+        positions_in_number = np.arange(number_length, dtype=np.float32)
+        if number_length > 1:
+            normalized_positions = positions_in_number / (number_length - 1)
+        else:
+            normalized_positions = np.array([0.0], dtype=np.float32)
+
+        # Compute weights for each digit position
+        weights = self.min_weight + (self.max_weight - self.min_weight) * normalized_positions
+
+        # Assign weights to the respective positions
+        for idx, pos in enumerate(digit_positions):
+            weights_seq[pos] = weights[idx]
 
     def get_config(self):
         # Return a configuration dictionary that can be used for serialization
@@ -242,13 +318,11 @@ class WeightedLossWithPadding(tf.keras.losses.Loss):
         config.update({
             'pad_token_index': self.pad_token_index,
             'pad_weight': self.pad_weight,
+            'min_weight': self.min_weight,
+            'max_weight': self.max_weight,
         })
         return config
 
-    @classmethod
-    def from_config(cls, config):
-        # Create an instance from the config
-        return cls(**config)
 
 
 def create_logs_dir(name_prefix):
@@ -311,11 +385,12 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     """
     Batch generator that generates input-target pairs for language modeling.
     For each data point, generates two sequences:
-    - Mapping from 'n/tconst' to 'name' or 'title'
-    - Mapping from 'name' or 'title' to 'n/tconst'
+    - Mapping from 'const' to 'name' or 'title'
+    - Mapping from 'name' or 'title' to 'const'
     For each position in the full sequence, generates an input sequence consisting
     of the tokens up to that position, left-padded to max_input_length.
     The target sequence is the input sequence shifted one token to the right.
+    Also computes weights for each position in the target sequence.
     """
     logging.info("Loading JSONL data files into memory")
     
@@ -339,10 +414,16 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     data_indices = [0] * len(jsonl_files)  # Track the current index for each dataset
     x_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
     y_batch = np.zeros((batch_size, tokenizer.max_input_length), dtype=np.int32)
+    weights_batch = np.ones((batch_size, tokenizer.max_input_length), dtype=np.float32)
     batch_index = 0
 
     logging.info("Starting batch generation loop")
     
+    # Precompute the digit indices for quick lookup
+    digit_chars = [str(d) for d in range(10)]
+    digit_indices = set(tokenizer.char_to_index.get(ch) for ch in digit_chars)
+    pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
+
     while True:
         # Randomly choose a dataset based on sampling probabilities
         dataset_choice = random.choices(range(len(jsonl_files)), weights=sampling_probs, k=1)[0]
@@ -359,19 +440,18 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
         data_indices[dataset_choice] += 1
 
         query_type = data_point.get('type')
-        logging.debug(f"Processing data point with query type: {query_type}")
 
         if query_type not in ['movie', 'tvSeries', 'person', 'character']:
-            logging.debug(f"Skipping data point due to unknown query type: {query_type}")
+            logging.info(f"Skipping data point due to unknown query type: {query_type}")
             continue
 
         query_fieldname = query_type_to_query_fieldname[query_type]
         name_or_title = data_point.get(query_fieldname, '').strip()
-        const_field = query_type_to_const_fieldname[query_type]
-        const = data_point.get(const_field).strip()
+        const_fieldname = query_type_to_const_fieldname[query_type]
+        const = data_point.get(const_fieldname).strip()
 
         if not name_or_title or not const:
-            logging.debug("Skipping data point due to missing name or const")
+            logging.info("Skipping data point due to missing name or const")
             continue  # Skip invalid data points
 
         # Log the selected data point information
@@ -413,24 +493,90 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                 else:
                     target_indices = target_indices[-max_len:]
 
+                # Compute weights for the target sequence
+                weights_seq = compute_weights_for_sequence(
+                    target_indices,
+                    tokenizer,
+                    pad_token_index,
+                    digit_indices,
+                    min_weight=0.5,
+                    max_weight=1.5,
+                    pad_weight=0.1
+                )
+
                 # Assign to batch arrays
                 x_batch[batch_index, :] = input_indices
                 y_batch[batch_index, :] = target_indices
+                weights_batch[batch_index, :] = weights_seq
 
                 batch_index += 1
 
                 if batch_index == batch_size:
                     logging.info(f"Yielding batch of size {batch_size}")
-                    yield x_batch, y_batch
+                    yield x_batch, y_batch, weights_batch
                     batch_index = 0
                     x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
                     y_batch = np.zeros((batch_size, max_len), dtype=np.int32)
+                    weights_batch = np.ones((batch_size, max_len), dtype=np.float32)
 
         # Check if all datasets are exhausted
         if all(index >= size for index, size in zip(data_indices, dataset_sizes)):
             logging.info("All datasets exhausted, resetting indices")
             data_indices = [0] * len(jsonl_files)
 
+
+def compute_weights_for_sequence(y_seq_np, tokenizer, pad_token_index, digit_indices, min_weight=0.5, max_weight=1.5, pad_weight=0.1):
+    """
+    Compute weights for a target sequence.
+    y_seq_np: numpy array of shape [sequence_length]
+    Returns weights_seq: numpy array of shape [sequence_length]
+    """
+    sequence_length = len(y_seq_np)
+    weights_seq = np.ones(sequence_length, dtype=np.float32)
+
+    is_digit_seq = np.array([idx in digit_indices for idx in y_seq_np])
+    in_number = False
+    digit_positions = []
+
+    for i in range(sequence_length):
+        is_digit = is_digit_seq[i]
+        if is_digit:
+            if not in_number:
+                in_number = True
+                digit_positions = []
+            digit_positions.append(i)
+        else:
+            if in_number:
+                assign_weights_to_digits(weights_seq, digit_positions, min_weight, max_weight)
+                in_number = False
+    # Handle last number if sequence ends with digits
+    if in_number:
+        assign_weights_to_digits(weights_seq, digit_positions, min_weight, max_weight)
+
+    # Fix: Perform element-wise comparison using numpy
+    pad_mask = np.equal(y_seq_np, pad_token_index).astype(np.float32)
+    weights_seq = weights_seq * (1 - pad_mask) + pad_weight * pad_mask
+
+    return weights_seq
+
+
+def assign_weights_to_digits(weights_seq, digit_positions, min_weight, max_weight):
+    number_length = len(digit_positions)
+    positions_in_number = np.arange(number_length, dtype=np.float32)
+    if number_length > 1:
+        normalized_positions = positions_in_number / (number_length - 1)
+    else:
+        normalized_positions = np.array([0.0], dtype=np.float32)
+
+    # Reverse to have least significant digits with higher weight
+    normalized_positions = normalized_positions[::-1]
+
+    # Compute weights for each digit position
+    weights = min_weight + (max_weight - min_weight) * normalized_positions
+
+    # Assign weights to the respective positions
+    for idx, pos in enumerate(digit_positions):
+        weights_seq[pos] = weights[idx]
 
 
 def create_name_generator():
@@ -683,7 +829,7 @@ class ReconstructCallback(Callback):
                 self.generate_sample()
 
     def generate_sample(self):
-        # Sample a data point from the shared buffer
+        # Sample a data point from the shared_buffer
         data_point = random.choice(list(self.shared_buffer))
 
         query_type = data_point.get('type')
@@ -693,8 +839,7 @@ class ReconstructCallback(Callback):
 
         query_fieldname = query_type_to_query_fieldname[query_type]
         name_or_title = data_point.get(query_fieldname, '').strip()
-        const_field = query_type_to_const_fieldname[query_type]
-        const = data_point.get(const_field).strip()
+        const = data_point.get('const', '').strip()
 
         if not name_or_title or not const:
             return  # Skip invalid samples
@@ -705,16 +850,18 @@ class ReconstructCallback(Callback):
         if direction == 'const_to_name':
             # Construct the prompt
             prompt = f"{SPECIAL_START}{const}{SPECIAL_SEP}"
-            expected_result = name_or_title
+            expected_result = name_or_title + SPECIAL_END
+            full_sequence_str = f"{SPECIAL_START}{const}{SPECIAL_SEP}{expected_result}"
         else:
             # Construct the prompt
             prompt = f"{SPECIAL_START}{name_or_title}{SPECIAL_SEP}"
-            expected_result = const
+            expected_result = const + SPECIAL_END
+            full_sequence_str = f"{SPECIAL_START}{name_or_title}{SPECIAL_SEP}{expected_result}"
 
         input_indices = self.tokenizer.tokenize(prompt)
 
         print("\nPrompt:")
-        print(self.tokenizer.untokenize(input_indices))
+        print(prompt)
 
         print("\nExpected result:")
         print(expected_result)
@@ -722,6 +869,28 @@ class ReconstructCallback(Callback):
         generated_text = self.generate_continuation(input_indices)
         print("\nModel prediction:")
         print(generated_text)
+
+        # Now compute weights for the full_sequence_str
+        full_sequence_indices = self.tokenizer.tokenize(full_sequence_str, pad_to_max_length=False)
+        weights_seq = compute_weights_for_sequence(
+            full_sequence_indices,
+            self.tokenizer,
+            self.tokenizer.char_to_index[SPECIAL_PAD],
+            set(self.tokenizer.char_to_index.get(ch) for ch in '0123456789'),
+            min_weight=0.5,
+            max_weight=1.5,
+            pad_weight=0.1
+        )
+
+        # Map weights to ASCII characters
+        ascii_weights = map_weights_to_ascii(weights_seq)
+
+        # Print the weights visualization
+        print("\nWeights visualization:")
+        sequence_chars = [self.tokenizer.index_to_char.get(idx, '') for idx in full_sequence_indices]
+        for ch, weight_char in zip(sequence_chars, ascii_weights):
+            print(f"{ch}:{weight_char}", end=' ')
+        print("\n")
 
         print("-" * 50)
 
@@ -736,7 +905,7 @@ class ReconstructCallback(Callback):
             next_char_index = tf.argmax(next_char_logits).numpy()
             next_char = self.tokenizer.index_to_char.get(next_char_index, '')
 
-            # Add the predicted index to generated indices
+            # Add the predicted index to generated_indices
             generated_indices.append(next_char_index)
 
             # Check for end token
@@ -750,6 +919,24 @@ class ReconstructCallback(Callback):
         generated_text = self.tokenizer.untokenize(generated_indices)
         return generated_text
 
+
+def map_weights_to_ascii(weights_seq):
+    """
+    Map weights to ASCII characters for visualization.
+    """
+    # Define a set of ASCII characters from light to dark
+    ascii_chars = ' .:-=+*#%@'
+
+    # Normalize weights to range [0, 1]
+    min_weight = np.min(weights_seq)
+    max_weight = np.max(weights_seq)
+    normalized_weights = (weights_seq - min_weight) / (max_weight - min_weight + 1e-8)  # Add small epsilon to avoid division by zero
+
+    # Map normalized weights to indices in ascii_chars
+    indices = (normalized_weights * (len(ascii_chars) - 1)).astype(int)
+    ascii_weights = [ascii_chars[idx] for idx in indices]
+
+    return ascii_weights
 
 
 
