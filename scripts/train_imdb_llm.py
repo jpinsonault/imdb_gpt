@@ -320,7 +320,6 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             'pad_weight': self.pad_weight,
             'min_weight': self.min_weight,
             'max_weight': self.max_weight,
-            'verbose': self.verbose,
         })
         return config
 
@@ -515,10 +514,10 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                     # Log input and target sequences as strings
                     input_str = tokenizer.untokenize(input_indices)
                     target_str = tokenizer.untokenize(target_indices)
-                    logging.debug(f"Sample {sample_counter}:")
-                    logging.debug(f"Input sequence: {input_str}")
-                    logging.debug(f"Target sequence: {target_str}")
-                    logging.debug(f"Weights: {weights_seq}")
+                    logging.info(f"Sample {sample_counter}:")
+                    logging.info(f"Input sequence: {input_str}")
+                    logging.info(f"Target sequence: {target_str}")
+                    logging.info(f"Weights: {weights_seq}")
 
                 batch_index += 1
 
