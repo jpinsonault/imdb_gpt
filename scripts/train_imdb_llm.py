@@ -455,7 +455,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
             continue  # Skip invalid data points
 
         # Log the selected data point information
-        logging.info(f"Generating sequences for data point: {const} <-> {name_or_title}")
+        if batch_index % 100 == 0:
+            logging.info(f"Generating sequences for data point: {const} <-> {name_or_title}")
 
         # Create two sequences:
         # Sequence 1: const -> name_or_title
@@ -839,7 +840,8 @@ class ReconstructCallback(Callback):
 
         query_fieldname = query_type_to_query_fieldname[query_type]
         name_or_title = data_point.get(query_fieldname, '').strip()
-        const = data_point.get('const', '').strip()
+        const_fieldname = query_type_to_const_fieldname[query_type]
+        const = data_point.get(const_fieldname).strip()
 
         if not name_or_title or not const:
             return  # Skip invalid samples
