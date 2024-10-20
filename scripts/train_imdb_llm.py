@@ -185,7 +185,7 @@ def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_fil
 
 
 def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks):
-    initial_learning_rate = 0.0002
+    initial_learning_rate = 0.0001
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=initial_learning_rate,
         decay_steps=steps_per_epoch * num_epochs,
@@ -199,8 +199,8 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
     loss_fn = WeightedLossWithDigitPosition(
         pad_token_index=pad_token_index,
         tokenizer=tokenizer,
-        min_weight=0.5,  # You can configure these values
-        max_weight=1.5,
+        min_weight=0.1,  # You can configure these values
+        max_weight=1.0,
         pad_weight=0.1
     )
 
