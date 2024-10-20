@@ -498,8 +498,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                     tokenizer,
                     pad_token_index,
                     digit_indices,
-                    min_weight=0.5,
-                    max_weight=1.5,
+                    min_weight=1.5,
+                    max_weight=0.5,
                     pad_weight=0.1
                 )
 
