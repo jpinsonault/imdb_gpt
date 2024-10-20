@@ -454,10 +454,6 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
             logging.info("Skipping data point due to missing name or const")
             continue  # Skip invalid data points
 
-        # Log the selected data point information
-        if batch_index % 100 == 0:
-            logging.info(f"Generating sequences for data point: {const} <-> {name_or_title}")
-
         # Create two sequences:
         # Sequence 1: const -> name_or_title
         input_string1 = f"{SPECIAL_START}{const}{SPECIAL_SEP}{name_or_title}{SPECIAL_END}"
@@ -513,7 +509,6 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                 batch_index += 1
 
                 if batch_index == batch_size:
-                    logging.info(f"Yielding batch of size {batch_size}")
                     yield x_batch, y_batch, weights_batch
                     batch_index = 0
                     x_batch = np.zeros((batch_size, max_len), dtype=np.int32)
