@@ -50,7 +50,7 @@ SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
 
-logging.basicConfig(level=logging.NOTSET)
+logging.basicConfig(level=logging.DEBUG)
 
 def main():
     configs = generate_param_combinations(project_config)
@@ -223,14 +223,13 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
 
 
 class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
-    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, verbose=False, **kwargs):
+    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, **kwargs):
         super().__init__(**kwargs)
         self.pad_token_index = pad_token_index
         self.pad_weight = pad_weight
         self.min_weight = min_weight
         self.max_weight = max_weight
         self.tokenizer = tokenizer
-        self.verbose = verbose
 
         # Precompute the digit indices for quick lookup
         self.digit_indices = np.array([tokenizer.char_to_index.get(str(d)) for d in range(10)], dtype=np.int32)
@@ -265,10 +264,6 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             weights_seq = self.compute_sequence_weights_np(y_seq)
             weights_batch[batch_idx] = weights_seq
 
-            if self.verbose and batch_idx < 1:  # Only log for the first sequence
-                tf.print(f"Sequence {batch_idx}: y_seq_np: {y_seq}")
-                tf.print(f"Sequence {batch_idx}: weights_seq: {weights_seq}")
-
         return weights_batch
 
     def compute_sequence_weights_np(self, y_seq_np):
@@ -280,10 +275,6 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         in_number = False
         digit_positions = []
 
-        if self.verbose:
-            tf.print(f"Computing weights for sequence: {y_seq_np}")
-            tf.print(f"is_digit_seq: {is_digit_seq}")
-
         for i in range(sequence_length):
             is_digit = is_digit_seq[i]
             if is_digit:
@@ -293,26 +284,15 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
                 digit_positions.append(i)
             else:
                 if in_number:
-                    if self.verbose:
-                        tf.print(f"Digit positions: {digit_positions}")
                     self.assign_weights_to_digits(weights_seq, digit_positions)
-                    if self.verbose:
-                        tf.print(f"Weights after assigning digits: {weights_seq}")
                     in_number = False
         # Handle last number if sequence ends with digits
         if in_number:
-            if self.verbose:
-                tf.print(f"Digit positions at end: {digit_positions}")
             self.assign_weights_to_digits(weights_seq, digit_positions)
-            if self.verbose:
-                tf.print(f"Weights after assigning digits at end: {weights_seq}")
 
         # Apply pad weight
         pad_mask = (y_seq_np == self.pad_token_index_np).astype(np.float32)
         weights_seq = weights_seq * (1 - pad_mask) + self.pad_weight * pad_mask
-
-        if self.verbose:
-            tf.print(f"Final weights_seq: {weights_seq}")
 
         return weights_seq
 
@@ -327,9 +307,6 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         # Compute weights for each digit position
         weights = self.min_weight + (self.max_weight - self.min_weight) * normalized_positions
 
-        if self.verbose:
-            tf.print(f"Assigning weights to digits at positions {digit_positions}")
-            tf.print(f"Computed weights: {weights}")
 
         # Assign weights to the respective positions
         for idx, pos in enumerate(digit_positions):
@@ -448,6 +425,8 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
     digit_indices = set(tokenizer.char_to_index.get(ch) for ch in digit_chars)
     pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
 
+    sample_counter = 0  # Initialize a sample counter
+
     while True:
         # Randomly choose a dataset based on sampling probabilities
         dataset_choice = random.choices(range(len(jsonl_files)), weights=sampling_probs, k=1)[0]
@@ -530,6 +509,17 @@ def autoencoder_batch_generator(jsonl_files, batch_size, tokenizer: Tokenizer, s
                 y_batch[batch_index, :] = target_indices
                 weights_batch[batch_index, :] = weights_seq
 
+                # Log the sequences and weights occasionally
+                sample_counter += 1
+                if sample_counter % 1000 == 0:
+                    # Log input and target sequences as strings
+                    input_str = tokenizer.untokenize(input_indices)
+                    target_str = tokenizer.untokenize(target_indices)
+                    logging.debug(f"Sample {sample_counter}:")
+                    logging.debug(f"Input sequence: {input_str}")
+                    logging.debug(f"Target sequence: {target_str}")
+                    logging.debug(f"Weights: {weights_seq}")
+
                 batch_index += 1
 
                 if batch_index == batch_size:
@@ -558,6 +548,10 @@ def compute_weights_for_sequence(y_seq_np, tokenizer, pad_token_index, digit_ind
     in_number = False
     digit_positions = []
 
+    # For logging purposes, collect digit positions and weights assigned
+    all_digit_positions = []
+    all_digit_weights = []
+
     for i in range(sequence_length):
         is_digit = is_digit_seq[i]
         if is_digit:
@@ -568,14 +562,30 @@ def compute_weights_for_sequence(y_seq_np, tokenizer, pad_token_index, digit_ind
         else:
             if in_number:
                 assign_weights_to_digits(weights_seq, digit_positions, min_weight, max_weight)
+                # Collect digit positions and weights for logging
+                all_digit_positions.append(digit_positions.copy())
+                all_digit_weights.append(weights_seq[digit_positions].copy())
                 in_number = False
     # Handle last number if sequence ends with digits
     if in_number:
         assign_weights_to_digits(weights_seq, digit_positions, min_weight, max_weight)
+        # Collect digit positions and weights for logging
+        all_digit_positions.append(digit_positions.copy())
+        all_digit_weights.append(weights_seq[digit_positions].copy())
 
-    # Fix: Perform element-wise comparison using numpy
+    # Perform element-wise comparison using numpy
     pad_mask = np.equal(y_seq_np, pad_token_index).astype(np.float32)
     weights_seq = weights_seq * (1 - pad_mask) + pad_weight * pad_mask
+
+    # Logging for debugging
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        # Convert indices to characters
+        seq_chars = [tokenizer.index_to_char.get(idx, '') for idx in y_seq_np]
+        logging.debug("Sequence indices: {}".format(y_seq_np))
+        logging.debug("Sequence characters: {}".format(seq_chars))
+        logging.debug("Digit positions: {}".format(all_digit_positions))
+        logging.debug("Weights assigned to digits: {}".format(all_digit_weights))
+        logging.debug("Final weights sequence: {}".format(weights_seq))
 
     return weights_seq
 
