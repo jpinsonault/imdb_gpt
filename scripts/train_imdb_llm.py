@@ -224,13 +224,14 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
 
 
 class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
-    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, **kwargs):
+    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, verbose=False, **kwargs):
         super().__init__(**kwargs)
         self.pad_token_index = pad_token_index
         self.pad_weight = pad_weight
         self.min_weight = min_weight
         self.max_weight = max_weight
         self.tokenizer = tokenizer
+        self.verbose = verbose
 
         # Precompute the digit indices for quick lookup
         self.digit_indices = np.array([tokenizer.char_to_index.get(str(d)) for d in range(10)], dtype=np.int32)
@@ -265,6 +266,10 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             weights_seq = self.compute_sequence_weights_np(y_seq)
             weights_batch[batch_idx] = weights_seq
 
+            if self.verbose and batch_idx < 1:  # Only log for the first sequence
+                logging.debug(f"Sequence {batch_idx}: y_seq_np: {y_seq}")
+                logging.debug(f"Sequence {batch_idx}: weights_seq: {weights_seq}")
+
         return weights_batch
 
     def compute_sequence_weights_np(self, y_seq_np):
@@ -276,6 +281,10 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         in_number = False
         digit_positions = []
 
+        if self.verbose:
+            logging.debug(f"Computing weights for sequence: {y_seq_np}")
+            logging.debug(f"is_digit_seq: {is_digit_seq}")
+
         for i in range(sequence_length):
             is_digit = is_digit_seq[i]
             if is_digit:
@@ -285,15 +294,26 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
                 digit_positions.append(i)
             else:
                 if in_number:
+                    if self.verbose:
+                        logging.debug(f"Digit positions: {digit_positions}")
                     self.assign_weights_to_digits(weights_seq, digit_positions)
+                    if self.verbose:
+                        logging.debug(f"Weights after assigning digits: {weights_seq}")
                     in_number = False
         # Handle last number if sequence ends with digits
         if in_number:
+            if self.verbose:
+                logging.debug(f"Digit positions at end: {digit_positions}")
             self.assign_weights_to_digits(weights_seq, digit_positions)
+            if self.verbose:
+                logging.debug(f"Weights after assigning digits at end: {weights_seq}")
 
         # Apply pad weight
         pad_mask = (y_seq_np == self.pad_token_index_np).astype(np.float32)
         weights_seq = weights_seq * (1 - pad_mask) + self.pad_weight * pad_mask
+
+        if self.verbose:
+            logging.debug(f"Final weights_seq: {weights_seq}")
 
         return weights_seq
 
@@ -308,6 +328,10 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
         # Compute weights for each digit position
         weights = self.min_weight + (self.max_weight - self.min_weight) * normalized_positions
 
+        if self.verbose:
+            logging.debug(f"Assigning weights to digits at positions {digit_positions}")
+            logging.debug(f"Computed weights: {weights}")
+
         # Assign weights to the respective positions
         for idx, pos in enumerate(digit_positions):
             weights_seq[pos] = weights[idx]
@@ -320,6 +344,7 @@ class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
             'pad_weight': self.pad_weight,
             'min_weight': self.min_weight,
             'max_weight': self.max_weight,
+            'verbose': self.verbose,
         })
         return config
 
@@ -867,28 +892,6 @@ class ReconstructCallback(Callback):
         print("\nModel prediction:")
         print(generated_text)
 
-        # Now compute weights for the full_sequence_str
-        full_sequence_indices = self.tokenizer.tokenize(full_sequence_str, pad_to_max_length=False)
-        weights_seq = compute_weights_for_sequence(
-            full_sequence_indices,
-            self.tokenizer,
-            self.tokenizer.char_to_index[SPECIAL_PAD],
-            set(self.tokenizer.char_to_index.get(ch) for ch in '0123456789'),
-            min_weight=0.5,
-            max_weight=1.5,
-            pad_weight=0.1
-        )
-
-        # Map weights to ASCII characters
-        ascii_weights = map_weights_to_first_digit(weights_seq)
-
-        # Print the weights visualization
-        print("\nWeights visualization:")
-        sequence_chars = [self.tokenizer.index_to_char.get(idx, '') for idx in full_sequence_indices]
-        for ch, weight_char in zip(sequence_chars, ascii_weights):
-            print(f"{ch}:{weight_char}", end=' ')
-        print("\n")
-
         print("-" * 50)
 
     def generate_continuation(self, input_indices):
@@ -915,29 +918,6 @@ class ReconstructCallback(Callback):
         # Convert the generated indices to a string
         generated_text = self.tokenizer.untokenize(generated_indices)
         return generated_text
-
-
-def map_weights_to_first_digit(weights_seq, prompt_length):
-    """
-    Map weights to first digits for visualization.
-    If weight is exactly 0, display '*', and if weight is exactly 1, display '^'.
-    """
-    # Truncate the weights_seq to match the prompt length
-    weights_seq = weights_seq[:prompt_length]
-    
-    mapped_weights = []
-    for weight in weights_seq:
-        if weight == 0.0:
-            mapped_weights.append('*')
-        elif weight == 1.0:
-            mapped_weights.append('^')
-        else:
-            # Take the first digit of the weight (e.g., 0.123 -> '1')
-            first_digit = str(int(weight * 10))  # Scale weight by 10 and get integer part
-            mapped_weights.append(first_digit)
-    
-    # Return as a string
-    return ''.join(mapped_weights)
 
 
 
