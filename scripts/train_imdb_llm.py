@@ -33,12 +33,12 @@ from config import project_config
 from datasets import load_dataset, concatenate_datasets
 from scripts.attention_model import generative_matrix_attention
 from scripts.utils import print_project_config
-# from torch.utils.data import Dataset, DataLoader
 import os
 import json
 import hashlib
 import random
 from typing import Set, Dict
+import itertools
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from track_changes import commit_changes_to_git, suggest_folder_name
 from copy import deepcopy
@@ -49,9 +49,8 @@ SPECIAL_PAD = '\u200C'
 SPECIAL_START = '\u200D'
 SPECIAL_END = '\u200E'
 SPECIAL_SEP = '\u200F'
-import itertools
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.NOTSET)
 
 def main():
     configs = generate_param_combinations(project_config)
