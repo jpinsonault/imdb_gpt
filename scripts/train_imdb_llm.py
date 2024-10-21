@@ -184,6 +184,15 @@ def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_fil
     ]
 
 
+def static_lr_schedule(epoch, lr):
+    if epoch == 0:
+        return 0.0002
+    elif epoch == 1:
+        return 0.0001
+    elif epoch == 2:
+        return 0.00005
+
+
 def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks):
     initial_learning_rate = 0.0001
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
