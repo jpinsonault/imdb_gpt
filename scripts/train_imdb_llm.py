@@ -189,6 +189,7 @@ def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_fil
 
 
 def static_lr_schedule(epoch, lr):
+    return 0.0001
     if epoch == 0:
         return 0.0002
     elif epoch == 1:
