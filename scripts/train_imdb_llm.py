@@ -164,6 +164,9 @@ def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_fil
         frequency=100,
     )
 
+    lr_scheduler = keras.callbacks.LearningRateScheduler(static_lr_schedule)
+
+
     logs_dir = create_logs_dir(name_prefix=name_prefix)
     tensorboard_callback = TensorBoardBatchLogger(log_dir=str(logs_dir), update_freq=5)
     commit_changes_to_git_callback = CommitChangesToGitCallback(logs_dir)
@@ -180,7 +183,8 @@ def get_callbacks(tokenizer, name_prefix, input_length, shared_buffer, model_fil
         tensorboard_callback,
         reconstruct_callback,
         keras.callbacks.TensorBoard('./logs', update_freq=5),
-        checkpoint_callback
+        checkpoint_callback,
+        lr_scheduler,
     ]
 
 
@@ -191,15 +195,12 @@ def static_lr_schedule(epoch, lr):
         return 0.0001
     elif epoch == 2:
         return 0.00005
+    else:
+        return lr
 
 
 def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epochs, callbacks):
     initial_learning_rate = 0.0001
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=initial_learning_rate,
-        decay_steps=steps_per_epoch * num_epochs,
-        alpha=0.0
-    )
 
     # Get the padding token index from the tokenizer
     pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
@@ -215,7 +216,7 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
 
     print("\n> Compiling model\n")
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+        optimizer=keras.optimizers.Adam(learning_rate=initial_learning_rate),
         loss=loss_fn,
         metrics=['accuracy'],
     )
