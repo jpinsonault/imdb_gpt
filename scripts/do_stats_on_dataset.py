@@ -17,7 +17,7 @@ def do_stats_on_dataset(files_by_types):
             lines = f.readlines()
             for line in lines:
                 line_dict = json.loads(line)
-                result_len = len(line_dict['result'])
+                result_len = len(line_dict['title'])
                 length_counts[result_len] += 1
 
     print("length_counts", length_counts)
@@ -28,10 +28,6 @@ if __name__ == '__main__':
 
     files_by_types = [
         "movie.jsonl",
-        "tvSeries.jsonl",
-        "episode.jsonl",
-        "person.jsonl",
-        "character.jsonl",
     ]
 
     do_stats_on_dataset(files_by_types)
