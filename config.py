@@ -18,7 +18,7 @@ project_config = {
     'llm': {
         'input_length': 48,
         'character_embedding_dim': 256,
-        'epochs': 4,
+        'epochs': 100,
         'batches': 3000,
         'batch_size': 512,
         'num_heads': 8,

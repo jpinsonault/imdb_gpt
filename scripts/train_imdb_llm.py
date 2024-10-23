@@ -20,6 +20,7 @@ import tensorflow as tf
 from collections import deque
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.models import load_model
+from tensorflow.keras.regularizers import l2
 
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -668,6 +669,7 @@ def transformer_encoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 
 
 def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
+    weight_decay = 1e-5
     model_dim = input.shape[-1]
     key_dim = model_dim // 4 // num_heads  # Ensure key_dim divides model_dim evenly
 
@@ -685,8 +687,8 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 
     # Pre-Layer Normalization before Feed-Forward Network
     norm_attention_output = layers.LayerNormalization(epsilon=1e-6)(attention_output)
-    ff_output = layers.Dense(ff_dim, activation='gelu')(norm_attention_output)
-    ff_output = layers.Dense(model_dim, activation='gelu')(ff_output)
+    ff_output = layers.Dense(ff_dim, activation='gelu', kernel_regularizer=l2(weight_decay))(norm_attention_output)
+    ff_output = layers.Dense(model_dim, activation='gelu', kernel_regularizer=l2(weight_decay))(ff_output)
     ff_output = layers.Dropout(dropout_rate)(ff_output)
     ff_output = layers.Add()([ff_output, attention_output])  # Residual connection
 
@@ -697,28 +699,36 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 #-------------------------------------------------------------------------------------------------------------------------------------
 #......................................................................................................................................
 
+
+
+
 def kermit_language_model(input_length, alphabet_size, character_embedding_dim, num_heads, dropout_rate=0.0):
+    weight_decay = 1e-5
     num_decoder_blocks = 8
 
     inputs = Input(shape=(input_length,), dtype=tf.int32)
     embedding = Embedding(input_dim=alphabet_size, output_dim=character_embedding_dim*2)(inputs)
 
-    reduced_to_half = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(embedding)
-    reduced_to_quarter = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(reduced_to_half)
+    reduced_to_half = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu',
+                                    kernel_regularizer=l2(weight_decay))(embedding)
+    reduced_to_quarter = layers.Conv1D(character_embedding_dim, 3, strides=2, padding='same', activation='gelu',
+                                       kernel_regularizer=l2(weight_decay))(reduced_to_half)
     reduced_to_quarter = layers.LayerNormalization()(reduced_to_quarter)
 
     x = reduced_to_quarter
     for _ in range(num_decoder_blocks):
         x = transformer_decoder_block(x, num_heads, ff_dim=character_embedding_dim, dropout_rate=dropout_rate)
 
-    back_to_half = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu')(x)
+    back_to_half = layers.Conv1DTranspose(character_embedding_dim, 3, strides=2, padding='same', activation='gelu',
+                                          kernel_regularizer=l2(weight_decay))(x)
     back_to_half = layers.Add()([back_to_half, reduced_to_half])
 
-    back_to_full = layers.Conv1DTranspose(character_embedding_dim*2, 3, strides=2, padding='same', activation='gelu')(back_to_half)
+    back_to_full = layers.Conv1DTranspose(character_embedding_dim*2, 3, strides=2, padding='same', activation='gelu',
+                                          kernel_regularizer=l2(weight_decay))(back_to_half)
     back_to_full = layers.Add()([back_to_full, embedding])
 
     # Final output layer
-    outputs = layers.Dense(alphabet_size, activation='softmax')(back_to_full)
+    outputs = layers.Dense(alphabet_size, activation='softmax', kernel_regularizer=l2(weight_decay))(back_to_full)
 
     model = Model(inputs=inputs, outputs=outputs, name="transformer_autoencoder_with_alibi_attention")
     return model
