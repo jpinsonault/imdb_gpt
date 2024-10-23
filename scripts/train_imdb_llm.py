@@ -99,6 +99,8 @@ def character_llm_training(config, name_prefix):
     total_samples = calculate_steps_per_epoch(jsonl_files, tokenizer)
     steps_per_epoch = total_samples // batch_size
 
+    print(f"steps_per_epoch: {total_samples} // {batch_size} = {steps_per_epoch}")
+
     # Define the checkpoint path (modify to include parameters if needed)
     checkpoint_dir = data_dir / "checkpoints" / f"input{input_length}_embed{character_embedding_dim}_batch{batch_size}_epochs{num_epochs}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
