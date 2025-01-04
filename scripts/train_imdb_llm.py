@@ -210,13 +210,7 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
     pad_token_index = tokenizer.char_to_index[SPECIAL_PAD]
 
     # Instantiate the custom loss function with digit position awareness
-    loss_fn = WeightedLossWithDigitPosition(
-        pad_token_index=pad_token_index,
-        tokenizer=tokenizer,
-        min_weight=0.1,  # You can configure these values
-        max_weight=1.0,
-        pad_weight=0.1
-    )
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
     print("\n> Compiling model\n")
     model.compile(
@@ -234,109 +228,6 @@ def compile_and_train_model(model, tokenizer, dataset, steps_per_epoch, num_epoc
         epochs=num_epochs,
         callbacks=callbacks
     )
-
-
-class WeightedLossWithDigitPosition(tf.keras.losses.Loss):
-    def __init__(self, pad_token_index, tokenizer, min_weight=0.5, max_weight=1.5, pad_weight=0.1, **kwargs):
-        super().__init__(**kwargs)
-        self.pad_token_index = pad_token_index
-        self.pad_weight = pad_weight
-        self.min_weight = min_weight
-        self.max_weight = max_weight
-        self.tokenizer = tokenizer
-
-        # Precompute the digit indices for quick lookup
-        self.digit_indices = np.array([tokenizer.char_to_index.get(str(d)) for d in range(10)], dtype=np.int32)
-        self.pad_token_index_np = np.array(pad_token_index, dtype=np.int32)
-
-    def call(self, y_true, y_pred):
-        # Compute the standard sparse categorical cross-entropy loss
-        loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
-
-        # Compute the weights
-        weights = self.compute_weights(y_true)
-
-        # Apply the weights to the loss
-        weighted_loss = loss * weights
-
-        # Return the mean loss over the batch
-        return tf.reduce_mean(weighted_loss)
-
-    def compute_weights(self, y_true):
-        # y_true shape: [batch_size, sequence_length]
-        weights = tf.numpy_function(self.compute_weights_batch_np, [y_true], tf.float32)
-        weights.set_shape(y_true.shape)
-        return weights
-
-    def compute_weights_batch_np(self, y_true_np):
-        # y_true_np: numpy array of shape [batch_size, sequence_length]
-        batch_size, sequence_length = y_true_np.shape
-        weights_batch = np.ones_like(y_true_np, dtype=np.float32)
-
-        for batch_idx in range(batch_size):
-            y_seq = y_true_np[batch_idx]
-            weights_seq = self.compute_sequence_weights_np(y_seq)
-            weights_batch[batch_idx] = weights_seq
-
-        return weights_batch
-
-    def compute_sequence_weights_np(self, y_seq_np):
-        # y_seq_np: numpy array of shape [sequence_length]
-        sequence_length = len(y_seq_np)
-        weights_seq = np.ones(sequence_length, dtype=np.float32)
-
-        is_digit_seq = np.isin(y_seq_np, self.digit_indices)
-        in_number = False
-        digit_positions = []
-
-        for i in range(sequence_length):
-            is_digit = is_digit_seq[i]
-            if is_digit:
-                if not in_number:
-                    in_number = True
-                    digit_positions = []
-                digit_positions.append(i)
-            else:
-                if in_number:
-                    self.assign_weights_to_digits(weights_seq, digit_positions)
-                    in_number = False
-        # Handle last number if sequence ends with digits
-        if in_number:
-            self.assign_weights_to_digits(weights_seq, digit_positions)
-
-        # Apply pad weight
-        pad_mask = (y_seq_np == self.pad_token_index_np).astype(np.float32)
-        weights_seq = weights_seq * (1 - pad_mask) + self.pad_weight * pad_mask
-
-        return weights_seq
-
-    def assign_weights_to_digits(self, weights_seq, digit_positions):
-        number_length = len(digit_positions)
-        positions_in_number = np.arange(number_length, dtype=np.float32)
-        if number_length > 1:
-            normalized_positions = positions_in_number / (number_length - 1)
-        else:
-            normalized_positions = np.array([0.0], dtype=np.float32)
-
-        # Compute weights for each digit position
-        weights = self.min_weight + (self.max_weight - self.min_weight) * normalized_positions
-
-
-        # Assign weights to the respective positions
-        for idx, pos in enumerate(digit_positions):
-            weights_seq[pos] = weights[idx]
-
-    def get_config(self):
-        # Return a configuration dictionary that can be used for serialization
-        config = super().get_config()
-        config.update({
-            'pad_token_index': self.pad_token_index,
-            'pad_weight': self.pad_weight,
-            'min_weight': self.min_weight,
-            'max_weight': self.max_weight,
-        })
-        return config
-
 
 
 def create_logs_dir(name_prefix):
@@ -698,7 +589,6 @@ def transformer_decoder_block(input, num_heads, ff_dim, dropout_rate=0.1):
 ######################################################################################################################################
 #-------------------------------------------------------------------------------------------------------------------------------------
 #......................................................................................................................................
-
 
 
 

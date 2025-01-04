@@ -31,16 +31,22 @@ def take_upto(iterable, n):
             break
         yield item
 
+ALLOWED_GENRES = {
+    'Drama', 'Comedy', 'Documentary', 'Romance', 'Action', 'Crime', 'Thriller', 'Horror', 
+    'Adventure', 'Mystery', 'Family', 'Biography', 'Fantasy', 'History', 'Music', 'Unknown', 'Sci-Fi', 'Musical',
+    'War', 'Western', 'Animation', 'Adult', 'Sport', 'Film-Noir', 'News',
+}
+
+ALLOWED_JOBS = {
+    'actor', 'actress', 'producer', 'writer', 'director', 'cinematographer', 'animation_department', 'composer',
+}
 
 def save_datasets(db_path, output_dir, max_input_length):
-    # Connect to the database
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Load dictionaries for tconst and nconst lookups
     tconst_to_title, nconst_to_name = load_dictionaries(cursor)
 
-    # Corrected queries to extract entities and their types
     queries = {
         'movie': """
             SELECT m.tconst, m.title, m.year, m.genres, m.rating, m.numVotes, m.isAdult, m.runtimeMinutes
@@ -60,25 +66,25 @@ def save_datasets(db_path, output_dir, max_input_length):
         """
     }
 
-    # Create output directory if it does not exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Sets to track valid shows, movies, and people
     included_shows = set()
     included_movies = set()
     included_people = set()
 
-    # Updated filtered_counts to correctly track counts per exclusion reason and entity type
     filtered_counts = {
-        'json_too_long': defaultdict(int),
         'not_enough_votes': defaultdict(int),
         'not_known_for_anything': defaultdict(int),
         'person_not_in_included_title': defaultdict(int),
         'character_not_in_included_title_or_person': defaultdict(int),
         'missing_year_or_votes': defaultdict(int),
+        'genre_whitelist_excluded': defaultdict(int),
+        'job_whitelist_excluded': defaultdict(int),
     }
 
-    # Process each entity type
+    # Track how many rows we actually keep
+    saved_counts = defaultdict(int)
+
     for entity_type, query in queries.items():
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -87,9 +93,7 @@ def save_datasets(db_path, output_dir, max_input_length):
 
         with open(output_file, 'w', encoding='utf-8') as f:
             for row in tqdm(rows, desc=f"Processing {entity_type}"):
-                # Filter out titles without years or with fewer than 10 votes
                 if entity_type in ['movie', 'tvSeries']:
-                    # Adjusted indices based on entity_type
                     if entity_type == 'movie':
                         year = row[2]  # m.year
                         votes = row[5]  # m.numVotes
@@ -97,40 +101,32 @@ def save_datasets(db_path, output_dir, max_input_length):
                         year = row[2]  # s.startYear
                         votes = row[6]  # s.numVotes
 
-                    # Check for missing year and votes
                     if year is None or votes is None:
                         filtered_counts['missing_year_or_votes'][entity_type] += 1
                         continue
-
                     if votes < 10:
                         filtered_counts['not_enough_votes'][entity_type] += 1
                         continue
 
-                    # Add valid movies and shows to the corresponding sets
                     if entity_type == 'movie':
-                        included_movies.add(row[0])  # Add tconst of the movie to the set
-                    elif entity_type == 'tvSeries':
-                        included_shows.add(row[0])  # Add tconst of the show to the set
+                        included_movies.add(row[0])
+                    else:
+                        included_shows.add(row[0])
 
-                # Check if person's known titles are in included movies or shows
                 if entity_type == 'person':
-                    known_tconsts = row[5]
+                    known_tconsts = row[5]  # p.knownForTitles
                     if known_tconsts is None:
                         filtered_counts['not_known_for_anything'][entity_type] += 1
                         continue
-
                     known_tconsts = known_tconsts.split(',')
-                    # Filter based on tconsts
                     if not any(tconst in included_movies or tconst in included_shows for tconst in known_tconsts):
                         filtered_counts['person_not_in_included_title'][entity_type] += 1
                         continue
-                    included_people.add(row[0])  # Add nconst of the person to the set
-                    # Resolve the titles using the lookup dictionary
+                    included_people.add(row[0])
                     resolved_titles = [tconst_to_title.get(tconst, 'Unknown') for tconst in known_tconsts]
-                    row = list(row)  # Convert to a mutable list
-                    row[5] = ', '.join(take_upto(resolved_titles, 2))  # Update knownForTitles with resolved titles
+                    row = list(row)
+                    row[5] = ', '.join(take_upto(resolved_titles, 2))
 
-                # Check if character's tconst or nconst are in included movies or people
                 if entity_type == 'character':
                     if row[0] not in included_movies and row[0] not in included_shows:
                         filtered_counts['character_not_in_included_title_or_person'][entity_type] += 1
@@ -139,61 +135,90 @@ def save_datasets(db_path, output_dir, max_input_length):
                         filtered_counts['character_not_in_included_title_or_person'][entity_type] += 1
                         continue
 
-                # Construct the data dictionary
                 if entity_type == 'movie':
-                    genres = row[3].replace(',', ', ') if row[3] is not None else 'Unknown'
+                    genres = row[3].split(',') if row[3] is not None else []
+                    filtered_genres = [g for g in genres if g in ALLOWED_GENRES]
+                    if not filtered_genres:
+                        filtered_counts['genre_whitelist_excluded'][entity_type] += 1
+                        continue
                     data = {
-                        'type': 'movie', 'tconst': row[0], 'title': row[1], 'year': row[2], 'genres': genres,
-                        'rating': row[4], 'votes': row[5], 'adult': row[6], 'runtime': row[7]
+                        'type': 'movie',
+                        'tconst': row[0],
+                        'title': row[1],
+                        'year': row[2],
+                        'genres': filtered_genres,
+                        'rating': row[4],
+                        'votes': row[5],
+                        'adult': row[6],
+                        'runtime': row[7]
                     }
+
                 elif entity_type == 'tvSeries':
-                    genres = row[4].replace(',', ', ') if row[4] is not None else 'Unknown'
+                    genres = row[4].split(',') if row[4] is not None else []
+                    filtered_genres = [g for g in genres if g in ALLOWED_GENRES]
+                    if not filtered_genres:
+                        filtered_counts['genre_whitelist_excluded'][entity_type] += 1
+                        continue
                     data = {
-                        'type': 'tvSeries', 'tconst': row[0], 'title': row[1], 'start': row[2],
-                        'end': row[3], 'genres': genres, 'rating': row[5], 'votes': row[6],
-                        'adult': row[7], 'runtime': row[8]
+                        'type': 'tvSeries',
+                        'tconst': row[0],
+                        'title': row[1],
+                        'start': row[2],
+                        'end': row[3],
+                        'genres': filtered_genres,
+                        'rating': row[5],
+                        'votes': row[6],
+                        'adult': row[7],
+                        'runtime': row[8]
                     }
+
                 elif entity_type == 'person':
                     knownForTitles = row[5].split(', ')
-                    primaryProfession = row[4].replace(',', ', ') if row[4] is not None else 'Unknown'
+                    jobs = row[4].split(',') if row[4] is not None else []
+                    filtered_jobs = [j for j in jobs if j in ALLOWED_JOBS]
+                    if not filtered_jobs:
+                        filtered_counts['job_whitelist_excluded'][entity_type] += 1
+                        continue
                     data = {
-                        'type': 'person', 'nconst': row[0], 'name': row[1], 'birth': row[2],
-                        'death': row[3], 'jobs': primaryProfession, 'knownFor': knownForTitles
+                        'type': 'person',
+                        'nconst': row[0],
+                        'name': row[1],
+                        'birth': row[2],
+                        'death': row[3],
+                        'jobs': filtered_jobs,
+                        'knownFor': knownForTitles
                     }
-                elif entity_type == 'character':
+
+                else:  # entity_type == 'character'
                     title = tconst_to_title.get(row[0], 'Unknown')
                     data = {
-                        'type': 'character', 'tconst': row[0], 'nconst': row[1],
-                        'name': row[2], 'inTitle': title, 'category': row[4]
+                        'type': 'character',
+                        'tconst': row[0],
+                        'nconst': row[1],
+                        'name': row[2],
+                        'inTitle': title,
+                        'category': row[4]
                     }
 
-                # Remove empty or None values for a cleaner output
-                data = {k: v for k, v in data.items() if v not in (None, '', '\\\\N')}
+                data = {k: v for k, v in data.items() if v not in (None, '', '\\\\N', [], ['Unknown'])}
 
-                # Serialize the data to JSON
                 json_record = json.dumps(data, ensure_ascii=False)
-
-                # Check if JSON record exceeds max_input_length
-                if len(json_record) > max_input_length:
-                    filtered_counts['json_too_long'][entity_type] += 1
-                    continue
-
-                # Write the JSON object to file
                 f.write(json_record + '\n')
+                saved_counts[entity_type] += 1
 
-    # Optionally, print or log the filtered_counts for analysis
     print("Filtered counts per exclusion reason and entity type:")
     for reason, counts in filtered_counts.items():
         print(f"\nReason: {reason}")
-        for entity_type, count in counts.items():
-            print(f"  {entity_type}: {count}")
+        for etype, cnum in counts.items():
+            print(f"  {etype}: {cnum}")
 
-    # Close the database connection
+    print("\nRows saved for each entity type:")
+    for etype, cnum in saved_counts.items():
+        print(f"  {etype}: {cnum}")
+
     conn.close()
-
 
 if __name__ == '__main__':
     data_dir = Path(project_config['data_dir'])
     max_input_length = int(project_config['llm']['input_length'])
-    
     save_datasets(data_dir / 'imdb.db', data_dir, max_input_length)

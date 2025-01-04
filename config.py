@@ -1,4 +1,4 @@
-from pathlib import Path
+# config.py
 
 
 project_config = {
@@ -23,4 +23,11 @@ project_config = {
         'batch_size': 512,
         'num_heads': 8,
     },
+    'autoencoder': {
+        'latent_dim': 192,
+        'batch_size': 512,
+        'epochs': 20,
+        'movies_file': 'movie.jsonl',
+        'callback_interval': 50,
+    }
 }

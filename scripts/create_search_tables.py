@@ -1,3 +1,5 @@
+# create_search_tables.py
+
 import json
 from pathlib import Path
 import sqlite3
