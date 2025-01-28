@@ -41,8 +41,7 @@ class RowAutoencoder:
     def row_generator(self, db_path: str):
         raise NotImplementedError("Subclasses must implement this method")
 
-    @cached_property
-    def build_fields() -> List[BaseField]:
+    def build_fields(self) -> List[BaseField]:
         raise NotImplementedError("Subclasses must implement this method")
 
     def _build_model(self):
@@ -95,3 +94,7 @@ class RowAutoencoder:
             name="TabularAutoencoder"
         )
         return autoencoder
+
+
+class TableJoinSequenceEncoder:
+    pass

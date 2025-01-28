@@ -125,8 +125,7 @@ def populate_titles_and_genres(conn):
         endYear,
         runtimeMinutes,
         averageRating,
-        numVotes,
-        genres
+        numVotes
     )
     SELECT
         b.tconst,
@@ -138,19 +137,9 @@ def populate_titles_and_genres(conn):
         b.endYear,
         b.runtimeMinutes,
         r.averageRating,
-        r.numVotes,
-        GROUP_CONCAT(g.genre, ',') AS genres
+        r.numVotes
     FROM raw_title_basics b
-    LEFT JOIN raw_title_ratings r ON b.tconst = r.tconst
-    LEFT JOIN title_genres g ON b.tconst = g.tconst
-    WHERE b.startYear IS NOT NULL 
-    AND r.averageRating IS NOT NULL
-    AND b.runtimeMinutes IS NOT NULL
-    AND b.runtimeMinutes >= 5
-    AND b.startYear >= 1850
-    AND r.numVotes >= 10
-    GROUP BY b.tconst
-    HAVING COUNT(g.genre) > 0;
+    LEFT JOIN raw_title_ratings r ON b.tconst = r.tconst;
     """
     conn.execute(insert_titles)
 

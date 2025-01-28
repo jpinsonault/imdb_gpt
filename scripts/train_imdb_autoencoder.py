@@ -9,6 +9,7 @@ from config import project_config
 from autoencoder.imdb_row_autoencoders import TitlesAutoencoder
 
 
+
 def main():
     config = project_config["autoencoder"]
     data_dir = Path(project_config["data_dir"])
@@ -16,6 +17,8 @@ def main():
     
     titles_autoencoder = TitlesAutoencoder(config, db_path)
     titles_autoencoder.fit()
+
+    credits_sequence_encoder = 
 
 
 if __name__ == "__main__":

@@ -25,7 +25,6 @@ class TitlesAutoencoder(RowAutoencoder):
         self.model = None
         self.stats_accumulated = False
 
-    @cached_property
     def build_fields(self) -> List[BaseField]:
         return [
             MultiCategoryField("titleType"),
@@ -53,29 +52,25 @@ class TitlesAutoencoder(RowAutoencoder):
                     GROUP_CONCAT(g.genre, ',') AS genres
                 FROM titles t
                 LEFT JOIN title_genres g ON t.tconst = g.tconst
+                WHERE t.startYear IS NOT NULL 
+                AND t.averageRating IS NOT NULL
+                AND t.runtimeMinutes IS NOT NULL
+                AND t.runtimeMinutes >= 5
+                AND t.startYear >= 1850
                 GROUP BY t.tconst
+                HAVING COUNT(g.genre) > 0
+                AND t.numVotes >= 10
             """)
             for row in c:
-                (
-                    titleType,
-                    primaryTitle,
-                    startYear,
-                    endYear,
-                    runtimeMinutes,
-                    averageRating,
-                    numVotes,
-                    genres_str
-                ) = row
-
                 yield {
-                    "titleType": titleType,
-                    "primaryTitle": primaryTitle,
-                    "startYear": startYear,
-                    "endYear": endYear,
-                    "runtimeMinutes": runtimeMinutes,
-                    "averageRating": averageRating,
-                    "numVotes": numVotes,
-                    "genres": genres_str.split(',') if genres_str else []
+                    "titleType": row[0],
+                    "primaryTitle": row[1],
+                    "startYear": row[2],
+                    "endYear": row[3],
+                    "runtimeMinutes": row[4],
+                    "averageRating": row[5],
+                    "numVotes": row[6],
+                    "genres": row[7].split(',') if row[7] else []
                 }
     
     def accumulate_stats(self, db_path: Path):

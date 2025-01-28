@@ -601,13 +601,13 @@ class MultiCategoryField(BaseField):
         if self.optional:
             vec_part = predicted_array[:-1]
             is_null_part = predicted_array[-1]
-            if is_null_part > 0.5:
+            if is_null_part > 0.4:
                 return "None"
             probs = vec_part
         else:
             probs = predicted_array
 
-        threshold = 0.5
+        threshold = 0.4
         # detailed debug print of probabilities
         for i, p in enumerate(probs):
             print(f"{self.category_list[i]}: {p:.3f}")
