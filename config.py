@@ -26,6 +26,7 @@ project_config = {
     'autoencoder': {
         'latent_dim': 192,
         'batch_size': 512,
+        'learning_rate': 0.00005,
         'epochs': 20,
         'movies_file': 'movie.jsonl',
         'callback_interval': 50,
