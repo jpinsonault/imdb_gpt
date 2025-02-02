@@ -1,6 +1,9 @@
 # schema.py
 from prettytable import PrettyTable
 from typing import List, Dict
+
+from tqdm import tqdm
+
 from .fields import BaseField
 import tensorflow as tf
 from functools import cached_property
@@ -8,6 +11,19 @@ from functools import cached_property
 class RowAutoencoder:
     def __init__(self):
         self.fields = self.build_fields()
+
+    def accumulate_stats(self):
+        if self.stats_accumulated:
+            print("stats already accumulated")
+            return
+
+        print("Accumulating stats...")
+        for row in tqdm(self.row_generator(), desc="Accumulating stats"):
+            self.accumulate_stats_for_row(row)
+
+        self.finalize_stats()
+        self.print_stats()
+        self.stats_accumulated = True
 
     def accumulate_stats_for_row(self, row: Dict):
         for f in self.fields:
@@ -29,16 +45,14 @@ class RowAutoencoder:
         return {f"{f.name}_decoder": f.loss for f in self.fields}
 
     def get_loss_weights_dict(self) -> Dict[str, float]:
-        # If you wanted per-field weighting:
         return {f"{f.name}_decoder": 1.0 for f in self.fields}
 
-    # New: print stats for each field
     def print_stats(self):
         for f in self.fields:
             f.print_stats()
-            print()  # Blank line for spacing
+            print()
 
-    def row_generator(self, db_path: str):
+    def row_generator(self):
         raise NotImplementedError("Subclasses must implement this method")
 
     def build_fields(self) -> List[BaseField]:
@@ -97,4 +111,25 @@ class RowAutoencoder:
 
 
 class TableJoinSequenceEncoder:
-    pass
+    def __init__(self, db_path, from_table_schema: RowAutoencoder, to_table_schema: RowAutoencoder):
+        self.from_table_schema = from_table_schema
+        self.to_table_schema = to_table_schema
+        self.db_path = db_path
+        self.stats_accumulated = False
+
+    def accumulate_stats(self):
+        if self.stats_accumulated:
+            print("stats already accumulated")
+            return
+
+        self.from_table_schema.accumulate_stats()
+        self.to_table_schema.accumulate_stats()
+
+        self.stats_accumulated = True
+
+    def row_generator(self):
+        raise NotImplementedError("Subclasses must implement this method")
+    
+    def build_model(self):
+        # lstm
+        pass

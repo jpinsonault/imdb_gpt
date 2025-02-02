@@ -18,8 +18,6 @@ def main():
     titles_autoencoder = TitlesAutoencoder(config, db_path)
     titles_autoencoder.fit()
 
-    credits_sequence_encoder = 
-
 
 if __name__ == "__main__":
     try:

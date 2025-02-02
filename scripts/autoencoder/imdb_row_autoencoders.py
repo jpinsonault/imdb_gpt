@@ -1,11 +1,8 @@
-from functools import cached_property
 from typing import Any, Dict, List
 from pathlib import Path
 import sqlite3
 import tensorflow as tf
 from contextlib import redirect_stdout
-from tqdm import tqdm
-from prettytable import PrettyTable
 from autoencoder.schema import RowAutoencoder
 from autoencoder.fields import (
     TextField,
@@ -24,6 +21,7 @@ class TitlesAutoencoder(RowAutoencoder):
         self.db_path = db_path
         self.model = None
         self.stats_accumulated = False
+        
 
     def build_fields(self) -> List[BaseField]:
         return [
@@ -37,8 +35,8 @@ class TitlesAutoencoder(RowAutoencoder):
             MultiCategoryField("genres")
         ]
 
-    def row_generator(self, db_path: Path):
-        with sqlite3.connect(db_path, check_same_thread=False) as conn:
+    def row_generator(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             c = conn.cursor()
             c.execute("""
                 SELECT 
@@ -72,19 +70,6 @@ class TitlesAutoencoder(RowAutoencoder):
                     "numVotes": row[6],
                     "genres": row[7].split(',') if row[7] else []
                 }
-    
-    def accumulate_stats(self, db_path: Path):
-        if self.stats_accumulated:
-            print("stats already accumulated")
-            return
-
-        print("Accumulating stats...")
-        for row in tqdm(self.row_generator(db_path), desc="Accumulating stats"):
-            self.accumulate_stats_for_row(row)
-
-        self.finalize_stats()
-        self.print_stats()
-        self.stats_accumulated = True
 
     def _print_model_architecture(self):
         print("\n--- Field Encoder/Decoder Summaries ---")
@@ -103,7 +88,7 @@ class TitlesAutoencoder(RowAutoencoder):
 
     def _build_dataset(self, db_path: Path) -> tf.data.Dataset:
         def db_generator():
-             for row_dict in self.row_generator(self.db_path):
+             for row_dict in self.row_generator():
                 x = tuple(f.transform(row_dict.get(f.name)) for f in self.fields)
                 yield x, x
 
@@ -115,8 +100,7 @@ class TitlesAutoencoder(RowAutoencoder):
         return ds.batch(self.config["batch_size"])
 
     def fit(self):
-        if not self.stats_accumulated:
-             self.accumulate_stats(self.db_path)
+        self.accumulate_stats()
         
         self._build_model()
         self._print_model_architecture()
@@ -146,7 +130,7 @@ class TitlesAutoencoder(RowAutoencoder):
             interval_batches=self.config["callback_interval"],
             row_autoencoder=self,
             db_path=self.db_path,
-            num_samples=5
+            num_samples=20
         )
 
         ds = self._build_dataset(self.db_path)

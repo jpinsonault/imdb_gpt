@@ -608,16 +608,12 @@ class MultiCategoryField(BaseField):
             probs = predicted_array
 
         threshold = 0.4
-        # detailed debug print of probabilities
-        for i, p in enumerate(probs):
-            print(f"{self.category_list[i]}: {p:.3f}")
-
 
         selected = []
         for i, p in enumerate(probs):
             if p >= threshold:
                 selected.append(self.category_list[i])
-        return ",".join(selected) if selected else "(none)"
+        return ', '.join(selected) if selected else "(none)"
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(len(self.category_list),), name=f"{self.name}_input", dtype=self.input_dtype)
@@ -638,7 +634,7 @@ class MultiCategoryField(BaseField):
 
     def print_stats(self):
         t = PrettyTable([f"MultiCategory Field", self.name])
-        t.add_row(["# unique categories", len(self.category_list)])
-        if len(self.category_list) < 10:
-            t.add_row(["Categories", ", ".join(self.category_list)])
+        t.add_row(["Unique categories", len(self.category_list)])
+        for i, c in enumerate(self.category_list):
+            t.add_row([i, c])
         print(t)

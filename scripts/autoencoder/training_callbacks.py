@@ -7,18 +7,15 @@ from .schema import RowAutoencoder
 from .fields import BaseField
 
 class ReconstructionCallback(tf.keras.callbacks.Callback):
-    def __init__(self, interval_batches, row_autoencoder, db_path, num_samples=5):
+    def __init__(self, interval_batches, row_autoencoder: RowAutoencoder, db_path, num_samples=5):
         super().__init__()
         self.interval_batches = interval_batches
         self.row_autoencoder = row_autoencoder
         self.db_path = db_path
         self.num_samples = num_samples
 
-        # Grab up to 5000 rows, sample 'num_samples' from them for reconstructions
         all_rows = []
-        for idx, row_dict in enumerate(row_autoencoder.row_generator(db_path)):
-            if idx >= 50000:
-                break
+        for idx, row_dict in enumerate(row_autoencoder.row_generator()):
             all_rows.append(row_dict)
         self.samples = random.sample(all_rows, min(num_samples, len(all_rows)))
 
@@ -63,12 +60,13 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
                 reconstructed_row[field.name] = reconstructed_str
                 original_value = row_dict.get(field.name, "N/A")
                 if isinstance(original_value, list):
-                    original_value = ",".join(original_value)
+                    original_value = ", ".join(original_value)
                 table.add_row([
                     field.name,
                     original_value,
                     reconstructed_str
                 ])
+
 
             print(table)
             table.clear_rows()
