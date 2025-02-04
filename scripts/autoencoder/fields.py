@@ -117,6 +117,10 @@ class BaseField(abc.ABC):
     def loss(self):
         return self._get_loss()
 
+    @property
+    def weight(self):
+        return self._get_weight()
+
     def accumulate_stats(self, raw_value):
         self._accumulate_stats(raw_value)
 
@@ -146,6 +150,9 @@ class BaseField(abc.ABC):
     @abc.abstractmethod
     def _get_loss(self):
         pass
+
+    def _get_weight(self):
+        return 1.0
 
     @abc.abstractmethod
     def _accumulate_stats(self, raw_value):
@@ -424,6 +431,9 @@ class TextField(BaseField):
             masked_loss = loss * mask
             return tf.reduce_sum(masked_loss) / tf.reduce_sum(mask)
         return masked_sparse_categorical_crossentropy
+    
+    def _get_weight(self):
+        return 2.0
 
     def _accumulate_stats(self, raw_value):
         if raw_value:
@@ -616,7 +626,7 @@ class MultiCategoryField(BaseField):
         return ', '.join(selected) if selected else "(none)"
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
-        inp = tf.keras.Input(shape=(len(self.category_list),), name=f"{self.name}_input", dtype=self.input_dtype)
+        inp = tf.keras.Input(shape=self.input_shape, name=f"{self.name}_input", dtype=self.input_dtype)
         x = Dense(32, activation='gelu')(inp)
         x = LayerNormalization()(x)
         x = Dense(32, activation='gelu')(x)
@@ -629,7 +639,8 @@ class MultiCategoryField(BaseField):
         x = LayerNormalization()(x)
         x = Dense(32, activation='gelu')(x)
         x = LayerNormalization()(x)
-        out = Dense(len(self.category_list), activation='sigmoid', name=f"{self.name}_decoder")(x)
+        # Note: Use self.output_shape to account for the optional extra element.
+        out = Dense(self.output_shape[0], activation='sigmoid', name=f"{self.name}_decoder")(x)
         return tf.keras.Model(inp, out, name=f"{self.name}_decoder")
 
     def print_stats(self):

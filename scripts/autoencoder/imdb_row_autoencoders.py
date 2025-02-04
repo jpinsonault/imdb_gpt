@@ -110,11 +110,13 @@ class TitlesAutoencoder(RowAutoencoder):
             self._print_model_architecture()
 
         print(f"Loss dict: {self.get_loss_dict()}")
+        print(f"Loss weights dict: {self.get_loss_weights_dict()}")
 
         learning_rate = 0.00005
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
             loss=self.get_loss_dict(),
+            loss_weights=self.get_loss_weights_dict()
         )
 
         # Callbacks
@@ -143,3 +145,117 @@ class TitlesAutoencoder(RowAutoencoder):
         )
         self.model.save("tabular_autoencoder.h5")
         print("\nTraining complete and model saved.")
+
+
+class PeopleAutoencoder(RowAutoencoder):
+    def __init__(self, config: Dict[str, Any], db_path: Path):
+        super().__init__()
+        self.config = config
+        self.db_path = db_path
+        self.model = None
+        self.stats_accumulated = False
+
+    def build_fields(self) -> List[BaseField]:
+        return [
+            TextField("primaryName"),
+            ScalarField("birthYear", scaling=Scaling.STANDARDIZE),
+            ScalarField("deathYear", scaling=Scaling.STANDARDIZE, optional=True), # optional as some people are still alive
+            MultiCategoryField("professions", optional=True) # optional as some might have no profession listed
+        ]
+
+    def row_generator(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT
+                    p.primaryName,
+                    p.birthYear,
+                    p.deathYear,
+                    GROUP_CONCAT(pp.profession, ',') AS professions
+                FROM people p
+                LEFT JOIN people_professions pp ON p.nconst = pp.nconst
+                WHERE p.birthYear IS NOT NULL  -- Filter out people without birth years
+                GROUP BY p.nconst
+            """)
+            for row in c:
+                yield {
+                    "primaryName": row[0],
+                    "birthYear": row[1],
+                    "deathYear": row[2],
+                    "professions": row[3].split(',') if row[3] else []
+                }
+
+    def _print_model_architecture(self):
+        print("\n--- Field Encoder/Decoder Summaries ---")
+        for field in self.fields:
+            encoder = field.build_encoder(latent_dim=self.config["latent_dim"])
+            print(f"\nEncoder: {field.name}")
+            encoder.summary()
+
+            decoder = field.build_decoder(latent_dim=self.config["latent_dim"])
+            print(f"\nDecoder: {field.name}")
+            decoder.summary()
+
+        print("--- Main Autoencoder Summary ---")
+        self.model.summary()
+        print("Model Outputs:", self.model.output_names)
+
+    def _build_dataset(self, db_path: Path) -> tf.data.Dataset:
+        def db_generator():
+             for row_dict in self.row_generator():
+                x = tuple(f.transform(row_dict.get(f.name)) for f in self.fields)
+                yield x, x
+
+        # Define the signature for tf.data
+        specs_in = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in self.fields)
+        specs_out = tuple(tf.TensorSpec(shape=f.output_shape, dtype=tf.float32) for f in self.fields)
+
+        ds = tf.data.Dataset.from_generator(db_generator, output_signature=(specs_in, specs_out))
+        return ds.batch(self.config["batch_size"])
+
+    def fit(self):
+        self.accumulate_stats()
+
+        self._build_model()
+        self._print_model_architecture()
+
+        # Write model summary to file (optional)
+        with redirect_stdout(open('logs/people_model_summary.txt', 'w')):
+            self._print_model_architecture()
+
+        print(f"Loss dict: {self.get_loss_dict()}")
+        print(f"Loss weights dict: {self.get_loss_weights_dict()}")
+
+        learning_rate = 0.00005
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss=self.get_loss_dict(),
+            loss_weights=self.get_loss_weights_dict()
+        )
+
+        # Callbacks
+        log_dir = "logs/people_fit/" + str(int(tf.timestamp().numpy()))
+        os.makedirs(log_dir, exist_ok=True)
+        tensorboard_callback = tf.keras.callbacks.TensorBoard(
+            log_dir=log_dir,
+            histogram_freq=1,
+            embeddings_freq=1,
+            update_freq=self.config["callback_interval"]
+        )
+        reconstruction_callback = ReconstructionCallback(
+            interval_batches=self.config["callback_interval"],
+            row_autoencoder=self,
+            db_path=self.db_path,
+            num_samples=20,
+        )
+
+        ds = self._build_dataset(self.db_path)
+
+        # Train
+        self.model.fit(
+            ds,
+            epochs=self.config["epochs"],
+            callbacks=[tensorboard_callback, reconstruction_callback]
+        )
+        self.model.save("people_autoencoder.h5")
+        print("\nTraining complete and people autoencoder model saved.")

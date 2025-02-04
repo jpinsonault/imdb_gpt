@@ -19,7 +19,7 @@ import os
 
 class TitlesToPrinciplesSequenceEncoder(TableJoinSequenceEncoder):
     def __init__(self, config: Dict[str, Any], db_path: Path):
-        super().__init__()
+        super().__init__(config, db_path, "titles", "principles")
         self.config = config
         self.db_path = db_path
         self.model = None
@@ -108,16 +108,17 @@ class TitlesToPrinciplesSequenceEncoder(TableJoinSequenceEncoder):
         self.build_model()
         self._print_model_architecture()
 
-        # Write model summary to file (optional)
         with redirect_stdout(open('logs/model_summary.txt', 'w')):
             self._print_model_architecture()
 
         print(f"Loss dict: {self.get_loss_dict()}")
+        print(f"Loss weights dict: {self.get_loss_weights_dict()}")  # Added line
 
         learning_rate = 0.00005
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
             loss=self.get_loss_dict(),
+            loss_weights=self.get_loss_weights_dict()  # Added loss weights
         )
 
         # Callbacks

@@ -51,7 +51,7 @@ class RowAutoencoder:
         return {f"{f.name}_decoder": f.loss for f in self.fields}
 
     def get_loss_weights_dict(self) -> Dict[str, float]:
-        return {f"{f.name}_decoder": 1.0 for f in self.fields}
+        return {f"{f.name}_decoder": f.weight for f in self.fields}
 
     def print_stats(self):
         for f in self.fields:
