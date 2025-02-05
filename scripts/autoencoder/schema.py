@@ -116,49 +116,6 @@ class RowAutoencoder:
         return autoencoder
 
 
-class UncertaintyWeightedAutoencoder(tf.keras.Model):
-    def __init__(self, row_autoencoder: RowAutoencoder, **kwargs):
-        super().__init__(**kwargs)
-        self.row_autoencoder = row_autoencoder
-        self.autoencoder = row_autoencoder.build_autoencoder()
-        self.uncertainties = {}
-        for field in self.row_autoencoder.fields:
-            key = f"{field.name}_decoder"
-            self.uncertainties[key] = tf.Variable(
-                0.0, trainable=True, dtype=tf.float32, name=f"{key}_uncertainty"
-            )
-
-    def call(self, inputs, training=False):
-        return self.autoencoder(inputs, training=training)
-
-    def train_step(self, data):
-        inputs, targets = data
-        with tf.GradientTape() as tape:
-            outputs = self(inputs, training=True)
-            total_loss = 0.0
-            loss_dict = self.row_autoencoder.get_loss_dict()
-            field_losses = {}
-
-            for i, field in enumerate(self.row_autoencoder.fields):
-                key = f"{field.name}_decoder"
-                loss_fn = loss_dict[key]
-                y_true = targets[i]
-                y_pred = outputs[i]
-
-                raw_loss = loss_fn(y_true, y_pred)
-                s = self.uncertainties[key]
-                weighted_loss = tf.exp(-s) * raw_loss + s
-                field_losses[key] = weighted_loss
-                total_loss += weighted_loss
-
-        gradients = tape.gradient(total_loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-
-        metrics = {"loss": total_loss}
-        metrics.update(field_losses)
-        return metrics
-    
-
 class TableJoinSequenceEncoder:
     def __init__(self, db_path, first_table_schema, second_table_schema, config, name=None):
         self.first_table_schema = first_table_schema

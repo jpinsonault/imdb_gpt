@@ -14,6 +14,7 @@ from autoencoder.fields import (
 from autoencoder.training_callbacks import ReconstructionCallback
 import os
 
+
 class TitlesAutoencoder(RowAutoencoder):
     def __init__(self, config: Dict[str, Any], db_path: Path):
         super().__init__()
@@ -58,6 +59,7 @@ class TitlesAutoencoder(RowAutoencoder):
                 GROUP BY t.tconst
                 HAVING COUNT(g.genre) > 0
                 AND t.numVotes >= 10
+                LIMIT 100000
             """)
             for row in c:
                 yield {
@@ -101,25 +103,30 @@ class TitlesAutoencoder(RowAutoencoder):
 
     def fit(self):
         self.accumulate_stats()
-        
+
         self._build_model()
         self._print_model_architecture()
 
-        # Write model summary to file (optional)
         with redirect_stdout(open('logs/model_summary.txt', 'w')):
             self._print_model_architecture()
 
         print(f"Loss dict: {self.get_loss_dict()}")
         print(f"Loss weights dict: {self.get_loss_weights_dict()}")
+        schedule = [0.0001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005]
 
-        learning_rate = 0.00005
+        # Define a stairstep learning rate schedule.
+        def stairstep_lr(epoch, lr):
+            print(f"epoch: {epoch}, lr: {lr}")
+            return schedule[epoch] if epoch < len(schedule) else schedule[-1]
+
+        lr_callback = tf.keras.callbacks.LearningRateScheduler(stairstep_lr)
+
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            optimizer=tf.keras.optimizers.Adam(learning_rate=schedule[0]),
             loss=self.get_loss_dict(),
             loss_weights=self.get_loss_weights_dict()
         )
 
-        # Callbacks
         log_dir = "logs/fit/" + str(int(tf.timestamp().numpy()))
         os.makedirs(log_dir, exist_ok=True)
         tensorboard_callback = tf.keras.callbacks.TensorBoard(
@@ -137,21 +144,21 @@ class TitlesAutoencoder(RowAutoencoder):
 
         ds = self._build_dataset(self.db_path)
 
-        # Train
         self.model.fit(
             ds,
             epochs=self.config["epochs"],
-            callbacks=[tensorboard_callback, reconstruction_callback]
+            callbacks=[tensorboard_callback, reconstruction_callback, lr_callback]
         )
         self.model.save("tabular_autoencoder.h5")
         print("\nTraining complete and model saved.")
+
 
 
 class PeopleAutoencoder(RowAutoencoder):
     def __init__(self, config: Dict[str, Any], db_path: Path):
         super().__init__()
         self.config = config
-        self.db_path = db_path
+        self.db_path = db_path  
         self.model = None
         self.stats_accumulated = False
 
@@ -159,8 +166,8 @@ class PeopleAutoencoder(RowAutoencoder):
         return [
             TextField("primaryName"),
             ScalarField("birthYear", scaling=Scaling.STANDARDIZE),
-            ScalarField("deathYear", scaling=Scaling.STANDARDIZE, optional=True), # optional as some people are still alive
-            MultiCategoryField("professions", optional=True) # optional as some might have no profession listed
+            # ScalarField("deathYear", scaling=Scaling.STANDARDIZE, optional=True), # optional as some people are still alive
+            # MultiCategoryField("professions", optional=True) # optional as some might have no profession listed
         ]
 
     def row_generator(self):

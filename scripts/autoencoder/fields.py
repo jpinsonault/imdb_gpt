@@ -151,6 +151,41 @@ class BaseField(abc.ABC):
     def _get_loss(self):
         pass
 
+    def _optional_loss_wrapper(self, base_loss_fn):
+        """
+        Wraps the given loss function so that when the field is optional,
+        the loss on the main output is multiplied by a mask (which is 0 when
+        the field is missing) and the flag loss (computed via BCE) is always applied.
+        Assumes that the last element in the last dimension is the null flag.
+        """
+        def loss_fn(y_true, y_pred):
+            # Split the tensors along the last dimension.
+            # Assume shape (..., base_dim + 1) where the last element is the flag.
+            base_true = y_true[..., :-1]
+            flag_true = y_true[..., -1]
+            base_pred = y_pred[..., :-1]
+            flag_pred = y_pred[..., -1]
+            # Create a mask: 1 when field is provided (flag == 0) and 0 when missing (flag == 1)
+            mask = 1.0 - flag_true
+            # Compute the loss on the main output (for instance, using MSE)
+            main_loss = base_loss_fn(base_true, base_pred)
+            # Compute the loss on the flag (using binary crossentropy)
+            flag_loss = tf.keras.losses.binary_crossentropy(flag_true, flag_pred)
+            # Return a weighted sum. 
+            return mask * main_loss + flag_loss
+        return loss_fn
+
+    @property
+    def loss(self):
+        """
+        When the field is optional, wrap the base loss function.
+        Otherwise, return the base loss function directly.
+        """
+        base_loss = self._get_loss()  # this should be a callable loss function
+        if self.optional:
+            return self._optional_loss_wrapper(base_loss)
+        return base_loss
+
     def _get_weight(self):
         return 1.0
 
@@ -202,7 +237,10 @@ class BooleanField(BaseField):
         return (1,)
 
     def _get_loss(self):
-        return 'binary_crossentropy' if self.use_bce_loss else 'mse'
+        mse_loss = tf.keras.losses.MeanSquaredError()
+        binary_cross_entryopy_loss = tf.keras.losses.BinaryCrossentropy()
+
+        return binary_cross_entryopy_loss if self.use_bce_loss else mse_loss
 
     def _accumulate_stats(self, raw_value):
         if raw_value is not None:
@@ -295,7 +333,7 @@ class ScalarField(BaseField):
         return (1,)
 
     def _get_loss(self):
-        return 'mse'
+        return tf.keras.losses.MeanSquaredError()
 
     def _accumulate_stats(self, raw_value):
         if raw_value is not None:
@@ -430,6 +468,7 @@ class TextField(BaseField):
             loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
             masked_loss = loss * mask
             return tf.reduce_sum(masked_loss) / tf.reduce_sum(mask)
+        
         return masked_sparse_categorical_crossentropy
     
     def _get_weight(self):
@@ -586,7 +625,7 @@ class MultiCategoryField(BaseField):
         return (len(self.category_list),)
 
     def _get_loss(self):
-        return 'binary_crossentropy'
+        return tf.keras.losses.BinaryCrossentropy()
 
     def _accumulate_stats(self, raw_value):
         if raw_value:

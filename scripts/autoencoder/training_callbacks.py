@@ -1,6 +1,6 @@
 import random
 import numpy as np
-from prettytable import PrettyTable
+from prettytable import PrettyTable, TableStyle
 from typing import List, Dict
 import tensorflow as tf
 from .schema import RowAutoencoder
@@ -26,6 +26,8 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
         print(f"\nBatch {batch + 1}: Reconstruction Results")
         
         table = PrettyTable()
+        table.set_style(TableStyle.SINGLE_BORDER)
+
         table.field_names = ["Field", "Original Value", "Reconstructed Value"]
         
         # Set alignment for all columns to left-justified
