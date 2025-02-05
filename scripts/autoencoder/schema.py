@@ -1,4 +1,5 @@
 # schema.py
+from pathlib import Path
 from prettytable import PrettyTable
 from typing import List, Dict
 
@@ -9,7 +10,7 @@ import tensorflow as tf
 from functools import cached_property
 
 class RowAutoencoder:
-    def __init__(self):
+    def __init__(self, field_models_dir: Path):
         self.fields = self.build_fields()
         self.num_rows_in_dataset = 0
 
@@ -67,6 +68,12 @@ class RowAutoencoder:
     def _build_model(self):
         if not self.model:
             self.model = self.build_autoencoder()
+
+    def save_fields(self):
+        output_dir = Path("models") / self.__class__.__name__
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for f in self.fields:
+            # save
 
     def build_autoencoder(self) -> tf.keras.Model:
         latent_dim = self.config["latent_dim"]

@@ -149,7 +149,9 @@ class TitlesAutoencoder(RowAutoencoder):
             epochs=self.config["epochs"],
             callbacks=[tensorboard_callback, reconstruction_callback, lr_callback]
         )
-        self.model.save("tabular_autoencoder.h5")
+
+        self.save_fields()
+
         print("\nTraining complete and model saved.")
 
 
