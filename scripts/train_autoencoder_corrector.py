@@ -62,15 +62,17 @@ class LatentCorrector(tf.keras.Model):
         corrected_latent = self.correction_network(correction_input)
         # Freeze the decoder so its weights remain fixed during training.
         self.base_autoencoder.decoder.trainable = False
-        decoded_output = self.base_autoencoder.decoder(corrected_latent)
-        correction_decoding_model = tf.keras.Model(correction_input, decoded_output, name="corrector_decoder")
+        decoded_outputs = self.base_autoencoder.decoder(corrected_latent)
+        output_dict = {
+            f"{field.name}_decoder": output 
+            for field, output in zip(self.base_autoencoder.fields, decoded_outputs)
+        }
+        correction_decoding_model = tf.keras.Model(correction_input, output_dict, name="corrector_decoder")
 
-        # Compile the composite model using the same loss functions as in the autoencoder.
-        # (For example, if your autoencoder uses a per-field loss dictionary, you can pass that here.)
         correction_decoding_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss=self.base_autoencoder.get_loss_dict(),  # Adjust as needed if you use multiple outputs.
-            loss_weights=self.base_autoencoder.get_loss_weights_dict()  # Optional: use same weights.
+            loss=self.base_autoencoder.get_loss_dict(),
+            loss_weights=self.base_autoencoder.get_loss_weights_dict()
         )
 
         # (Optional) set up callbacks (you might need to adjust the reconstruction callback as well)
