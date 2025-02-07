@@ -1,7 +1,7 @@
 # schema.py
 from pathlib import Path
 from prettytable import PrettyTable
-from typing import List, Dict
+from typing import Any, List, Dict
 
 from tqdm import tqdm
 
@@ -11,11 +11,15 @@ from functools import cached_property
 
 
 class RowAutoencoder:
-    def __init__(self):
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
         self.fields = self.build_fields()
         self.num_rows_in_dataset = 0
+        self.latent_dim = self.config["latent_dim"]
+        self.stats_accumulated = False
 
     def accumulate_stats(self):
+        
         if self.stats_accumulated:
             print("stats already accumulated")
             return
@@ -41,6 +45,19 @@ class RowAutoencoder:
     def finalize_stats(self):
         for f in self.fields:
             f.finalize_stats()
+
+    def _build_dataset(self) -> tf.data.Dataset:
+        def db_generator():
+             for row_dict in self.row_generator():
+                x = tuple(f.transform(row_dict.get(f.name)) for f in self.fields)
+                yield x, x
+
+        # Define the signature for tf.data
+        specs_in = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in self.fields)
+        specs_out = tuple(tf.TensorSpec(shape=f.output_shape, dtype=tf.float32) for f in self.fields)
+
+        ds = tf.data.Dataset.from_generator(db_generator, output_signature=(specs_in, specs_out))
+        return ds.batch(self.config["batch_size"])
 
     def transform_row(self, row: Dict) -> Dict[str, tf.Tensor]:
         out = {}
@@ -71,7 +88,7 @@ class RowAutoencoder:
             self.model = self.build_autoencoder()
 
     def build_autoencoder(self) -> tf.keras.Model:
-        latent_dim = self.config["latent_dim"]
+        latent_dim = self.latent_dim
         encoder_inputs = {}
         encoder_outputs = {}
         decoders = {}

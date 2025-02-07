@@ -17,8 +17,7 @@ import os
 
 class TitlesAutoencoder(RowAutoencoder):
     def __init__(self, config: Dict[str, Any], db_path: Path):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.db_path = db_path
         self.model = None
         self.stats_accumulated = False
@@ -86,19 +85,6 @@ class TitlesAutoencoder(RowAutoencoder):
         print("--- Main Autoencoder Summary ---")
         self.model.summary()
         print("Model Outputs:", self.model.output_names)
-
-    def _build_dataset(self, db_path: Path) -> tf.data.Dataset:
-        def db_generator():
-             for row_dict in self.row_generator():
-                x = tuple(f.transform(row_dict.get(f.name)) for f in self.fields)
-                yield x, x
-
-        # Define the signature for tf.data
-        specs_in = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in self.fields)
-        specs_out = tuple(tf.TensorSpec(shape=f.output_shape, dtype=tf.float32) for f in self.fields)
-
-        ds = tf.data.Dataset.from_generator(db_generator, output_signature=(specs_in, specs_out))
-        return ds.batch(self.config["batch_size"])
 
     def fit(self):
         self.accumulate_stats()
