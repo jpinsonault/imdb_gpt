@@ -17,58 +17,23 @@ def build_correction_network(latent_dim, hidden_units=256, num_layers=3):
     return Model(inp, corrected_input, name="correction_network")
 
 class RecursiveCorrectionAutoencoder(tf.keras.Model):
-    def __init__(self, base_autoencoder: RowAutoencoder, latent_dim: int, correction_network: Model):
+    def __init__(self, base_autoencoder: RowAutoencoder, latent_dim: int):
         super().__init__()
         self.base_autoencoder = base_autoencoder
         self.latent_dim = latent_dim
-        self.correction_network = correction_network
-        self.autoencoder = self._build_autoencoder_with_correction()
-
-    def _build_autoencoder_with_correction(self):
-        fields = self.base_autoencoder.fields
-        encoder_inputs = {}
-        encoder_outputs = {}
-        decoders = {}
-        decoder_outputs = {}
-
-        for field in fields:
-            inp = tf.keras.Input(shape=field.input_shape, name=f"{field.name}_input", dtype=field.input_dtype)
-            encoder_inputs[field.name] = inp
-
-        for field in fields:
-            encoder = field.build_encoder(self.latent_dim)
-            encoder_outputs[field.name] = encoder(encoder_inputs[field.name])
-            decoders[field.name] = field.build_decoder(self.latent_dim)
-
-        combined = layers.Concatenate()(list(encoder_outputs.values()))
-        x = layers.Dense(self.latent_dim * 8, activation='gelu', name="latent_dense1")(combined)
-        x = layers.Dense(self.latent_dim * 2, activation='gelu', name="latent_dense2")(x)
-        latent = layers.Dense(self.latent_dim, activation='linear', name="latent_dense3")(x)
-        latent = layers.LayerNormalization(name="latent_ln")(latent)
-
-        corrected = self.correction_network(latent)
-
-        for field in fields:
-            decoder_outputs[field.name] = decoders[field.name](corrected)
-
-        inputs_list = [encoder_inputs[field.name] for field in fields]
-        outputs_list = [decoder_outputs[field.name] for field in fields]
-        return Model(inputs=inputs_list, outputs=outputs_list, name="RecursiveCorrectionAutoencoder")
-
-    def call(self, inputs, training=False):
-        return self.autoencoder(inputs, training=training)
-
+        # TODO
+        
 if __name__ == "__main__":
     config = project_config["autoencoder"]
+    latent_dim = config["latent_dim"]
     data_dir = Path(project_config["data_dir"])
     db_path = data_dir / 'imdb.db'
 
     base_ae = TitlesAutoencoder(config, db_path)
     base_ae.accumulate_stats()
-    latent_dim = config["latent_dim"]
-    correction_net = build_correction_network(latent_dim, hidden_units=256, num_layers=3)
+    base_ae.load_model(Path("models/"))
 
-    rc_autoencoder = RecursiveCorrectionAutoencoder(base_ae, latent_dim, correction_net)
+    rc_autoencoder = CorrectionAutoencoder(base_ae, latent_dim)
     rc_autoencoder.summary()
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=config["learning_rate"])

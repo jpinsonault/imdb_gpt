@@ -1,3 +1,4 @@
+from functools import partial
 from prettytable import PrettyTable
 import numpy as np
 import tensorflow as tf
@@ -66,6 +67,7 @@ SPECIAL_SEP_DISPLAY = '<|>'
 # Utility for text fields
 ################################################################################
 
+@tf.keras.utils.register_keras_serializable()
 def add_positional_encoding(input_sequence):
     batch_size = tf.shape(input_sequence)[0]
     sequence_length = tf.shape(input_sequence)[1]
@@ -79,6 +81,7 @@ def add_positional_encoding(input_sequence):
 
     return tf.concat([input_sequence, pos_encoding_up, pos_encoding_down], axis=-1)
 
+@tf.keras.utils.register_keras_serializable()
 def sin_activation(x):
     return tf.sin(x)
 
@@ -430,6 +433,30 @@ class ScalarField(BaseField):
 ################################################################################
 # TextField
 ################################################################################
+@tf.keras.utils.register_keras_serializable(package="Custom", name="MaskedSparseCategoricalCrossentropy")
+class MaskedSparseCategoricalCrossentropy(tf.keras.losses.Loss):
+    def __init__(self, char_to_index, **kwargs):
+        super().__init__(**kwargs)
+        self.char_to_index = char_to_index
+
+    def call(self, y_true, y_pred):
+        pad_token_index = self.char_to_index[SPECIAL_PAD]
+        mask = tf.cast(tf.not_equal(y_true, pad_token_index), dtype=tf.float32)
+        loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+        masked_loss = loss * mask
+        return tf.reduce_sum(masked_loss) / tf.reduce_sum(mask)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "char_to_index": self.char_to_index,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
 
 class TextField(BaseField):
     def __init__(
@@ -462,14 +489,7 @@ class TextField(BaseField):
         return (self.max_length,)
 
     def _get_loss(self):
-        def masked_sparse_categorical_crossentropy(y_true, y_pred):
-            pad_token_index = self.char_to_index[SPECIAL_PAD]
-            mask = tf.cast(tf.not_equal(y_true, pad_token_index), dtype=tf.float32)
-            loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
-            masked_loss = loss * mask
-            return tf.reduce_sum(masked_loss) / tf.reduce_sum(mask)
-        
-        return masked_sparse_categorical_crossentropy
+        return MaskedSparseCategoricalCrossentropy(self.char_to_index)
     
     def _get_weight(self):
         return 2.0
@@ -555,7 +575,7 @@ class TextField(BaseField):
                 x = self._residual_block(x, current_filters, block_num=block, step_num=step)
             current_length //= 2
             current_filters *= 2
-            x = Conv1D(current_filters, 3, strides=2, activation=sin_activation, padding='same')(x)
+            x = Conv1D(current_filters, 3, strides=2, activation='gelu', padding='same')(x)
             # x = LayerNormalization()(x)
 
         x = Conv1D(self.base_size, 3, activation='linear')(x)
@@ -567,15 +587,14 @@ class TextField(BaseField):
         current_length = self.max_length // (2 ** self.downsample_steps)
         current_filters = self.base_size * (2 ** self.downsample_steps)
 
-        x = Dense(current_length * self.base_size, activation=sin_activation)(inp)
+        x = Dense(current_length * self.base_size, activation='gelu')(inp)
         x = Reshape((current_length, self.base_size))(x)
         x = Lambda(add_positional_encoding, 
                 output_shape=lambda s: (s[0], s[1], s[2] + 2),
                 name="add_positional_encoding")(x)
 
         for step in range(self.downsample_steps):
-            x = Conv1DTranspose(current_filters * 2, 3, strides=2, activation=sin_activation, padding='same')(x)
-            # x = LayerNormalization()(x)
+            x = Conv1DTranspose(current_filters * 2, 3, strides=2, activation='gelu', padding='same')(x)
             num_blocks = self.num_blocks_per_step[step] if step < len(self.num_blocks_per_step) else 1
             for block in range(num_blocks):
                 x = self._residual_block(x, current_filters, block_num=block, step_num=step)
@@ -591,12 +610,9 @@ class TextField(BaseField):
             print(f"Applying Residual Block {block_num + 1} at Step {step_num + 1} with {filters} filters.")
 
         shortcut = x
-        x = Conv1D(filters // reduction_ratio, 1, activation=sin_activation, padding='same')(x)
-        # x = LayerNormalization()(x)
-        x = Conv1D(filters // reduction_ratio, kernel_size, activation=sin_activation, padding='same')(x)
-        # x = LayerNormalization()(x)
+        x = Conv1D(filters // reduction_ratio, 1, activation='gelu', padding='same')(x)
+        x = Conv1D(filters // reduction_ratio, kernel_size, activation='gelu', padding='same')(x)
         x = Conv1D(filters, 1, activation='linear', padding='same')(x)
-        # x = LayerNormalization()(x)
         if shortcut.shape[-1] != x.shape[-1]:
             shortcut = Conv1D(x.shape[-1], 1, padding='same', name=f'adjustment_conv_S{step_num}_B{block_num}')(shortcut)
         return Add()([x, shortcut])

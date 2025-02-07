@@ -59,7 +59,6 @@ class TitlesAutoencoder(RowAutoencoder):
                 GROUP BY t.tconst
                 HAVING COUNT(g.genre) > 0
                 AND t.numVotes >= 10
-                LIMIT 100000
             """)
             for row in c:
                 yield {
@@ -104,7 +103,9 @@ class TitlesAutoencoder(RowAutoencoder):
     def fit(self):
         self.accumulate_stats()
 
-        self._build_model()
+        if self.model is None:
+            self._build_model()
+        
         self._print_model_architecture()
 
         with redirect_stdout(open('logs/model_summary.txt', 'w')):
@@ -112,14 +113,13 @@ class TitlesAutoencoder(RowAutoencoder):
 
         print(f"Loss dict: {self.get_loss_dict()}")
         print(f"Loss weights dict: {self.get_loss_weights_dict()}")
-        schedule = [0.0001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005, 0.00001, 0.00005]
+        schedule = [0.00001, 0.000005, 0.00001, .000005]
 
-        # Define a stairstep learning rate schedule.
-        def stairstep_lr(epoch, lr):
+        def fixed_scheduler(epoch, lr):
             print(f"epoch: {epoch}, lr: {lr}")
             return schedule[epoch] if epoch < len(schedule) else schedule[-1]
 
-        lr_callback = tf.keras.callbacks.LearningRateScheduler(stairstep_lr)
+        lr_callback = tf.keras.callbacks.LearningRateScheduler(fixed_scheduler)
 
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=schedule[0]),
@@ -149,8 +149,6 @@ class TitlesAutoencoder(RowAutoencoder):
             epochs=self.config["epochs"],
             callbacks=[tensorboard_callback, reconstruction_callback, lr_callback]
         )
-
-        self.save_fields()
 
         print("\nTraining complete and model saved.")
 

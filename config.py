@@ -27,7 +27,8 @@ project_config = {
         'latent_dim': 192,
         'batch_size': 512,
         'learning_rate': 0.00005,
-        'epochs': 20,
+        'epochs': 4,
+        'model_dir': 'models',
         'movies_file': 'movie.jsonl',
         'callback_interval': 50,
     }

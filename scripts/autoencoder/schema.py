@@ -5,12 +5,13 @@ from typing import List, Dict
 
 from tqdm import tqdm
 
-from .fields import BaseField
+from .fields import BaseField, MaskedSparseCategoricalCrossentropy, add_positional_encoding, sin_activation
 import tensorflow as tf
 from functools import cached_property
 
+
 class RowAutoencoder:
-    def __init__(self, field_models_dir: Path):
+    def __init__(self):
         self.fields = self.build_fields()
         self.num_rows_in_dataset = 0
 
@@ -69,12 +70,6 @@ class RowAutoencoder:
         if not self.model:
             self.model = self.build_autoencoder()
 
-    def save_fields(self):
-        output_dir = Path("models") / self.__class__.__name__
-        output_dir.mkdir(parents=True, exist_ok=True)
-        for f in self.fields:
-            # save
-
     def build_autoencoder(self) -> tf.keras.Model:
         latent_dim = self.config["latent_dim"]
         encoder_inputs = {}
@@ -82,45 +77,73 @@ class RowAutoencoder:
         decoders = {}
         decoder_outputs = {}
 
-        # Create input layers
+        # Build inputs and per-field encoders/decoders.
         for field in self.fields:
-            input_layer = tf.keras.Input(shape=field.input_shape, name=f"{field.name}_input", dtype=field.input_dtype)
-            encoder_inputs[field.name] = input_layer
+            inp = tf.keras.Input(shape=field.input_shape, name=f"{field.name}_input", dtype=field.input_dtype)
+            encoder_inputs[field.name] = inp
 
-        # Create encoders and connect them to the corresponding input layers
         for field in self.fields:
             encoder = field.build_encoder(latent_dim)
             decoder = field.build_decoder(latent_dim)
-
             decoders[field.name] = decoder
-
-            encoder_output = encoder(encoder_inputs[field.name])
-            encoder_outputs[field.name] = encoder_output
+            encoder_outputs[field.name] = encoder(encoder_inputs[field.name])
 
         combined_encodings = tf.keras.layers.Concatenate()(list(encoder_outputs.values()))
-
-        latent_vector = tf.keras.layers.Dense(latent_dim*8, activation='gelu', name="latent_vector_dense1")(combined_encodings)
-        latent_vector = tf.keras.layers.Dense(latent_dim*2, activation='gelu', name="latent_vector_dense2")(latent_vector)
-
+        latent_vector = tf.keras.layers.Dense(latent_dim * 8, activation='gelu', name="latent_vector_dense1")(combined_encodings)
+        latent_vector = tf.keras.layers.Dense(latent_dim * 2, activation='gelu', name="latent_vector_dense2")(latent_vector)
         latent_vector = tf.keras.layers.Dense(latent_dim, activation='linear', name="latent_vector_dense3")(latent_vector)
-        latent_vector = tf.keras.layers.LayerNormalization()(latent_vector)
+        latent_vector = tf.keras.layers.LayerNormalization(name="latent_vector_layernorm")(latent_vector)
 
-        # Decode the latent vector
+        # Decode the latent vector.
         for field in self.fields:
-            decoder = decoders[field.name]
-            decoder.name = f"{field.name}_decoder"
-            decoder_outputs[field.name] = decoder(latent_vector)
-
-        # Create the autoencoder model, ensuring the input order matches the schema
-        input_layers = [encoder_inputs[field.name] for field in self.fields]
-        output_layers = [decoder_outputs[field.name] for field in self.fields]
+            decoder_outputs[field.name] = decoders[field.name](latent_vector)
 
         autoencoder = tf.keras.Model(
-            inputs=input_layers,
-            outputs=output_layers,
+            inputs=[encoder_inputs[field.name] for field in self.fields],
+            outputs=[decoder_outputs[field.name] for field in self.fields],
             name="TabularAutoencoder"
         )
+
+        # Create an encoder model (from input layers to the latent vector).
+        encoder_model = tf.keras.Model(
+            inputs=[encoder_inputs[field.name] for field in self.fields],
+            outputs=latent_vector,
+            name="Encoder"
+        )
+
+        # Create a decoder model (from a latent vector input to decoder outputs).
+        latent_input = tf.keras.Input(shape=(latent_dim,), name="latent_input")
+        decoder_outputs_for_decoder = [decoders[field.name](latent_input) for field in self.fields]
+        decoder_model = tf.keras.Model(
+            inputs=latent_input,
+            outputs=decoder_outputs_for_decoder,
+            name="Decoder"
+        )
+
+        # Store the models.
+        self.model = autoencoder
+        self.encoder = encoder_model
+        self.decoder = decoder_model
         return autoencoder
+
+    def save_model(self, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save(output_dir / f"{self.__class__.__name__}_autoencoder.keras")
+        self.encoder.save(output_dir / f"{self.__class__.__name__}_encoder.keras")
+        self.decoder.save(output_dir / f"{self.__class__.__name__}_decoder.keras")
+
+    def load_model(self, input_dir):
+        tf.keras.config.enable_unsafe_deserialization()
+        input_dir = Path(input_dir)
+        try:
+            custom_objects = {"add_positional_encoding": add_positional_encoding, "sin_activation": sin_activation, "MaskedSparseCategoricalCrossentropy": MaskedSparseCategoricalCrossentropy}
+
+            self.model = tf.keras.models.load_model(input_dir / f"{self.__class__.__name__}_autoencoder.keras", custom_objects=custom_objects)
+            self.encoder = tf.keras.models.load_model(input_dir / f"{self.__class__.__name__}_encoder.keras", custom_objects=custom_objects)
+            self.decoder = tf.keras.models.load_model(input_dir / f"{self.__class__.__name__}_decoder.keras", custom_objects=custom_objects)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Model files not found in {input_dir}")
 
 
 class TableJoinSequenceEncoder:
