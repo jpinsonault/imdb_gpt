@@ -18,10 +18,10 @@ project_config = {
     },
     'corrector': {
         'learning_rate': 0.00005,
-        'epochs': 4,
-        'callback_interval': 50,
-        'hidden_units': 256,
-        'num_layers': 3,
-        'noise_std': 0.1,
+        'epochs': 20,
+        'callback_interval': 200,
+        'hidden_units': 192*4,
+        'num_layers': 5,
+        'noise_std': 0.01,
     }
 }

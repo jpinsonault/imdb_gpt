@@ -8,13 +8,16 @@ from autoencoder.schema import RowAutoencoder
 from autoencoder.imdb_row_autoencoders import TitlesAutoencoder
 from scripts.autoencoder.training_callbacks import LatentCorrectorReconstructionCallback
 
-def build_correction_network(latent_dim, hidden_units=256, num_layers=3):
+leaky_relu = tf.keras.layers.LeakyReLU(alpha=0.2)
+
+def build_correction_network(latent_dim, hidden_units, num_layers):
     inp = tf.keras.Input(shape=(latent_dim,), name="latent_correction_input")
     x = inp
     for i in range(num_layers):
-        x = layers.Dense(hidden_units, activation=tf.sin, name=f"siren_dense_{i}")(x)
-    correction = layers.Dense(latent_dim, activation='linear', name="corrected_latent")(x)
-    corrected = layers.Add(name="corrected_latent_output")([inp, correction])
+        x = layers.Dense(hidden_units, activation='gelu', name=f"siren_dense_{i}")(x)
+    noise = layers.Dense(latent_dim, activation='linear', name="noise")(x)
+
+    corrected = layers.Add(name="corrected_latent_output")([inp, -noise])
     return Model(inp, corrected, name="correction_network")
 
 class LatentCorrector(tf.keras.Model):
@@ -69,7 +72,7 @@ class LatentCorrector(tf.keras.Model):
             embeddings_freq=1,
             update_freq=self.config["callback_interval"]
         )
-        
+
         reconstruction_callback = LatentCorrectorReconstructionCallback(
             interval_batches=self.config["callback_interval"],
             row_autoencoder=self.base_autoencoder,

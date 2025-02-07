@@ -128,7 +128,7 @@ class TitlesAutoencoder(RowAutoencoder):
             num_samples=20
         )
 
-        ds = self._build_dataset(self.db_path)
+        ds = self._build_dataset()
 
         self.model.fit(
             ds,

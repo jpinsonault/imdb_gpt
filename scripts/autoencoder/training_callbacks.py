@@ -106,7 +106,7 @@ class LatentCorrectorReconstructionCallback(tf.keras.callbacks.Callback):
         print(f"\nBatch {batch + 1}: Latent Correction Reconstruction Results")
         table = PrettyTable()
         table.set_style(TableStyle.SINGLE_BORDER)
-        table.field_names = ["Field", "Original", "No-Correct Recons", "Corrected Recons"]
+        table.field_names = ["Field", "Truth", "Autoencoded", "With Noise", "Corrected"]
         table.align = "l"
 
         # Process each sampled row
@@ -117,22 +117,15 @@ class LatentCorrectorReconstructionCallback(tf.keras.callbacks.Callback):
                 field.name: field.transform(row_dict.get(field.name))
                 for field in self.row_autoencoder.fields
             }
-            print(f"input_tensors: {input_tensors}")
             # Build a list of inputs in the order of the fields.
             # Convert to NumPy arrays and add the batch dimension.
             inputs = [
                 np.expand_dims(
-                    x.numpy() if hasattr(x, "numpy") else x,
+                    input_tensors[field.name].numpy() if hasattr(input_tensors[field.name], "numpy") else input_tensors[field.name],
                     axis=0
                 )
-                for field, x in sorted(input_tensors.items(), key=lambda item: item[0])
+                for field in self.row_autoencoder.fields
             ]
-
-            for input in zip(self.row_autoencoder.fields, inputs):
-                print(f"input: {input[0].name}, len(input[1]): {len(input[1])}")
-                print(f"input shape: {input[1].shape}")
-
-
 
             # Get the latent vector from the base encoder
             latent = self.row_autoencoder.encoder.predict(inputs)
@@ -140,18 +133,20 @@ class LatentCorrectorReconstructionCallback(tf.keras.callbacks.Callback):
             noise = np.random.normal(loc=0.0, scale=self.noise_std, size=latent.shape)
             noisy_latent = latent + noise
 
+            autoencoded_decodings = self.row_autoencoder.decoder.predict(latent)
+
             # Decode the noisy latent directly (without correction)
-            preds_no_correct = self.row_autoencoder.decoder.predict(noisy_latent)
+            noisy_decodings = self.row_autoencoder.decoder.predict(noisy_latent)
             # Correct the noisy latent using the latent corrector (self.model)
-            corrected_latent = self.model.predict(noisy_latent)
+            corrected_decodings = self.model.predict(noisy_latent)
             # Decode the corrected latent vector
-            preds_corrected = self.row_autoencoder.decoder.predict(corrected_latent)
+            corrected_decodings = self.row_autoencoder.decoder.predict(corrected_decodings)
 
             # Ensure predictions are lists (one per field) even if there is a single output
-            if not isinstance(preds_no_correct, list):
-                preds_no_correct = [preds_no_correct]
-            if not isinstance(preds_corrected, list):
-                preds_corrected = [preds_corrected]
+            if not isinstance(noisy_decodings, list):
+                noisy_decodings = [noisy_decodings]
+            if not isinstance(corrected_decodings, list):
+                corrected_decodings = [corrected_decodings]
 
             # For each field, extract and convert predictions
             for idx, field in enumerate(self.row_autoencoder.fields):
@@ -160,11 +155,12 @@ class LatentCorrectorReconstructionCallback(tf.keras.callbacks.Callback):
                 if isinstance(original_value, list):
                     original_value = ", ".join(original_value)
                 # Take the first (and only) example from the batch dimension.
-                pred_no_correct = preds_no_correct[idx][0]
-                pred_corrected = preds_corrected[idx][0]
+                noisy_decoding = noisy_decodings[idx][0]
+                corrected_decoding = corrected_decodings[idx][0]
                 # Use the field’s to_string helper to obtain a readable version.
-                recon_no_correct = field.to_string(pred_no_correct)
-                recon_corrected = field.to_string(pred_corrected)
-                table.add_row([field.name, str(original_value), recon_no_correct, recon_corrected])
+                noisy_output = field.to_string(noisy_decoding)
+                corrected_output = field.to_string(corrected_decoding)
+                autoencoded_output = field.to_string(autoencoded_decodings[idx][0])
+                table.add_row([field.name, str(original_value), autoencoded_output, noisy_output, corrected_output])
             print(table)
             table.clear_rows()
