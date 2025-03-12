@@ -4,20 +4,25 @@ import numpy as np
 import tensorflow as tf
 from enum import Enum
 from tensorflow.keras.layers import (
-    Embedding,
-    LayerNormalization,
     Dense,
+    Embedding,
     Input,
+    LayerNormalization,
     Reshape,
     Softmax,
+    Dropout,
+    Add,
+    Lambda,
+    Flatten,
     Conv1D,
     Conv1DTranspose,
-    Flatten,
-    Add,
-    Lambda
+    GlobalAveragePooling1D,
+    GlobalMaxPooling1D,
 )
 from tensorflow.keras.models import Model
+
 import abc
+from tensorflow.keras.layers import Layer, Subtract
 
 ################################################################################
 # Enums and constants
@@ -66,20 +71,21 @@ SPECIAL_SEP_DISPLAY = '<|>'
 ################################################################################
 # Utility for text fields
 ################################################################################
-
 @tf.keras.utils.register_keras_serializable()
 def add_positional_encoding(input_sequence):
-    batch_size = tf.shape(input_sequence)[0]
-    sequence_length = tf.shape(input_sequence)[1]
-    pos_range_up = tf.linspace(0.0, 1.0, sequence_length)
-    pos_range_up = tf.reshape(pos_range_up, (1, sequence_length, 1))
-    pos_encoding_up = tf.tile(pos_range_up, [batch_size, 1, 1])
+    seq_len = tf.shape(input_sequence)[1]
+    model_dim = tf.shape(input_sequence)[2]
 
-    pos_range_down = tf.linspace(1.0, 0.0, sequence_length)
-    pos_range_down = tf.reshape(pos_range_down, (1, sequence_length, 1))
-    pos_encoding_down = tf.tile(pos_range_down, [batch_size, 1, 1])
+    positions = tf.cast(tf.range(seq_len)[:, tf.newaxis], tf.float32)
+    dims = tf.range(model_dim)
+    angle_rates = 1 / tf.pow(10000.0, (2 * tf.cast(tf.math.floordiv(dims, 2), tf.float32)) / tf.cast(model_dim, tf.float32))
+    angles = positions * angle_rates
 
-    return tf.concat([input_sequence, pos_encoding_up, pos_encoding_down], axis=-1)
+    pos_encoding = tf.where(tf.math.floormod(dims, 2) == 0, tf.sin(angles), tf.cos(angles))
+    pos_encoding = pos_encoding[tf.newaxis, ...]  # Expand batch dimension
+
+    return input_sequence + pos_encoding
+
 
 @tf.keras.utils.register_keras_serializable()
 def sin_activation(x):
@@ -93,6 +99,46 @@ class BaseField(abc.ABC):
     def __init__(self, name: str, optional: bool = False):
         self.name = name
         self.optional = optional
+
+    @abc.abstractmethod
+    def _get_input_shape(self):
+        pass
+
+    @abc.abstractmethod
+    def _get_output_shape(self):
+        pass
+
+    @abc.abstractmethod
+    def _get_loss(self):
+        pass
+
+    @abc.abstractmethod
+    def _accumulate_stats(self, raw_value):
+        pass
+
+    @abc.abstractmethod
+    def _finalize_stats(self):
+        pass
+
+    @abc.abstractmethod
+    def _transform(self, raw_value):
+        pass
+
+    @abc.abstractmethod
+    def build_encoder(self, latent_dim: int) -> tf.keras.Model:
+        pass
+
+    @abc.abstractmethod
+    def build_decoder(self, latent_dim: int) -> tf.keras.Model:
+        pass
+
+    @abc.abstractmethod
+    def to_string(self, predicted_array: np.ndarray) -> str:
+        pass
+
+    @abc.abstractmethod
+    def print_stats(self):
+        pass
 
     @property
     def input_shape(self):
@@ -133,26 +179,17 @@ class BaseField(abc.ABC):
     def transform(self, raw_value):
         if raw_value is None and not self.optional:
             raise ValueError(f"Received None for non-optional field: {self.name}")
-        is_null = 1.0 if raw_value is None else 0.0
+        
         base_output = self._transform(raw_value)
+
         if self.optional:
+            is_null = 1.0 if raw_value is None else 0.0
             return tf.concat(
                 [base_output, tf.constant([is_null], dtype=tf.float32)],
                 axis=-1
             )
-        return base_output
-
-    @abc.abstractmethod
-    def _get_input_shape(self):
-        pass
-
-    @abc.abstractmethod
-    def _get_output_shape(self):
-        pass
-
-    @abc.abstractmethod
-    def _get_loss(self):
-        pass
+        else:
+            return base_output
 
     def _optional_loss_wrapper(self, base_loss_fn):
         """
@@ -191,35 +228,6 @@ class BaseField(abc.ABC):
 
     def _get_weight(self):
         return 1.0
-
-    @abc.abstractmethod
-    def _accumulate_stats(self, raw_value):
-        pass
-
-    @abc.abstractmethod
-    def _finalize_stats(self):
-        pass
-
-    @abc.abstractmethod
-    def _transform(self, raw_value):
-        pass
-
-    @abc.abstractmethod
-    def build_encoder(self, latent_dim: int) -> tf.keras.Model:
-        pass
-
-    @abc.abstractmethod
-    def build_decoder(self, latent_dim: int) -> tf.keras.Model:
-        pass
-
-    @abc.abstractmethod
-    def to_string(self, predicted_array: np.ndarray) -> str:
-        pass
-
-    # New: optional helper for printing stats
-    def print_stats(self):
-        # Default no-op; each subclass can override.
-        pass
 
 ################################################################################
 # BooleanField
@@ -292,6 +300,7 @@ class BooleanField(BaseField):
 
     def build_decoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(latent_dim,), name=f"{self.name}_decoder_in")
+        
         x = Dense(8, activation='gelu')(inp)
         x = LayerNormalization()(x)
         x = Dense(8, activation='gelu')(x)
@@ -315,7 +324,7 @@ class ScalarField(BaseField):
         name: str,
         scaling: Scaling = Scaling.NONE,
         clip_max=None,
-        optional: bool = False
+        optional: bool = False,
     ):
         super().__init__(name, optional)
         self.scaling = scaling
@@ -328,6 +337,7 @@ class ScalarField(BaseField):
         self.max_val = float("-inf")
         self.mean_val = 0.0
         self.std_val = 1.0
+        self.encoding_dim = 32
 
     def _get_input_shape(self):
         return (1,)
@@ -364,6 +374,10 @@ class ScalarField(BaseField):
             self.mean_val = 0.0
             self.std_val = 1.0
 
+    def noise_function(self, x):
+        gaussian_noise = tf.keras.layers.GaussianNoise(stddev=0.05)(x)
+        return x + gaussian_noise
+
     def _transform(self, raw_value):
         x = 0.0
         if raw_value is not None:
@@ -391,10 +405,10 @@ class ScalarField(BaseField):
             is_null_part = predicted_array[-1]
             if is_null_part > 0.5:
                 return "None"
-            float_val = float(value_part)
+            float_val = float(value_part[0])
         else:
-            float_val = float(predicted_array)
-
+            float_val = float(predicted_array[0])
+        
         if self.scaling == Scaling.NONE:
             float_val = self.scaling.none_untransform(float_val)
         elif self.scaling == Scaling.NORMALIZE:
@@ -403,23 +417,29 @@ class ScalarField(BaseField):
             float_val = self.scaling.standardize_untransform(float_val, mean_val=self.mean_val, std_val=self.std_val)
         elif self.scaling == Scaling.LOG:
             float_val = self.scaling.log_untransform(float_val)
-
+        
         return f"{float_val:.2f}"
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=self.input_shape, name=f"{self.name}_input")
-        x = Dense(32, activation='gelu')(inp)
-        x = LayerNormalization()(x)
-        x = Dense(latent_dim // 8, activation='gelu')(x)
+        inp = self.noise_function(inp)
+        x = Dense(self.encoding_dim, activation='gelu')(inp)
+        x = Dense(self.encoding_dim, activation='gelu')(x)
         out = LayerNormalization()(x)
         return tf.keras.Model(inp, out, name=f"{self.name}_encoder")
 
     def build_decoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(latent_dim,), name=f"{self.name}_decoder_in")
-        x = Dense(32, activation='gelu')(inp)
-        x = LayerNormalization()(x)
-        x = Dense(self.output_shape[0], activation='linear')(x)
-        return tf.keras.Model(inp, x, name=f"{self.name}_decoder")
+        decoded = Dense(self.encoding_dim, activation='gelu')(inp)
+        decoded = Dense(self.encoding_dim, activation='gelu')(decoded)
+        decoded = LayerNormalization()(decoded)
+        decoded = Dense(1, activation='linear')(decoded)
+
+        if self.optional:
+            optional_decoded = Dense(1, activation='sigmoid')(inp)
+            decoded = tf.keras.layers.Concatenate()([decoded, optional_decoded])
+
+        return tf.keras.Model(inp, decoded, name=f"{self.name}_decoder")
 
     def print_stats(self):
         t = PrettyTable([f"Scalar Field", self.name])
@@ -430,9 +450,230 @@ class ScalarField(BaseField):
         t.add_row(["Std", self.std_val])
         print(t)
 
+
+class TextSwapNoise(tf.keras.layers.Layer):
+    def __init__(self, vocab_size, swap_prob, **kwargs):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.swap_prob = swap_prob
+
+    def call(self, inputs, training=None):
+        # Ensure training is a boolean; if None, default to False.
+        training = tf.cast(training if training is not None else False, tf.bool)
+
+        def add_noise():
+            # inputs shape: (batch, seq_length)
+            shape = tf.shape(inputs)
+            # For each token, sample a random float [0,1)
+            random_vals = tf.random.uniform(shape, 0, 1, dtype=tf.float32)
+            # Create a mask: True where a token should be swapped.
+            swap_mask = tf.cast(random_vals < self.swap_prob, inputs.dtype)
+            # Sample random tokens for every position.
+            random_tokens = tf.random.uniform(
+                shape, minval=0, maxval=self.vocab_size, dtype=inputs.dtype
+            )
+            # For positions marked in swap_mask, replace the token.
+            return tf.where(tf.equal(swap_mask, 1), random_tokens, inputs)
+
+        return tf.cond(training, add_noise, lambda: inputs)
+
+    def compute_output_shape(self, input_shape):
+        # The noise layer leaves the shape unchanged.
+        return input_shape
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "vocab_size": self.vocab_size,
+            "swap_prob": self.swap_prob,
+        })
+        return config
+    
+    def output_shape(self):
+        return self.input_shape
+
+
 ################################################################################
 # TextField
 ################################################################################
+class TransformerEncoderBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate=0.05, **kwargs):
+        super().__init__(**kwargs)
+        self.att = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = tf.keras.Sequential([
+            Dense(ff_dim, activation='gelu'),
+            Dense(embed_dim)
+        ])
+        self.norm1 = LayerNormalization()
+        self.norm2 = LayerNormalization()
+        self.dropout = tf.keras.layers.Dropout(dropout_rate)
+
+    def call(self, x, training=False):
+        seq_len = tf.shape(x)[1]
+        # Create a band mask: each token attends to itself and one token to each side
+        # This results in a (seq_len, seq_len) mask where positions more than 1 apart are blocked.
+        local_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), 1, 1)
+        attn_output = self.att(x, x, attention_mask=local_mask)
+        attn_output = self.dropout(attn_output, training=training)
+        out1 = self.norm1(x + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout(ffn_output, training=training)
+        return self.norm2(out1 + ffn_output)
+
+class TransformerDecoderBlock(tf.keras.layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout_rate=0.05, **kwargs):
+        super().__init__(**kwargs)
+        self.self_att = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = tf.keras.Sequential([
+            Dense(ff_dim, activation='gelu'),
+            Dense(embed_dim)
+        ])
+        self.norm1 = LayerNormalization()
+        self.norm2 = LayerNormalization()
+        self.dropout = tf.keras.layers.Dropout(dropout_rate)
+
+    def call(self, x, training=False):
+        seq_len = tf.shape(x)[1]
+        # Create a band mask so that each position attends only to its adjacent tokens.
+        local_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), 1, 1)
+        attn_output = self.self_att(x, x, attention_mask=local_mask)
+        attn_output = self.dropout(attn_output, training=training)
+        out1 = self.norm1(x + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout(ffn_output, training=training)
+        return self.norm2(out1 + ffn_output)
+    
+
+class AttentionPooling1D(tf.keras.layers.Layer):
+    def __init__(self, feature_dim, num_heads=2, dropout_rate=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.dropout_rate = dropout_rate
+        self.supports_masking = True
+
+        self.key_dense = Dense(self.feature_dim * self.num_heads, kernel_initializer="glorot_uniform", name="key_dense")
+        self.value_dense = Dense(self.feature_dim * self.num_heads, kernel_initializer="glorot_uniform", name="value_dense")
+        self.output_dense = Dense(self.feature_dim, kernel_initializer="glorot_uniform", name="output_dense")
+        self.attention_dropout = Dropout(self.dropout_rate)
+
+        self.global_query = self.add_weight(
+            shape=(self.num_heads, self.feature_dim),
+            initializer="glorot_uniform",
+            trainable=True,
+            name="global_query",
+        )
+
+    def call(self, inputs, mask=None, training=None):
+        batch_size = tf.shape(inputs)[0]
+        keys = self.key_dense(inputs)
+        values = self.value_dense(inputs)
+
+        keys = tf.reshape(keys, (batch_size, -1, self.num_heads, self.feature_dim))
+        values = tf.reshape(values, (batch_size, -1, self.num_heads, self.feature_dim))
+        keys = tf.transpose(keys, [0, 2, 1, 3])
+        values = tf.transpose(values, [0, 2, 1, 3])
+
+        query = tf.expand_dims(self.global_query, axis=0)
+        query = tf.tile(query, [batch_size, 1, 1])
+        query = tf.expand_dims(query, axis=2)
+
+        scores = tf.matmul(query, keys, transpose_b=True)
+        scores /= tf.math.sqrt(tf.cast(self.feature_dim, scores.dtype))
+
+        if mask is not None:
+            mask = tf.cast(tf.reshape(mask, [batch_size, 1, 1, -1]), scores.dtype)
+            scores += (1.0 - mask) * -1e9
+
+        weights = tf.nn.softmax(scores, axis=-1)
+        weights = self.attention_dropout(weights, training=training)
+        pooled = tf.matmul(weights, values)
+        pooled = tf.squeeze(pooled, axis=2)
+        pooled = tf.reshape(pooled, (batch_size, self.num_heads * self.feature_dim))
+        output = self.output_dense(pooled)
+        return output
+
+class GlobalSummaryPooling1D(tf.keras.layers.Layer):
+    def __init__(self, epsilon=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def call(self, inputs):
+        # inputs shape: (batch, sequence_length, channels)
+        mean = tf.reduce_mean(inputs, axis=1)          # (batch, channels)
+        max_val = tf.reduce_max(inputs, axis=1)         # (batch, channels)
+        min_val = tf.reduce_min(inputs, axis=1)         # (batch, channels)
+        # Standard deviation calculation
+        std = tf.sqrt(tf.reduce_mean(tf.square(inputs - tf.expand_dims(mean, axis=1)), axis=1) + self.epsilon)
+        # Range: difference between max and min
+        range_val = max_val - min_val
+        # Skewness: E[(x - mean)^3] / (std^3 + epsilon)
+        skew_numer = tf.reduce_mean(tf.pow(inputs - tf.expand_dims(mean, axis=1), 3), axis=1)
+        skew = skew_numer / (tf.pow(std, 3) + self.epsilon)
+        
+        # Stack metrics along a new axis, resulting in shape (batch, 6, channels)
+        summary = tf.stack([max_val, mean, std, min_val, range_val, skew], axis=1)
+        return summary
+
+    def compute_output_shape(self, input_shape):
+        # Input shape is (batch, sequence_length, channels)
+        return (input_shape[0], 6, input_shape[2])
+    
+
+class GlobalMaskedPooling1D(tf.keras.layers.Layer):
+    def __init__(self, input_size, epsilon=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        # This conv will reduce the stats dimension (of length 6) to 1.
+        self.mask_conv_big = tf.keras.layers.Conv1D(filters=64, kernel_size=1, padding="same", activation="linear")
+        self.mask_conv = tf.keras.layers.Conv1D(filters=1, kernel_size=1, padding="same", activation="gelu")
+        self.mask_dense = tf.keras.layers.Dense(input_size*2, activation="linear")
+        self.mask_dense_final = tf.keras.layers.Dense(input_size, activation="sigmoid")
+        self.flatten = Flatten()
+        self.softmax = Softmax()
+
+    def call(self, inputs):
+        # inputs shape: (batch, sequence_length, channels)
+        max_val = tf.reduce_max(inputs, axis=1, keepdims=True)  # (batch, 1, channels)
+        mean_val = tf.reduce_mean(inputs, axis=1, keepdims=True)  # (batch, 1, channels)
+        std_val = tf.sqrt(tf.reduce_mean(tf.square(inputs - mean_val), axis=1, keepdims=True) + self.epsilon)  # (batch, 1, channels)
+
+        # Skewness: E[(x - mean)^3] / (std^3 + epsilon)
+        skew = tf.reduce_mean(tf.pow(inputs - mean_val, 3), axis=1, keepdims=True) / (tf.pow(std_val, 3) + self.epsilon)  # (batch, 1, channels)
+
+        # Entropy: treat the sequence values as logits over positions per channel.
+        # Apply softmax along the sequence dimension to get probabilities.
+        p = tf.nn.softmax(inputs, axis=1)
+        entropy = -tf.reduce_sum(p * tf.math.log(p + self.epsilon), axis=1, keepdims=True)  # (batch, 1, channels)
+
+        # Kurtosis: E[(x - mean)^4] / (std^4 + epsilon) - 3.
+        kurtosis = tf.reduce_mean(tf.pow(inputs - mean_val, 4), axis=1, keepdims=True) / (tf.pow(std_val, 4) + self.epsilon) - 3  # (batch, 1, channels)
+
+        # Stack the metrics into a tensor of shape (batch, 6, channels)
+        # We are including: max, mean, std, skew, entropy, kurtosis.
+        stats = tf.concat([max_val, mean_val, std_val, skew, entropy, kurtosis], axis=1)
+        # Rotate so that the channels become the steps dimension: (batch, channels, 6)
+        stats = tf.transpose(stats, perm=[0, 2, 1])
+        
+        # Apply a Conv1D along the stats dimension to produce a mask per channel.
+        # The conv will reduce the 6 stats to 1.
+        mask = self.mask_conv_big(stats)
+        mask = self.mask_conv(mask)
+        mask = self.flatten(mask)
+        mask = self.mask_dense(mask)
+        mask = self.mask_dense_final(mask)
+        mask = tf.expand_dims(mask, axis=1)
+        
+        # Multiply the mask by the maxpooled vector.
+        output = mask * max_val
+        return output
+
+    def compute_output_shape(self, input_shape):
+        # Output shape: (batch, 1, channels)
+        return (input_shape[0], 1, input_shape[2])
+
+
+
 @tf.keras.utils.register_keras_serializable(package="Custom", name="MaskedSparseCategoricalCrossentropy")
 class MaskedSparseCategoricalCrossentropy(tf.keras.losses.Loss):
     def __init__(self, char_to_index, **kwargs):
@@ -562,8 +803,8 @@ class TextField(BaseField):
             name=f"{self.name}_embedding"
         )(inp)
 
-        x = Lambda(add_positional_encoding, 
-                output_shape=lambda s: (s[0], s[1], s[2] + 2),
+        x = Lambda(add_positional_encoding,
+                output_shape=lambda s: (s[0], s[1], s[2]),
                 name="add_positional_encoding")(embedding)
 
         current_length = self.max_length
@@ -576,9 +817,8 @@ class TextField(BaseField):
             current_length //= 2
             current_filters *= 2
             x = Conv1D(current_filters, 3, strides=2, activation='gelu', padding='same')(x)
-            # x = LayerNormalization()(x)
 
-        x = Conv1D(self.base_size, 3, activation='linear')(x)
+        x = Conv1D(current_filters, 3, activation='linear')(x)
         x = Flatten()(x)
         return tf.keras.Model(inp, x, name=f"{self.name}_encoder")
 
@@ -590,7 +830,7 @@ class TextField(BaseField):
         x = Dense(current_length * self.base_size, activation='gelu')(inp)
         x = Reshape((current_length, self.base_size))(x)
         x = Lambda(add_positional_encoding, 
-                output_shape=lambda s: (s[0], s[1], s[2] + 2),
+                output_shape=lambda s: (s[0], s[1], s[2]),
                 name="add_positional_encoding")(x)
 
         for step in range(self.downsample_steps):
@@ -623,6 +863,39 @@ class TextField(BaseField):
         t.add_row(["Max raw length", self.dynamic_max_len])
         t.add_row(["Final max_length", self.max_length])
         print(t)
+
+class MultiCategoryToggleLayer(Layer):
+    """
+    Flips each one-hot bit with probability `p` only when `training=True`.
+    """
+    def __init__(self, p, **kwargs):
+        super().__init__(**kwargs)
+        self.p = p
+
+    def call(self, inputs, training=None):
+        # If `training` is None, default to False. (This is typical for
+        # a functional model call without an explicit 'training' arg.)
+        if training is None:
+            training = False
+
+        def no_noise():
+            return inputs
+
+        def add_noise():
+            random_vals = tf.random.uniform(tf.shape(inputs), 0, 1, dtype=inputs.dtype)
+            toggles = tf.cast(random_vals < self.p, inputs.dtype)
+            return tf.where(toggles > 0, 1.0 - inputs, inputs)
+
+        # tf.cond expects boolean scalar for condition
+        return tf.cond(tf.cast(training, tf.bool), add_noise, no_noise)
+
+    def compute_output_shape(self, input_shape):
+        # Same shape as the input
+        return input_shape
+    
+    def compute_output_signature(self, input_signature):
+        # Same dtype/shape as input
+        return input_signature
 
 ################################################################################
 # MultiCategoryField
@@ -661,6 +934,20 @@ class MultiCategoryField(BaseField):
                 idx = self.category_list.index(c_str)
                 vec[idx] = 1.0
         return tf.constant(vec, dtype=tf.float32)
+    
+    def noise_function(self, x: tf.Tensor, training: bool = True) -> tf.Tensor:
+        return MultiCategoryToggleLayer(p=0.05)(x)
+
+    def _toggle_categories(self, cat_values: tf.Tensor, p: float) -> tf.Tensor:
+        """
+        Helper that flips bits in cat_values with probability p.
+        cat_values shape: (batch, num_categories)
+        """
+        random_vals = tf.random.uniform(tf.shape(cat_values), 0, 1, dtype=cat_values.dtype)
+        toggles = tf.cast(random_vals < p, cat_values.dtype)  # 1 where we flip, else 0
+        # Flipping means: new_val = 1 - old_val
+        # We'll do tf.where(toggles > 0, 1 - x, x)
+        return tf.where(toggles > 0, 1.0 - cat_values, cat_values)
 
     def to_string(self, predicted_array: np.ndarray) -> str:
         if self.optional:
@@ -682,6 +969,7 @@ class MultiCategoryField(BaseField):
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=self.input_shape, name=f"{self.name}_input", dtype=self.input_dtype)
+        x = self.noise_function(inp)
         x = Dense(32, activation='gelu')(inp)
         x = LayerNormalization()(x)
         x = Dense(32, activation='gelu')(x)
@@ -690,11 +978,12 @@ class MultiCategoryField(BaseField):
 
     def build_decoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(latent_dim,), name=f"{self.name}_decoder_in")
+        
         x = Dense(32, activation='gelu')(inp)
         x = LayerNormalization()(x)
         x = Dense(32, activation='gelu')(x)
         x = LayerNormalization()(x)
-        # Note: Use self.output_shape to account for the optional extra element.
+        # no denoising residual
         out = Dense(self.output_shape[0], activation='sigmoid', name=f"{self.name}_decoder")(x)
         return tf.keras.Model(inp, out, name=f"{self.name}_decoder")
 

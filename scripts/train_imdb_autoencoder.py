@@ -16,13 +16,10 @@ def main():
     model_dir = Path(project_config["model_dir"])
 
 
-    title_ae = TitlesAutoencoder(config, db_path)
-    title_ae.load_model(model_dir)
+    title_ae = TitlesAutoencoder(config, db_path, model_dir)
+    # title_ae.load_model()
     title_ae.fit()
-    title_ae.save_model(model_dir)
-
-    people_ae = PeopleAutoencoder(config, db_path)
-    # people_ae.fit()
+    title_ae.save_model()
 
 if __name__ == "__main__":
     main()

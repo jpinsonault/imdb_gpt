@@ -3,7 +3,9 @@ from pathlib import Path
 import sqlite3
 import tensorflow as tf
 from contextlib import redirect_stdout
-from autoencoder.schema import RowAutoencoder
+from scripts.autoencoder.row_autoencoder import RowAutoencoder
+from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCallback
+import os
 from autoencoder.fields import (
     TextField,
     ScalarField,
@@ -11,28 +13,25 @@ from autoencoder.fields import (
     Scaling,
     BaseField
 )
-from autoencoder.training_callbacks import ReconstructionCallback
-import os
 
 
 class TitlesAutoencoder(RowAutoencoder):
-    def __init__(self, config: Dict[str, Any], db_path: Path):
-        super().__init__(config)
+    def __init__(self, config: Dict[str, Any], db_path: Path, model_dir: Path):
+        super().__init__(config, model_dir)
         self.db_path = db_path
         self.model = None
         self.stats_accumulated = False
-        
 
     def build_fields(self) -> List[BaseField]:
         return [
-            MultiCategoryField("titleType"),
+            # MultiCategoryField("titleType"),
             TextField("primaryTitle"),
-            ScalarField("startYear", scaling=Scaling.STANDARDIZE),
+            # ScalarField("startYear", scaling=Scaling.STANDARDIZE),
             # ScalarField("endYear", scaling=Scaling.STANDARDIZE, optional=True),
-            ScalarField("runtimeMinutes", scaling=Scaling.LOG),
-            ScalarField("averageRating", scaling=Scaling.STANDARDIZE),
-            ScalarField("numVotes", scaling=Scaling.LOG),
-            MultiCategoryField("genres")
+            # ScalarField("runtimeMinutes", scaling=Scaling.LOG),
+            # ScalarField("averageRating", scaling=Scaling.STANDARDIZE),
+            # ScalarField("numVotes", scaling=Scaling.LOG),
+            # MultiCategoryField("genres")
         ]
 
     def row_generator(self):
@@ -55,6 +54,7 @@ class TitlesAutoencoder(RowAutoencoder):
                 AND t.runtimeMinutes IS NOT NULL
                 AND t.runtimeMinutes >= 5
                 AND t.startYear >= 1850
+                AND t.titleType IN ('movie', 'tvSeries', 'tvMovie', 'tvMiniSeries')
                 GROUP BY t.tconst
                 HAVING COUNT(g.genre) > 0
                 AND t.numVotes >= 10
@@ -97,18 +97,21 @@ class TitlesAutoencoder(RowAutoencoder):
         with redirect_stdout(open('logs/model_summary.txt', 'w')):
             self._print_model_architecture()
 
-        print(f"Loss dict: {self.get_loss_dict()}")
-        print(f"Loss weights dict: {self.get_loss_weights_dict()}")
-        schedule = [0.00001, 0.000005, 0.00001, .000005]
-
+        schedule = [
+            0.001,
+            0.0005,
+            0.0002, 0.0002,
+            0.0001, 0.0001,
+        ]
+        
         def fixed_scheduler(epoch, lr):
-            print(f"epoch: {epoch}, lr: {lr}")
             return schedule[epoch] if epoch < len(schedule) else schedule[-1]
-
         lr_callback = tf.keras.callbacks.LearningRateScheduler(fixed_scheduler)
 
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule[0], weight_decay=1e-6)
+
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=schedule[0]),
+            optimizer=optimizer,
             loss=self.get_loss_dict(),
             loss_weights=self.get_loss_weights_dict()
         )
@@ -128,16 +131,17 @@ class TitlesAutoencoder(RowAutoencoder):
             num_samples=20
         )
 
+        model_save_callback = ModelSaveCallback(self, output_dir=self.model_dir)
+
         ds = self._build_dataset()
 
         self.model.fit(
             ds,
             epochs=self.config["epochs"],
-            callbacks=[tensorboard_callback, reconstruction_callback, lr_callback]
+            callbacks=[tensorboard_callback, reconstruction_callback, lr_callback, model_save_callback]
         )
 
         print("\nTraining complete and model saved.")
-
 
 
 class PeopleAutoencoder(RowAutoencoder):
@@ -215,9 +219,6 @@ class PeopleAutoencoder(RowAutoencoder):
         # Write model summary to file (optional)
         with redirect_stdout(open('logs/people_model_summary.txt', 'w')):
             self._print_model_architecture()
-
-        print(f"Loss dict: {self.get_loss_dict()}")
-        print(f"Loss weights dict: {self.get_loss_weights_dict()}")
 
         learning_rate = 0.00005
         self.model.compile(

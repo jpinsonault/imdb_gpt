@@ -3,8 +3,20 @@ import numpy as np
 from prettytable import PrettyTable, TableStyle
 from typing import List, Dict
 import tensorflow as tf
-from .schema import RowAutoencoder
+from .row_autoencoder import RowAutoencoder
 from .fields import BaseField
+import os
+
+class ModelSaveCallback(tf.keras.callbacks.Callback):
+    def __init__(self, row_autoencoder: RowAutoencoder, output_dir):
+        super().__init__()
+        self.row_autoencoder = row_autoencoder
+        self.output_dir = output_dir
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.row_autoencoder.save_model()
+        print(f"Model saved to {self.output_dir} at the end of epoch {epoch+1}")
+
 
 class ReconstructionCallback(tf.keras.callbacks.Callback):
     def __init__(self, interval_batches, row_autoencoder: RowAutoencoder, db_path, num_samples=5):
@@ -126,9 +138,11 @@ class LatentCorrectorReconstructionCallback(tf.keras.callbacks.Callback):
                 )
                 for field in self.row_autoencoder.fields
             ]
+            
+            combined_inputs = tf.concat(inputs, axis=0)
 
             # Get the latent vector from the base encoder
-            latent = self.row_autoencoder.encoder.predict(inputs)
+            latent = self.row_autoencoder.encoder.predict(combined_inputs)
             # Add noise
             noise = np.random.normal(loc=0.0, scale=self.noise_std, size=latent.shape)
             noisy_latent = latent + noise

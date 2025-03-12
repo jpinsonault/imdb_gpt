@@ -6,7 +6,7 @@ import tensorflow as tf
 from contextlib import redirect_stdout
 from tqdm import tqdm
 from prettytable import PrettyTable
-from autoencoder.schema import RowAutoencoder, TableJoinSequenceEncoder
+from scripts.autoencoder.row_autoencoder import RowAutoencoder, TableJoinSequenceEncoder
 from autoencoder.fields import (
     TextField,
     ScalarField,
