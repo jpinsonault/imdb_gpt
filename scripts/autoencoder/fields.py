@@ -818,7 +818,9 @@ class TextField(BaseField):
             current_filters *= 2
             x = Conv1D(current_filters, 3, strides=2, activation='gelu', padding='same')(x)
 
-        x = Conv1D(current_filters, 3, activation='linear')(x)
+        x = Conv1D(current_filters, 3, activation='gelu', padding='same')(x)
+        x = Conv1D(current_filters, 3, activation='gelu', padding='same')(x)
+        x = Conv1D(self.base_size, 1, activation='gelu')(x)
         x = Flatten()(x)
         return tf.keras.Model(inp, x, name=f"{self.name}_encoder")
 
@@ -827,7 +829,12 @@ class TextField(BaseField):
         current_length = self.max_length // (2 ** self.downsample_steps)
         current_filters = self.base_size * (2 ** self.downsample_steps)
 
-        x = Dense(current_length * self.base_size, activation='gelu')(inp)
+        dense_restoration_size = current_length * self.base_size
+
+        x = Dense(dense_restoration_size//8, activation='gelu')(inp)
+        x = Dense(dense_restoration_size//4, activation='gelu')(x)
+        x = Dense(dense_restoration_size//2, activation='gelu')(x)
+        x = Dense(dense_restoration_size, activation='gelu')(x)
         x = Reshape((current_length, self.base_size))(x)
         x = Lambda(add_positional_encoding, 
                 output_shape=lambda s: (s[0], s[1], s[2]),
@@ -841,22 +848,24 @@ class TextField(BaseField):
             current_filters //= 2
             current_length *= 2
 
-        out = Conv1D(len(self.char_to_index), 1, activation='linear')(x)
+        out = Conv1D(len(self.char_to_index), 1, activation='gelu')(x)
         out = Softmax()(out)
         return tf.keras.Model(inp, out, name=f"{self.name}_decoder")
 
-    def _residual_block(self, x, filters, reduction_ratio=2, kernel_size=3, block_num=None, step_num=None):
-        if block_num is not None and step_num is not None:
-            print(f"Applying Residual Block {block_num + 1} at Step {step_num + 1} with {filters} filters.")
-
+    def _residual_block(self, x, filters, reduction_ratio=2, kernel_size=3, block_num=None, step_num=None, use_norm=False):
         shortcut = x
-        x = Conv1D(filters // reduction_ratio, 1, activation='gelu', padding='same')(x)
-        x = Conv1D(filters // reduction_ratio, kernel_size, activation='gelu', padding='same')(x)
-        x = Conv1D(filters, 1, activation='linear', padding='same')(x)
+        x = tf.keras.layers.Conv1D(filters // reduction_ratio, 1, activation='gelu', padding='same')(x)
+       
+        x = tf.keras.layers.Conv1D(filters // reduction_ratio, kernel_size, activation='gelu', padding='same')(x)
+        
+        x = tf.keras.layers.Conv1D(filters, 1, activation='linear', padding='same')(x)
         if shortcut.shape[-1] != x.shape[-1]:
-            shortcut = Conv1D(x.shape[-1], 1, padding='same', name=f'adjustment_conv_S{step_num}_B{block_num}')(shortcut)
-        return Add()([x, shortcut])
-
+            shortcut = tf.keras.layers.Conv1D(x.shape[-1], 1, padding='same')(shortcut)
+        x = tf.keras.layers.Add()([x, shortcut])
+        if use_norm:
+            x = tf.keras.layers.LayerNormalization()(x)
+        return x
+    
     def print_stats(self):
         t = PrettyTable([f"Text Field", self.name])
         t.add_row(["Unique chars", len(self.alphabet)])

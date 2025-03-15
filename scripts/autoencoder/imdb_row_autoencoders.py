@@ -99,7 +99,6 @@ class TitlesAutoencoder(RowAutoencoder):
 
         schedule = [
             0.001,
-            0.0005,
             0.0002, 0.0002,
             0.0001, 0.0001,
         ]
@@ -108,7 +107,7 @@ class TitlesAutoencoder(RowAutoencoder):
             return schedule[epoch] if epoch < len(schedule) else schedule[-1]
         lr_callback = tf.keras.callbacks.LearningRateScheduler(fixed_scheduler)
 
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule[0], weight_decay=1e-6)
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule[0], weight_decay=1e-4)
 
         self.model.compile(
             optimizer=optimizer,
