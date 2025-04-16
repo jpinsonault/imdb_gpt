@@ -1,12 +1,15 @@
-from typing import Any, Dict, List
 from pathlib import Path
+from typing import Any, Dict, List
 import sqlite3
-import tensorflow as tf
-from contextlib import redirect_stdout
-from scripts.autoencoder.row_autoencoder import RowAutoencoder
-from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCallback
 import os
+from contextlib import redirect_stdout
+
+import tensorflow as tf
+from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCallback
 from autoencoder.fields import (
+    NumericDigitCategoryField,
+    QuantileThresholdCategory,
+    SingleCategoryField,
     TextField,
     ScalarField,
     MultiCategoryField,
@@ -14,6 +17,7 @@ from autoencoder.fields import (
     BaseField
 )
 
+from scripts.autoencoder.row_autoencoder import RowAutoencoder
 
 class TitlesAutoencoder(RowAutoencoder):
     def __init__(self, config: Dict[str, Any], db_path: Path, model_dir: Path):
@@ -24,14 +28,13 @@ class TitlesAutoencoder(RowAutoencoder):
 
     def build_fields(self) -> List[BaseField]:
         return [
-            # MultiCategoryField("titleType"),
             TextField("primaryTitle"),
-            # ScalarField("startYear", scaling=Scaling.STANDARDIZE),
+            NumericDigitCategoryField("startYear", base=10),
             # ScalarField("endYear", scaling=Scaling.STANDARDIZE, optional=True),
-            # ScalarField("runtimeMinutes", scaling=Scaling.LOG),
-            # ScalarField("averageRating", scaling=Scaling.STANDARDIZE),
-            # ScalarField("numVotes", scaling=Scaling.LOG),
-            # MultiCategoryField("genres")
+            NumericDigitCategoryField("runtimeMinutes", base=10),
+            NumericDigitCategoryField("averageRating", base=10, fraction_digits=1),
+            NumericDigitCategoryField("numVotes", base=10),
+            MultiCategoryField("genres")
         ]
 
     def row_generator(self):
@@ -58,6 +61,7 @@ class TitlesAutoencoder(RowAutoencoder):
                 GROUP BY t.tconst
                 HAVING COUNT(g.genre) > 0
                 AND t.numVotes >= 10
+                LIMIT 100000
             """)
             for row in c:
                 yield {
@@ -90,24 +94,20 @@ class TitlesAutoencoder(RowAutoencoder):
         self.accumulate_stats()
 
         if self.model is None:
-            self._build_model()
-        
+            self.build_autoencoder()
+
         self._print_model_architecture()
 
         with redirect_stdout(open('logs/model_summary.txt', 'w')):
             self._print_model_architecture()
 
-        schedule = [
-            0.001,
-            0.0002, 0.0002,
-            0.0001, 0.0001,
-        ]
-        
+        schedule = [0.0002] * 200 + [0.00018]
+
         def fixed_scheduler(epoch, lr):
             return schedule[epoch] if epoch < len(schedule) else schedule[-1]
         lr_callback = tf.keras.callbacks.LearningRateScheduler(fixed_scheduler)
 
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule[0], weight_decay=1e-4)
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule[0], weight_decay=1e-3)
 
         self.model.compile(
             optimizer=optimizer,
@@ -141,22 +141,24 @@ class TitlesAutoencoder(RowAutoencoder):
         )
 
         print("\nTraining complete and model saved.")
-
+    
 
 class PeopleAutoencoder(RowAutoencoder):
-    def __init__(self, config: Dict[str, Any], db_path: Path):
-        super().__init__()
-        self.config = config
-        self.db_path = db_path  
+    def __init__(self, config: Dict[str, Any], db_path: Path, model_dir: Path):
+        super().__init__(config, model_dir)
+        self.db_path = db_path
         self.model = None
+        self.encoder = None
+        self.decoder = None
         self.stats_accumulated = False
+        self.latent_dim = config["latent_dim"]
 
     def build_fields(self) -> List[BaseField]:
         return [
             TextField("primaryName"),
-            ScalarField("birthYear", scaling=Scaling.STANDARDIZE),
-            # ScalarField("deathYear", scaling=Scaling.STANDARDIZE, optional=True), # optional as some people are still alive
-            # MultiCategoryField("professions", optional=True) # optional as some might have no profession listed
+            NumericDigitCategoryField("birthYear"),
+            # SingleCategoryField("deathYear", optional=True),
+            MultiCategoryField("professions")
         ]
 
     def row_generator(self):
@@ -170,85 +172,74 @@ class PeopleAutoencoder(RowAutoencoder):
                     GROUP_CONCAT(pp.profession, ',') AS professions
                 FROM people p
                 LEFT JOIN people_professions pp ON p.nconst = pp.nconst
-                WHERE p.birthYear IS NOT NULL  -- Filter out people without birth years
+                WHERE p.birthYear IS NOT NULL
                 GROUP BY p.nconst
+                HAVING COUNT(pp.profession) > 0
             """)
             for row in c:
                 yield {
                     "primaryName": row[0],
                     "birthYear": row[1],
                     "deathYear": row[2],
-                    "professions": row[3].split(',') if row[3] else []
+                    "professions": row[3].split(',') if row[3] else None
                 }
 
-    def _print_model_architecture(self):
-        print("\n--- Field Encoder/Decoder Summaries ---")
-        for field in self.fields:
-            encoder = field.build_encoder(latent_dim=self.config["latent_dim"])
-            print(f"\nEncoder: {field.name}")
-            encoder.summary()
-
-            decoder = field.build_decoder(latent_dim=self.config["latent_dim"])
-            print(f"\nDecoder: {field.name}")
-            decoder.summary()
-
-        print("--- Main Autoencoder Summary ---")
-        self.model.summary()
-        print("Model Outputs:", self.model.output_names)
-
-    def _build_dataset(self, db_path: Path) -> tf.data.Dataset:
-        def db_generator():
-             for row_dict in self.row_generator():
-                x = tuple(f.transform(row_dict.get(f.name)) for f in self.fields)
-                yield x, x
-
-        # Define the signature for tf.data
-        specs_in = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in self.fields)
-        specs_out = tuple(tf.TensorSpec(shape=f.output_shape, dtype=tf.float32) for f in self.fields)
-
-        ds = tf.data.Dataset.from_generator(db_generator, output_signature=(specs_in, specs_out))
-        return ds.batch(self.config["batch_size"])
 
     def fit(self):
-        self.accumulate_stats()
+        """Fits the standalone PeopleAutoencoder."""
+        print(f"--- Training Standalone {self.__class__.__name__} ---")
+        if not self.stats_accumulated:
+            self.accumulate_stats()
 
-        self._build_model()
-        self._print_model_architecture()
+        if self.model is None:
+            self.build_autoencoder()
 
-        # Write model summary to file (optional)
-        with redirect_stdout(open('logs/people_model_summary.txt', 'w')):
-            self._print_model_architecture()
+        print("\n--- People Autoencoder Architecture ---")
+        print("--- Encoder Summary ---")
+        self.encoder.summary()
+        print("--- Decoder Summary ---")
+        self.decoder.summary()
+        print("--- Main Autoencoder Summary ---")
+        self.model.summary()
 
-        learning_rate = 0.00005
+        initial_lr = self.config.get("learning_rate", 0.0001)
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr, weight_decay=1e-4)
+        loss_dict = self.get_loss_dict()
+        loss_weights_dict = self.get_loss_weights_dict()
+
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-            loss=self.get_loss_dict(),
-            loss_weights=self.get_loss_weights_dict()
+            optimizer=optimizer,
+            loss=list(loss_dict.values()),
+            loss_weights=list(loss_weights_dict.values())
         )
 
-        # Callbacks
-        log_dir = "logs/people_fit/" + str(int(tf.timestamp().numpy()))
+        log_dir = os.path.join(self.model_dir, "logs", f"{self.__class__.__name__}_fit", str(int(tf.timestamp().numpy())))
         os.makedirs(log_dir, exist_ok=True)
         tensorboard_callback = tf.keras.callbacks.TensorBoard(
-            log_dir=log_dir,
-            histogram_freq=1,
-            embeddings_freq=1,
-            update_freq=self.config["callback_interval"]
+            log_dir=log_dir, histogram_freq=1, update_freq='epoch'
+        )
+        checkpoint_path = os.path.join(self.model_dir, f"{self.__class__.__name__}_epoch_{{epoch:02d}}.keras")
+        model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+             filepath=checkpoint_path, save_weights_only=False, save_freq='epoch'
         )
         reconstruction_callback = ReconstructionCallback(
             interval_batches=self.config["callback_interval"],
             row_autoencoder=self,
             db_path=self.db_path,
-            num_samples=20,
+            num_samples=20
         )
 
-        ds = self._build_dataset(self.db_path)
+        ds = self._build_dataset()
 
-        # Train
+        print("Starting standalone training...")
         self.model.fit(
             ds,
             epochs=self.config["epochs"],
-            callbacks=[tensorboard_callback, reconstruction_callback]
+            callbacks=[
+                tensorboard_callback, 
+                model_checkpoint_callback,
+                reconstruction_callback
+            ]
         )
-        self.model.save("people_autoencoder.h5")
-        print("\nTraining complete and people autoencoder model saved.")
+        print("\nStandalone Training complete.")
+        self.save_model()
