@@ -180,44 +180,21 @@ class JointAutoencoder(tf.keras.Model):
         return m_z, p_z, m_recon, p_recon
 
     def train_step(self, data):
-        # data is (movie_inputs, person_inputs)
         movie_in, person_in = data
-
         with tf.GradientTape() as tape:
             m_z, p_z, m_recon, p_recon = self((movie_in, person_in), training=True)
-
-            # 1) Reconstruction losses
             rec_loss = 0.0
-            #  a) movie fields
-            for name, loss_fn in self.movie_losses.items():
-                # find the matching target in movie_in by output_names index
-                idx    = self.movie_ae.decoder.output_names.index(name)
-                target = movie_in[idx]
-                rec_loss += self.movie_weights[name] * tf.reduce_mean(
-                    loss_fn(target, m_recon[name])
-                )
-            #  b) person fields
-            for name, loss_fn in self.person_losses.items():
-                idx    = self.person_ae.decoder.output_names.index(name)
-                target = person_in[idx]
-                rec_loss += self.person_weights[name] * tf.reduce_mean(
-                    loss_fn(target, p_recon[name])
-                )
-
-            # 2) InfoNCE contrastive loss
+            for i, (loss_fn, w) in enumerate(zip(self.movie_losses.values(), self.movie_weights.values())):
+                rec_loss += w * tf.reduce_mean(loss_fn(movie_in[i], m_recon[i]))
+            for i, (loss_fn, w) in enumerate(zip(self.person_losses.values(), self.person_weights.values())):
+                rec_loss += w * tf.reduce_mean(loss_fn(person_in[i], p_recon[i]))
             nce = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
-
-            total_loss = rec_loss + nce
-
-        # backprop
-        grads = tape.gradient(total_loss, self.trainable_weights)
+            total = rec_loss + nce
+        grads = tape.gradient(total, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        return {"loss": total, "rec_loss": rec_loss, "nce": nce}
 
-        return {
-            "loss":      total_loss,
-            "rec_loss":  rec_loss,
-            "nce":       nce
-        }
+
 
 
 ##########################################################################

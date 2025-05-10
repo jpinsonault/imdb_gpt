@@ -280,72 +280,50 @@ class RowAutoencoder:
             raise RuntimeError("Stats must be accumulated and finalized before building the model.")
 
         latent_dim = self.latent_dim
-        inputs = {}
-        field_inputs_list = []
-        for field in self.fields:
-            inp = tf.keras.Input(
-                shape=field.input_shape,
-                name=f"{field.name}_input",
-                dtype=field.input_dtype
-            )
-            inputs[field.name] = inp
-            field_inputs_list.append(inp)
 
-        encoder_outputs = {}
+        # ---------- inputs ----------
+        inp_list = []
+        for f in self.fields:
+            inp = tf.keras.Input(shape=f.input_shape,
+                                name=f"{f.name}_input",
+                                dtype=f.input_dtype)
+            inp_list.append(inp)
+
+        # ---------- encoders ----------
+        enc_outs = []
         decoders = {}
-        for field in self.fields:
-            enc = field.build_encoder(latent_dim)
-            encoder_outputs[field.name] = enc(inputs[field.name])
-            dec = field.build_decoder(latent_dim)
-            decoders[field.name] = dec
+        for f, inp in zip(self.fields, inp_list):
+            enc = f.build_encoder(latent_dim)
+            dec = f.build_decoder(latent_dim)
+            enc_outs.append(enc(inp))
+            decoders[f.name] = dec             # keep for the combined decoder
 
-        if len(encoder_outputs) == 1:
-            combined = list(encoder_outputs.values())[0]
+        # ---------- latent bottleneck ----------
+        if len(enc_outs) == 1:
+            z = enc_outs[0]
         else:
-            combined = tf.keras.layers.Concatenate(
-                name="combined_encodings"
-            )(list(encoder_outputs.values()))
+            z = tf.keras.layers.Concatenate(name="concat_latent")(enc_outs)
 
-        x = tf.keras.layers.Dense(
-            latent_dim * 2,
-            activation='gelu',
-            name="dense_bottleneck_1"
-        )(combined)
-        x = tf.keras.layers.LayerNormalization(
-            name="layernorm_bottleneck_1"
-        )(x)
-        x = tf.keras.layers.Dense(
-            latent_dim,
-            activation='gelu',
-            name="dense_bottleneck_2"
-        )(x)
-        latent = tf.keras.layers.LayerNormalization(
-            name="latent_layernorm"
-        )(x)
-        latent = BatchRepel(coeff=1e-2, name="repel")(latent)
+        z = tf.keras.layers.Dense(latent_dim * 2, activation="gelu")(z)
+        z = tf.keras.layers.LayerNormalization()(z)
+        z = tf.keras.layers.Dense(latent_dim, activation="gelu")(z)
+        z = tf.keras.layers.LayerNormalization(name="latent")(z)
 
-        encoder_model = tf.keras.Model(
-            inputs=field_inputs_list,
-            outputs=latent,
-            name="Encoder",
-        )
-        self.encoder = encoder_model
+        self.encoder = tf.keras.Model(inp_list, z, name="Encoder")
 
-        decoder_outputs = []
-        for field in self.fields:
-            out = decoders[field.name](latent)
-            main_out = out[0] if isinstance(out, (list, tuple)) else out
-            decoder_outputs.append(main_out)
+        # ---------- combined decoder (NEW) ----------
+        dec_in = tf.keras.Input(shape=(latent_dim,), name="decoder_latent")
+        dec_outs = []
+        for f in self.fields:
+            out = decoders[f.name](dec_in)
+            main = out[0] if isinstance(out, (list, tuple)) else out
+            dec_outs.append(main)
+        self.decoder = tf.keras.Model(dec_in, dec_outs, name="Decoder")
 
-        autoencoder = tf.keras.Model(
-            inputs=field_inputs_list,
-            outputs=decoder_outputs,
-            name="RowAutoencoder",
-        )
-
-        self.model = autoencoder
-        return autoencoder
-
+        # ---------- full autoencoder ----------
+        ae_outs = self.decoder(z)
+        self.model = tf.keras.Model(inp_list, ae_outs, name="RowAutoencoder")
+        return self.model
 
 
     def save_model(self):
