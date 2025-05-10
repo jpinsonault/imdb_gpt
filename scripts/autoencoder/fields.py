@@ -540,25 +540,21 @@ class TextSwapNoise(tf.keras.layers.Layer):
 ################################################################################
 # MaskedSparseCategoricalCrossentropy Loss
 ################################################################################
-@tf.keras.utils.register_keras_serializable(package="Custom", name="MaskedSparseCategoricalCrossentropy")
-class MaskedSparseCategoricalCrossentropy(tf.keras.losses.Loss):
-    def __init__(self, ignore_class: int, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE, name="masked_sparse_categorical_crossentropy"):
-        super().__init__(reduction=reduction, name=name)
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class MaskedSparseCategoricalCrossentropy(
+        tf.keras.losses.SparseCategoricalCrossentropy):
+    def __init__(self, ignore_class: int,
+                 reduction=tf.keras.losses.Reduction.NONE, name=None):
+        super().__init__(from_logits=False, reduction=reduction, name=name)
         self.ignore_class = int(ignore_class)
 
-    def call(self, y_true, y_pred, sample_weight=None):
-        loss = tf.keras.losses.sparse_categorical_crossentropy(
-            y_true, y_pred, from_logits=False, axis=-1
-        )
+    def call(self, y_true, y_pred):
+        # y_true : (B, L)               int32
+        # y_pred : (B, L, V)            float32, probs
+        loss = super().call(y_true, y_pred)          # still rank‑2  (B, L)
         mask = tf.cast(tf.not_equal(y_true, self.ignore_class), loss.dtype)
-        masked_loss = loss * mask
-        per_timestep_loss = tf.reduce_mean(masked_loss, axis=-1)
-        per_sample_loss = tf.reduce_mean(per_timestep_loss, axis=-1)
-
-        if sample_weight is not None:
-            per_sample_loss *= sample_weight
-
-        return per_sample_loss
+        loss = loss * mask                           # zero‑out PAD
+        return tf.reduce_mean(loss, axis=-1)         # (B,)
 
     def get_config(self):
         config = super().get_config()
