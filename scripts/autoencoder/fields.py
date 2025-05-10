@@ -99,6 +99,7 @@ class BaseField(abc.ABC):
     def __init__(self, name: str, optional: bool = False):
         self.name = name
         self.optional = optional
+        self._stats_finalized = False
 
     @abc.abstractmethod
     def _get_input_shape(self):
@@ -186,7 +187,11 @@ class BaseField(abc.ABC):
 
     def finalize_stats(self):
         self._finalize_stats()
-
+        self._stats_finalized = True
+    
+    def stats_finalized(self) -> bool:
+        return self._stats_finalized
+    
     def transform(self, raw_value):
         """Transforms a raw value for model INPUT. Handles None for optional fields."""
         if raw_value is None:
@@ -231,7 +236,7 @@ class BaseField(abc.ABC):
         """Returns the loss function for the optional flag output head."""
         if not self.optional:
             return None
-        return tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+        return tf.keras.losses.BinaryCrossentropy()
 
 
     def _get_weight(self):
@@ -258,9 +263,9 @@ class BooleanField(BaseField):
 
     def _get_loss(self):
         if self.use_bce_loss:
-            return tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+            return tf.keras.losses.BinaryCrossentropy()
         else:
-            return tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
+            return tf.keras.losses.MeanSquaredError()
 
     def get_base_padding_value(self):
         return tf.constant([0.0], dtype=tf.float32)
@@ -363,7 +368,7 @@ class ScalarField(BaseField):
         return (1,)
 
     def _get_loss(self):
-        return tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
+        return tf.keras.losses.MeanSquaredError()
 
     def get_base_padding_value(self):
          # Padding value depends on scaling, return the scaled representation of 0.0
@@ -537,43 +542,33 @@ class TextSwapNoise(tf.keras.layers.Layer):
 ################################################################################
 @tf.keras.utils.register_keras_serializable(package="Custom", name="MaskedSparseCategoricalCrossentropy")
 class MaskedSparseCategoricalCrossentropy(tf.keras.losses.Loss):
-    def __init__(self, ignore_class, **kwargs):
-        kwargs['reduction'] = tf.keras.losses.Reduction.NONE
-        super().__init__(**kwargs)
-        self.ignore_class = ignore_class
+    def __init__(self, ignore_class: int, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE, name="masked_sparse_categorical_crossentropy"):
+        super().__init__(reduction=reduction, name=name)
+        self.ignore_class = int(ignore_class)
 
-    def call(self, y_true, y_pred):
-        # Expect y_true shape: (B, T, S) = (None, 10, 76)
-        # Expect y_pred shape: (B, T, S, V) = (None, 10, 76, 260)
-
-        # --- Calculate Sparse Categorical Crossentropy ---
-        # This assumes Keras passes Rank 4 y_pred and Rank 3 y_true
+    def call(self, y_true, y_pred, sample_weight=None):
         loss = tf.keras.losses.sparse_categorical_crossentropy(
-            y_true, y_pred, from_logits=False, axis=-1 # Use axis=-1 for the Vocab dimension
+            y_true, y_pred, from_logits=False, axis=-1
         )
-        # loss shape should be (B, T, S)
-
-        # --- Create and apply the mask based on y_true ---
-        # Ensure ignore_class ID is correct (e.g., self.pad_token_id)
-        mask = tf.cast(tf.not_equal(y_true, self.ignore_class), dtype=loss.dtype)
+        mask = tf.cast(tf.not_equal(y_true, self.ignore_class), loss.dtype)
         masked_loss = loss * mask
-        # masked_loss shape: (B, T, S)
+        per_timestep_loss = tf.reduce_mean(masked_loss, axis=-1)
+        per_sample_loss = tf.reduce_mean(per_timestep_loss, axis=-1)
 
-        # --- Reduce loss ---
-        # Average over the text sequence dimension S (last dimension).
-        loss_reduced_over_seq = tf.reduce_mean(masked_loss, axis=-1)
-        # loss_reduced_over_seq shape: (B, T)
+        if sample_weight is not None:
+            per_sample_loss *= sample_weight
 
-        # Return loss per time step for each batch item, Keras applies sample_weights
-        return loss_reduced_over_seq
-
+        return per_sample_loss
 
     def get_config(self):
         config = super().get_config()
-        config.update({
-            "ignore_class": self.ignore_class,
-        })
+        config.update({"ignore_class": self.ignore_class})
         return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
 
 ################################################################################
 # TextField
@@ -877,7 +872,7 @@ class MultiCategoryField(BaseField):
 
     def _get_loss(self):
         # Multi-label classification loss for the main output head.
-        return tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+        return tf.keras.losses.BinaryCrossentropy()
 
     def get_base_padding_value(self):
         # Padding is a vector of zeros.
@@ -1076,8 +1071,7 @@ class SingleCategoryField(BaseField):
 
     def _get_loss(self):
         # Use sparse categorical crossentropy; assume decoder outputs logits over vocab.
-        return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True,
-                                                             reduction=tf.keras.losses.Reduction.NONE)
+        return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 
     def get_base_padding_value(self):
         return tf.constant([0], dtype=tf.int32)
@@ -1150,81 +1144,6 @@ class SingleCategoryField(BaseField):
         )(inp)
         return tf.keras.Model(inp, logits, name=f"{self.name}_decoder")
 
-class QuantileThresholdCategory(SingleCategoryField):
-    def __init__(self, name: str, num_bins: int = 4, optional: bool = False):
-        super().__init__(name, optional)
-        self.num_bins = num_bins
-        self.data_points = []
-        self.thresholds = None
-
-    def _accumulate_stats(self, raw_value):
-        if raw_value is not None:
-            try:
-                self.data_points.append(float(raw_value))
-            except (ValueError, TypeError):
-                pass
-
-    def _finalize_stats(self):
-        if len(self.data_points) == 0:
-            logging.warning(f"No data accumulated for field '{self.name}'.")
-            self.thresholds = None
-            self.category_list = []
-            return
-
-        # Calculate quantile thresholds: num_bins+1 values
-        self.thresholds = np.quantile(self.data_points, np.linspace(0, 1, self.num_bins + 1))
-        categories = []
-        for i in range(self.num_bins):
-            if i == 0:
-                label = f"less-than-{int(self.thresholds[1])}"
-            elif i == self.num_bins - 1:
-                label = f"greater-than-{int(self.thresholds[-2])}"
-            else:
-                label = f"{int(self.thresholds[i])}-to-{int(self.thresholds[i+1])}"
-            categories.append(label)
-        self.category_list = categories
-
-    def _transform(self, raw_value):
-        try:
-            val = float(raw_value)
-        except (ValueError, TypeError):
-            val = 0.0
-
-        if self.thresholds is None:
-            self.data_points.append(val)
-            self._finalize_stats()
-
-        # Use inner thresholds as bins for digitization.
-        bins = self.thresholds[1:-1]
-        bin_index = int(np.digitize(val, bins, right=False))
-        return tf.constant([bin_index], dtype=tf.int32)
-
-    def print_stats(self):
-        if self.thresholds is None or len(self.data_points) == 0:
-            print(f"No data accumulated for field '{self.name}'.")
-            return
-
-        bins = self.thresholds[1:-1]
-        bin_counts = [0] * self.num_bins
-        for val in self.data_points:
-            bin_index = int(np.digitize(val, bins, right=False))
-            bin_counts[bin_index] += 1
-
-        total = len(self.data_points)
-        table = PrettyTable()
-        table.field_names = ["Bucket", "Count", "Frequency"]
-        for label, count in zip(self.category_list, bin_counts):
-            frequency = count / total
-            table.add_row([label, count, f"{frequency:.4f}"])
-        print(table)
-
-def digit_loss(y_true, y_pred):
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=False,
-        reduction=tf.keras.losses.Reduction.NONE
-    )
-    loss = loss_fn(y_true, y_pred)
-    return tf.reduce_mean(loss, axis=-1)
 
 class NumericDigitCategoryField(BaseField):
     def __init__(self, name: str, base: int = 10, fraction_digits: int = 0, optional: bool = False):
@@ -1232,166 +1151,228 @@ class NumericDigitCategoryField(BaseField):
         self.base = base
         self.fraction_digits = fraction_digits
         self.data_points = []
+        self.has_negative = False
+        self.has_nan = False
         self.integer_digits = None
         self.total_positions = None
 
+    def _accumulate_stats(self, raw_value):
+        # detect None or NaN
+        if raw_value is None:
+            self.has_nan = True
+        else:
+            try:
+                val = float(raw_value)
+                if math.isnan(val):
+                    self.has_nan = True
+                else:
+                    if val < 0:
+                        self.has_negative = True
+                    self.data_points.append(val)
+            except (ValueError, TypeError):
+                # non-numeric string—treat as nan
+                self.has_nan = True
+
+    def _finalize_stats(self):
+        # determine width of integer part from non-nan values
+        if not self.data_points:
+            self.integer_digits = 1
+        else:
+            abs_ints = [int(math.floor(abs(v))) for v in self.data_points]
+            max_int = max(abs_ints)
+            if max_int > 0:
+                needed = int(math.floor(math.log(max_int, self.base))) + 1
+            else:
+                needed = 0
+            self.integer_digits = needed or (1 if self.fraction_digits > 0 else 1)
+
+        # compute total positions: [nan?][sign?] + integer_digits + fraction_digits
+        self.total_positions = (
+            (1 if self.has_nan else 0)
+            + (1 if self.has_negative else 0)
+            + self.integer_digits
+            + self.fraction_digits
+        )
+
     def _get_input_shape(self):
-        if self.integer_digits is None or self.total_positions is None:
+        if self.total_positions is None:
             self._finalize_stats()
-        return (self.total_positions, )
+        return (self.total_positions,)
 
     def _get_output_shape(self):
         return self._get_input_shape()
 
     def _get_loss(self):
-        
-        return digit_loss
+        return tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
 
     def get_base_padding_value(self):
-        total_positions = self._get_input_shape()[0]
-        return tf.constant([0] * total_positions, dtype=tf.int32)
+        return tf.constant([0] * self._get_input_shape()[0], dtype=tf.int32)
 
     def get_flag_padding_value(self):
-         return tf.constant([1.0], dtype=tf.float32)
-
-    def _accumulate_stats(self, raw_value):
-        if raw_value is not None:
-            try:
-                val = float(raw_value)
-                self.data_points.append(val)
-            except (ValueError, TypeError):
-                pass
-
-    def _finalize_stats(self):
-        if not self.data_points:
-            logging.warning(f"No data accumulated for field '{self.name}'.")
-            self.integer_digits = 1
-        else:
-            abs_ints = [int(math.floor(abs(val))) for val in self.data_points]
-            max_int = max(abs_ints) if abs_ints else 0
-            if max_int > 0:
-                needed = int(math.floor(math.log(max_int, self.base))) + 1
-            else:
-                needed = 0
-            if self.fraction_digits > 0 and needed == 0:
-                needed = 1
-            self.integer_digits = needed
-        self.total_positions = 1 + self.integer_digits + self.fraction_digits
-
-    def _int_to_digits(self, n: int, length: int) -> List[int]:
-        digits = []
-        for _ in range(length):
-            digits.append(n % self.base)
-            n //= self.base
-        digits.reverse()
-        return digits
+        return tf.constant([1.0], dtype=tf.float32)
 
     def _transform(self, raw_value):
-        try:
-            val = float(raw_value)
-        except (ValueError, TypeError):
-            val = 0.0
-        if self.integer_digits is None:
-            self.data_points.append(val)
+        # ensure stats finalized
+        if self.total_positions is None:
             self._finalize_stats()
-        sign_digit = 1 if val < 0 else 0
-        abs_val = abs(val)
+
+        # detect nan or None
+        is_nan = False
+        if raw_value is None:
+            is_nan = True
+        else:
+            try:
+                val = float(raw_value)
+                if math.isnan(val):
+                    is_nan = True
+                else:
+                    raw = val
+            except (ValueError, TypeError):
+                is_nan = True
+
+        # if this is nan/None, set nan slot=1 and zero-fill the rest
+        if is_nan:
+            return tf.constant([1] + [0] * (self.total_positions - 1), dtype=tf.int32)
+
+        seq = []
+        # nan slot
+        if self.has_nan:
+            seq.append(0)
+        # sign slot
+        if self.has_negative:
+            seq.append(1 if raw < 0 else 0)
+
+        abs_val = abs(raw)
         ipart = int(math.floor(abs_val))
+
+        # integer digits
         if self.integer_digits > 0:
             int_digits = self._int_to_digits(ipart, self.integer_digits)
         else:
             int_digits = []
-        frac_digits = []
-        if self.fraction_digits > 0:
-            fractional = abs_val - ipart
-            scaled = int(round(fractional * (self.base ** self.fraction_digits)))
-            if scaled >= self.base ** self.fraction_digits:
-                scaled = self.base ** self.fraction_digits - 1
-            frac_digits = self._int_to_digits(scaled, self.fraction_digits)
-        digit_seq = [sign_digit] + int_digits + frac_digits
-        return tf.constant(digit_seq, dtype=tf.int32)
+        seq.extend(int_digits)
 
-    def to_string(self, predicted_main: np.ndarray, flag_tensor: Optional[np.ndarray] = None) -> str:
-        total_positions = self._get_input_shape()[0]
-        if predicted_main.ndim > 1:
-            predicted_main = predicted_main.flatten()
-        if len(predicted_main) != total_positions:
-            raise ValueError("Mismatch in predicted digit length.")
-        sign_digit = int(predicted_main[0])
-        sign_str = "-" if (sign_digit % 2) == 1 else ""
-        int_digits = predicted_main[1:1+self.integer_digits]
-        frac_digits = predicted_main[1+self.integer_digits:]
-        int_val = 0
-        for d in int_digits:
-            int_val = int_val * self.base + int(d)
-        frac_val = 0
-        for d in frac_digits:
-            frac_val = frac_val * self.base + int(d)
+        # fraction digits
         if self.fraction_digits > 0:
-            frac_str = f"{frac_val:0{self.fraction_digits}d}"
-            return f"{sign_str}{int_val}.{frac_str}"
-        else:
-            return f"{sign_str}{int_val}"
+            frac = abs_val - ipart
+            scaled = int(round(frac * (self.base ** self.fraction_digits)))
+            scaled = min(scaled, self.base**self.fraction_digits - 1)
+            seq.extend(self._int_to_digits(scaled, self.fraction_digits))
+
+        # pad if anything missing
+        if len(seq) < self.total_positions:
+            seq += [0] * (self.total_positions - len(seq))
+
+        return tf.constant(seq, dtype=tf.int32)
+
+    def to_string(self, predicted_tensor: np.ndarray, flag_tensor: Optional[np.ndarray] = None) -> str:
+        """
+        Converts the raw output tensor (probabilities/logits per position)
+        from the decoder into a string representation of the number.
+        Performs argmax internally.
+        """
+        # Ensure stats are finalized to get shape info
+        if self.total_positions is None or self.base is None or self.integer_digits is None:
+             logging.error(f"Field '{self.name}': Stats (total_positions/base/integer_digits) not finalized in to_string.")
+             # Attempt to finalize, though ideally this should be done before reconstruction
+             self._finalize_stats()
+             if self.total_positions is None or self.base is None or self.integer_digits is None:
+                 raise RuntimeError(f"Field '{self.name}': Cannot determine necessary stats even after finalize attempt.")
+
+        expected_shape = (self.total_positions, self.base)
+        if predicted_tensor.shape != expected_shape:
+            # Add a check for the input shape before processing
+            raise ValueError(f"Field '{self.name}': Input tensor shape {predicted_tensor.shape} does not match expected shape {expected_shape}.")
+
+        # **** Core Change: Perform argmax here ****
+        # Find the index (predicted digit) with the highest probability/logit for each position
+        predicted_digits = np.argmax(predicted_tensor, axis=-1) # Shape will be (total_positions,)
+
+        # --- The rest of the logic uses the 1D 'predicted_digits' array ---
+        total_expected_digits = self.total_positions
+        if len(predicted_digits) != total_expected_digits:
+            # This check is unlikely to fail now but kept for sanity
+            raise ValueError(f"Field '{self.name}': Length mismatch after argmax. Got {len(predicted_digits)}, expected {total_expected_digits}.")
+
+        logging.debug(f"Field '{self.name}': Predicted digits after argmax: {predicted_digits}")
+
+        idx = 0
+        # Check for NaN representation (if applicable)
+        if self.has_nan:
+            if int(predicted_digits[idx]) == 1: # Assuming 1 represents NaN in the first slot
+                return "NaN"
+            idx += 1 # Move past the NaN slot
+
+        # Check for sign representation (if applicable)
+        negative = False
+        if self.has_negative:
+            negative = bool(int(predicted_digits[idx]) == 1) # Assuming 1 represents negative in the sign slot
+            idx += 1 # Move past the sign slot
+
+        # Reconstruct integer part
+        int_val = 0
+        num_int_digits_to_read = self.integer_digits
+        try:
+            int_digits_slice = predicted_digits[idx : idx + num_int_digits_to_read]
+            if len(int_digits_slice) != num_int_digits_to_read:
+                 logging.error(f"Field '{self.name}': Error slicing integer digits. Idx={idx}, NumRead={num_int_digits_to_read}, SliceLen={len(int_digits_slice)}, TotalDigits={len(predicted_digits)}")
+                 return "[Error Slicing Int Digits]"
+            for digit in int_digits_slice:
+                int_val = int_val * self.base + int(digit)
+            idx += num_int_digits_to_read
+        except IndexError:
+             logging.error(f"Field '{self.name}': IndexError reading integer digits. Idx={idx}, NumRead={num_int_digits_to_read}, TotalDigits={len(predicted_digits)}")
+             return "[IndexError Reading Int Digits]"
+
+
+        # Reconstruct fraction part
+        frac_val = 0
+        num_frac_digits_to_read = self.fraction_digits
+        try:
+            if num_frac_digits_to_read > 0:
+                frac_digits_slice = predicted_digits[idx : idx + num_frac_digits_to_read]
+                if len(frac_digits_slice) != num_frac_digits_to_read:
+                    logging.error(f"Field '{self.name}': Error slicing fraction digits. Idx={idx}, NumRead={num_frac_digits_to_read}, SliceLen={len(frac_digits_slice)}, TotalDigits={len(predicted_digits)}")
+                    return "[Error Slicing Frac Digits]"
+                for digit in frac_digits_slice:
+                    frac_val = frac_val * self.base + int(digit)
+                idx += num_frac_digits_to_read
+        except IndexError:
+            logging.error(f"Field '{self.name}': IndexError reading fraction digits. Idx={idx}, NumRead={num_frac_digits_to_read}, TotalDigits={len(predicted_digits)}")
+            return "[IndexError Reading Frac Digits]"
+
+
+        # Format the final string
+        s = f"{int_val}"
+        if self.fraction_digits > 0:
+            # Ensure the fraction part is padded with leading zeros if needed
+            s += "." + f"{frac_val:0{self.fraction_digits}d}"
+
+        # Prepend sign if necessary
+        return ("-" if negative else "") + s
 
     def print_stats(self):
-        if not self.data_points:
-            print(f"No data accumulated for field '{self.name}'.")
-            return
-
-        if self.integer_digits is None:
+        if self.integer_digits is None or self.total_positions is None:
             self._finalize_stats()
 
-        total_samples = len(self.data_points)
-        total_positions = self.total_positions
+        tbl = PrettyTable()
+        tbl.field_names = [
+            "Field", "Base", "Int Digits", "Frac Digits",
+            "Has Sign", "Has NaN", "Total Positions", "Samples"
+        ]
+        tbl.add_row([
+            self.name, self.base, self.integer_digits, self.fraction_digits,
+            self.has_negative, self.has_nan, self.total_positions,
+            len(self.data_points) + (1 if self.has_nan else 0)
+        ])
+        print(tbl)
 
-        overall = PrettyTable()
-        overall.field_names = ["Field", "Base", "Integer Digits", "Fraction Digits", "Sign Position", "Total Positions", "Total Samples"]
-        overall.add_row([self.name, self.base, self.integer_digits, self.fraction_digits, 1, total_positions, total_samples])
-        print(overall)
-
-        counters = []
-        counters.append({i: 0 for i in range(2)})
-        for _ in range(total_positions - 1):
-            counters.append({i: 0 for i in range(self.base)})
-
-        for val in self.data_points:
-            sign_digit = 1 if val < 0 else 0
-            abs_val = abs(val)
-            ipart = int(math.floor(abs_val))
-            if self.integer_digits > 0:
-                int_digits = self._int_to_digits(ipart, self.integer_digits)
-            else:
-                int_digits = []
-            frac_digits = []
-            if self.fraction_digits > 0:
-                fractional = abs_val - ipart
-                scaled = int(round(fractional * (self.base ** self.fraction_digits)))
-                if scaled >= self.base ** self.fraction_digits:
-                    scaled = self.base ** self.fraction_digits - 1
-                frac_digits = self._int_to_digits(scaled, self.fraction_digits)
-            seq = [sign_digit] + int_digits + frac_digits
-            for pos, digit in enumerate(seq):
-                if pos == 0:
-                    digit = digit if digit in (0, 1) else 0
-                counters[pos][digit] += 1
-
-        for pos in range(total_positions):
-            tbl = PrettyTable()
-            if pos == 0:
-                tbl.title = "Sign Digit (0: positive, 1: negative)"
-                cls_range = range(2)
-            else:
-                if pos <= self.integer_digits:
-                    tbl.title = f"Integer Digit Position {pos} (from most significant)"
-                else:
-                    frac_pos = pos - self.integer_digits
-                    tbl.title = f"Fraction Digit Position {frac_pos} (after decimal)"
-                cls_range = range(self.base)
-            tbl.field_names = ["Digit", "Count", "Frequency"]
-            for d in cls_range:
-                count = counters[pos].get(d, 0)
-                tbl.add_row([d, count, f"{count/total_samples:.4f}"])
-            print(tbl)
+    def _int_to_digits(self, value, num_digits):
+        digits = []
+        for _ in range(num_digits):
+            digits.append(value % self.base)
+            value //= self.base
+        return digits[::-1]  # reverse to correct order
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=self._get_input_shape(), name=f"{self.name}_input", dtype=tf.int32)

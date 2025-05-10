@@ -6,7 +6,14 @@ import os
 from contextlib import redirect_stdout
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras.layers import (
+    LayerNormalization,
+    Conv1D,
+    RepeatVector,
+    Lambda,
+    Activation,
+    Add,
+)
 from tensorflow.keras import ops
 
 from autoencoder.training_callbacks import ModelSaveCallback, TensorBoardPerBatchLoggingCallback, ReconstructionCallback, SequenceReconstructionCallback
@@ -36,6 +43,30 @@ def add_positional_encoding(input_sequence):
 
     return input_sequence + pos_encoding
 
+
+# -----------------------------------------------------------------------------
+# Reusable 1×1 residual block
+# -----------------------------------------------------------------------------
+
+def residual_block(width: int, name: str | None = None):
+    """Pre‑norm GELU residual block with kernel_size = 1.
+
+    Args:
+        width:     Number of channels for both conv layers and the residual add.
+        name:      Optional base string for layer naming.
+    Returns:
+        A function mapping a tensor of shape (B, T, width) to the same shape.
+    """
+    def inner(x):
+        res = x
+        x = LayerNormalization(name=f"{name}_ln" if name else None)(x)
+        x = Conv1D(width, 1, activation="gelu", name=f"{name}_conv1" if name else None)(x)
+        x = Conv1D(width, 1, name=f"{name}_conv2" if name else None)(x)
+        x = Add(name=f"{name}_add" if name else None)([x, res])
+        x = Activation("gelu", name=f"{name}_act" if name else None)(x)
+        return x
+
+    return inner
 
 class MoviesToPeopleSequenceAutoencoder:
     def __init__(self, config: Dict[str, Any], db_path: Path, model_dir: Path):
@@ -148,312 +179,110 @@ class MoviesToPeopleSequenceAutoencoder:
         if not self.stats_accumulated:
             raise RuntimeError("Stats must be accumulated before building the model.")
 
-        movie_fields = self.movie_autoencoder_instance.fields
+        movie_fields  = self.movie_autoencoder_instance.fields
         people_fields = self.people_autoencoder_instance.fields
-        latent_dim = self.latent_dim
-        seq_len = self.people_sequence_length
+        latent_dim    = self.latent_dim
+        seq_len       = self.people_sequence_length
 
-        # — movie inputs & frozen encoder —
+        # movie inputs & frozen encoder
         movie_inputs = {
-            field.name: tf.keras.Input(shape=field.input_shape, name=f"{field.name}_input", dtype=field.input_dtype)
-            for field in movie_fields
+            f.name: tf.keras.Input(
+                shape=f.input_shape,
+                name=f"{f.name}_input",
+                dtype=f.input_dtype,
+            )
+            for f in movie_fields
         }
-        # pass them *in the same order* the TitlesAutoencoder.encoder expects
-        movie_latent = self.movie_encoder([
-            movie_inputs[field.name] for field in movie_fields
-        ])
+        movie_latent = self.movie_encoder([movie_inputs[f.name] for f in movie_fields])
 
-        # — expand to sequence, process, reshape for decoding —
-        x = tf.keras.layers.RepeatVector(seq_len)(movie_latent)
-        x = tf.keras.layers.Conv1D(latent_dim * 2, 1, activation='linear')(x)
-        x = tf.keras.layers.Conv1D(latent_dim,   1, activation='gelu')(x)
-        x = tf.keras.layers.LayerNormalization()(x)
-        flat = tf.reshape(x, (-1, latent_dim))   # (batch*seq_len, latent_dim)
+        trunk_width = latent_dim * 2
+        x = RepeatVector(seq_len, name="repeat_latent")(movie_latent)  # (B, T, D)
+        x = Conv1D(trunk_width, 1, activation="gelu", name="project_up")(x)
 
-        # — run the frozen people‐decoder on every time step in batch*
-        decoder_outputs = self.people_decoder(flat)
-        # decoder_outputs is a dict: e.g. { "primaryName_decoder": tensor or [main,flag], ... }
+        for i in range(4):
+            x = residual_block(trunk_width, name=f"resblock_{i}")(x)
 
+        # final projection back to latent_dim
+        x = Conv1D(latent_dim, 1, activation="gelu", name="project_down")(x)
+
+        # ------------------------------------------------------------------
+        # decode each timestep with the frozen people decoder
+        # ------------------------------------------------------------------
+        def _decode_and_reshape(z):
+            b = tf.shape(z)[0]
+            T = seq_len
+            D = tf.shape(z)[2]
+            flat = tf.reshape(z, (b * T, D))
+            decoded = self.people_decoder(flat)
+
+            def _reshape_tensor(t):
+                tail = tf.shape(t)[1:]
+                return tf.reshape(t, tf.concat([[b, T], tail], axis=0))
+
+            return tf.nest.map_structure(_reshape_tensor, decoded)
+
+        decoded_seq = Lambda(_decode_and_reshape, name="SequenceDecode")(x)
+
+        # 4) collect and name outputs
         outputs = []
-        names   = []
-        T = seq_len
         for field in people_fields:
-            recon = decoder_outputs[f"{field.name}_decoder"]
-            if isinstance(recon, (list, tuple)):
-                main_flat, flag_flat = recon
+            rec = decoded_seq[f"{field.name}_decoder"]
+            if isinstance(rec, (list, tuple)):
+                main_seq, flag_seq = rec
+                outputs.append(
+                    Activation("linear", name=f"{field.name}_main_out")(main_seq)
+                )
+                outputs.append(
+                    Activation("linear", name=f"{field.name}_flag_out")(flag_seq)
+                )
             else:
-                main_flat, flag_flat = recon, None
+                outputs.append(
+                    Activation("linear", name=f"{field.name}_out")(rec)
+                )
 
-            # reshape back into (batch, T, …)
-            main_seq = tf.reshape(main_flat, (-1, T) + tuple(main_flat.shape[1:]))
-            name = f"{field.name}_main_out"
-            outputs.append(tf.keras.layers.Activation('linear', name=name, dtype=tf.float32)(main_seq))
-            names.append(name)
-
-            if flag_flat is not None:
-                flag_seq = tf.reshape(flag_flat, (-1, T, 1))
-                fname = f"{field.name}_flag_out"
-                outputs.append(tf.keras.layers.Activation('linear', name=fname, dtype=tf.float32)(flag_seq))
-                names.append(fname)
-
-        self.model = tf.keras.Model(
+        # 5) build, assign, and return
+        model = tf.keras.Model(
             inputs=list(movie_inputs.values()),
             outputs=outputs,
             name="MovieToPeopleSequencePredictor"
         )
-        return self.model
+        self.model = model
+        return model
 
 
-    def _build_dataset(self) -> tf.data.Dataset:
-        """
-        Builds the tf.data.Dataset for training the sequence prediction model.
-
-        Yields tuples of (inputs, targets, sample_weights):
-        - inputs: A tuple of tensors representing the input movie fields.
-        - targets: A dictionary mapping PEOPLE output layer names to the corresponding
-                   target tensors (people field sequences). Handles main/flag.
-        - sample_weights: A dictionary mapping PEOPLE output layer names to sample weights
-                          (masking padded time steps).
-
-        Raises:
-            RuntimeError: If stats have not been accumulated before calling.
-        """
-        if not self.stats_accumulated:
-            raise RuntimeError("Stats must be accumulated before building the dataset. Call accumulate_stats().")
-
-        # Get necessary attributes
-        movie_fields: List[BaseField] = self.movie_autoencoder_instance.fields
-        people_fields: List[BaseField] = self.people_autoencoder_instance.fields
-        seq_length: int = self.people_sequence_length
-        batch_size = self.config.get("batch_size", 32)
-
-        # Ensure people decoders were built
-        if not hasattr(self, 'people_decoders') or not self.people_decoders:
-             raise RuntimeError("People decoder instances not found. Ensure build_autoencoder() has been called.")
-        people_decoders = self.people_decoders
-
-        def db_generator():
-            """Generator function yielding data for sequence prediction."""
-            for row_dict in self.row_generator():
-                # --- 1. Process Inputs (Movie Fields) ---
-                inputs_tuple = []
-                try:
-                     inputs_tuple = tuple(field.transform(row_dict.get(field.name)) for field in movie_fields)
-                except Exception as e:
-                    logging.error(f"Error transforming INPUT fields: {e}. Row: {row_dict}", exc_info=True)
-                    continue # Skip problematic row
-
-                # --- 2. Process ONLY People Targets and Sample Weights ---
-                people_targets = {}
-                people_sample_weights = {}
-                people_seq_list = row_dict.get("people", [])
-                num_real_people = len(people_seq_list)
-
-                for field_idx, field in enumerate(people_fields): # Use index for potentially better error reporting
-                    try:
-                        main_target_list = []
-                        flag_target_list = []
-                        decoder = people_decoders[field.name]
-                        decoder_is_multi_output = isinstance(decoder.output, list)
-                        transform_target_returns_tuple = None
-
-                        for i in range(seq_length):
-                            is_padding_step = (i >= num_real_people)
-                            main_target_part = None
-                            flag_target_part = None # Reset for each step
-
-                            if is_padding_step:
-                                # --- Handle PADDING steps ---
-                                # *** MODIFICATION START ***
-                                if field.optional:
-                                    # Optional fields handle None via transform_target
-                                    target_result = field.transform_target(None) # Returns (padded_base, flag=1.0)
-                                    if not isinstance(target_result, tuple) or len(target_result) != 2:
-                                        raise ValueError(f"Optional field {field.name}.transform_target(None) did not return tuple of 2")
-                                    main_target_part, flag_target_part = target_result
-                                    if transform_target_returns_tuple is None: transform_target_returns_tuple = True
-                                else:
-                                    # Non-optional fields: Directly get base padding value. No flag involved.
-                                    main_target_part = field.get_base_padding_value()
-                                    flag_target_part = None # Explicitly None
-                                    if transform_target_returns_tuple is None: transform_target_returns_tuple = False
-                                # *** MODIFICATION END ***
-                            else:
-                                # --- Handle REAL data steps ---
-                                raw_val = people_seq_list[i].get(field.name)
-                                target_result = field.transform_target(raw_val) # Returns (transformed, flag=0.0) or just transformed
-
-                                # Unpack based on field optionality
-                                if field.optional:
-                                    if not isinstance(target_result, tuple) or len(target_result) != 2:
-                                         raise ValueError(f"Optional field {field.name}.transform_target() did not return tuple of 2 for value: {raw_val}")
-                                    main_target_part, flag_target_part = target_result
-                                    if transform_target_returns_tuple is None: transform_target_returns_tuple = True
-                                else:
-                                    main_target_part = target_result
-                                    flag_target_part = None
-                                    if transform_target_returns_tuple is None: transform_target_returns_tuple = False
-
-
-                            # Consistency check after first step
-                            if transform_target_returns_tuple is None:
-                                 raise RuntimeError(f"Logic error: transform_target_returns_tuple not set for field {field.name}")
-
-
-                            # Append results to lists
-                            main_target_list.append(main_target_part)
-
-                            # Append flag target *only if the decoder expects it*
-                            if decoder_is_multi_output:
-                                if transform_target_returns_tuple: # Flag was provided by transform_target (i.e., field is optional)
-                                    flag_target_list.append(tf.cast(flag_target_part, tf.float32))
-                                else: # Decoder needs flag, but field isn't optional
-                                    # Generate default flag (0.0 for real, 1.0 for padding)
-                                    default_flag = tf.cast(1.0 if is_padding_step else 0.0, tf.float32)
-                                    flag_target_list.append(default_flag)
-
-
-                        # Stack the lists into sequence tensors
-                        stacked_main_seq = tf.stack(main_target_list)
-
-                        # Create weights for time steps (masking padding)
-                        time_step_weights = tf.concat([
-                            tf.ones(num_real_people, dtype=tf.float32),
-                            tf.zeros(seq_length - num_real_people, dtype=tf.float32)
-                        ], axis=0)
-
-                        # Assign to targets and sample_weights dicts using correct names
-                        if decoder_is_multi_output:
-                            if len(flag_target_list) != seq_length:
-                                raise ValueError(f"Flag target list length mismatch for {field.name}")
-                            stacked_flag_seq = tf.stack(flag_target_list)
-                            main_name = f"{field.name}_main_out"
-                            flag_name = f"{field.name}_flag_out"
-                            people_targets[main_name] = stacked_main_seq
-                            people_targets[flag_name] = stacked_flag_seq
-                            people_sample_weights[main_name] = time_step_weights
-                            people_sample_weights[flag_name] = tf.ones_like(time_step_weights)
-                        else: # Single output decoder
-                            out_name = f"{field.name}_out"
-                            people_targets[out_name] = stacked_main_seq
-                            people_sample_weights[out_name] = time_step_weights # Apply weights unless loss handles masking
-
-
-                    except Exception as e:
-                        logging.error(f"Error processing TARGET for people field #{field_idx} ('{field.name}'): {e}. Row: {row_dict}", exc_info=True)
-                        # Decide whether to skip row or raise
-                        raise e # Re-raise to stop processing
-
-                # --- 3. Yield the structured data ---
-                yield inputs_tuple, people_targets, people_sample_weights
-
-
-        # --- Define Output Signature --- (Copied from previous correct version)
-        input_specs = tuple(tf.TensorSpec(shape=field.input_shape, dtype=field.input_dtype)
-                            for field in movie_fields)
-
-        target_specs = {}
-        for field in people_fields:
-            decoder = people_decoders[field.name]
-            is_multi_output = isinstance(decoder.output, list)
-            base_shape = field._get_output_shape()
-            base_dtype = field.output_dtype
-            flag_shape = (1,)
-            flag_dtype = tf.float32
-            seq_base_shape = (seq_length,) + base_shape
-            seq_flag_shape = (seq_length,) + flag_shape
-
-            if is_multi_output:
-                target_specs[f"{field.name}_main_out"] = tf.TensorSpec(shape=seq_base_shape, dtype=base_dtype)
-                target_specs[f"{field.name}_flag_out"] = tf.TensorSpec(shape=seq_flag_shape, dtype=flag_dtype)
-            else:
-                target_specs[f"{field.name}_out"] = tf.TensorSpec(shape=seq_base_shape, dtype=base_dtype)
-
-        sample_weight_specs = {}
-        for field in people_fields:
-            decoder = people_decoders[field.name]
-            is_multi_output = isinstance(decoder.output, list)
-            seq_weight_spec = tf.TensorSpec(shape=(seq_length,), dtype=tf.float32)
-            if is_multi_output:
-                sample_weight_specs[f"{field.name}_main_out"] = seq_weight_spec
-                sample_weight_specs[f"{field.name}_flag_out"] = seq_weight_spec
-            else:
-                sample_weight_specs[f"{field.name}_out"] = seq_weight_spec
-
-        # --- Create tf.data.Dataset ---
-        ds = tf.data.Dataset.from_generator(
-            db_generator,
-            output_signature=(input_specs, target_specs, sample_weight_specs)
-        )
-
-        ds = ds.batch(batch_size, drop_remainder=False)
-        ds = ds.prefetch(tf.data.AUTOTUNE)
-
-        return ds
-
+    
     def get_loss_dict(self) -> Dict[str, Any]:
-        """ Returns the loss dictionary ONLY for PEOPLE outputs. """
+        """
+        Returns a dict mapping each sequence‐output layer name to its loss function,
+        based on self.people_autoencoder_instance.fields and the naming convention
+        in build_autoencoder().
+        """
         loss_dict = {}
-        if not hasattr(self, 'people_decoders') or not self.people_decoders:
-             raise RuntimeError("People decoder instances not found for get_loss_dict. Ensure build_autoencoder() has been called.")
-        people_decoders = self.people_decoders
-
-        # People losses ONLY
         for field in self.people_autoencoder_instance.fields:
-            decoder = people_decoders.get(field.name)
-            if decoder is None:
-                raise ValueError(f"Decoder for people field '{field.name}' not found.")
-            is_multi_output = isinstance(decoder.output, list)
-            base_loss = field._get_loss() # Get the base loss instance (MSE, BCE, MaskedSCCE)
-
-            if is_multi_output:
-                # Assign appropriate losses to main and flag outputs
-                main_name = f"{field.name}_main_out"
-                flag_name = f"{field.name}_flag_out"
-                loss_dict[main_name] = base_loss
-                # Flag loss is typically BCE
-                loss_dict[flag_name] = tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
+            # your new model names each non-optional head as "<field>_out"
+            # and each optional one as "<field>_main_out" + "<field>_flag_out"
+            if field.optional:
+                # main head uses the field’s base loss
+                loss_dict[f"{field.name}_main_out"] = field._get_loss()
+                # flag head always BinaryCrossentropy
+                loss_dict[f"{field.name}_flag_out"] = tf.keras.losses.BinaryCrossentropy()
             else:
-                out_name = f"{field.name}_out"
-                loss_dict[out_name] = base_loss
-
-        # Ensure all model outputs (which are now only people outputs) have a loss
-        if self.model:
-            for output_name in self.model.output_names:
-                if output_name not in loss_dict:
-                    # This could happen if model output names differ from expected keys
-                    logging.warning(f"Model Output '{output_name}' is missing from the generated loss dictionary. Keys: {list(loss_dict.keys())}")
-                    # Attempt to find a match based on field name? Or raise error.
-                    # raise ValueError(f"Output '{output_name}' is missing from the loss dictionary.")
-
+                loss_dict[f"{field.name}_out"] = field._get_loss()
         return loss_dict
 
     def get_loss_weights_dict(self) -> Dict[str, float]:
-        """ Returns the loss weights dictionary ONLY for PEOPLE outputs. """
-        weights_dict = {}
-        if not hasattr(self, 'people_decoders') or not self.people_decoders:
-             raise RuntimeError("People decoder instances not found for get_loss_weights_dict.")
-        people_decoders = self.people_decoders
-
-        # People weights ONLY
+        """
+        Returns a dict mapping each sequence‐output layer name to its weight,
+        mirroring get_loss_dict but pulling `field.weight`.
+        """
+        weights = {}
         for field in self.people_autoencoder_instance.fields:
-            decoder = people_decoders.get(field.name)
-            if decoder is None:
-                 raise ValueError(f"Decoder for people field '{field.name}' not found.")
-            is_multi_output = isinstance(decoder.output, list)
-            weight = field.weight # Get the original field weight
-
-            if is_multi_output:
-                main_name = f"{field.name}_main_out"
-                flag_name = f"{field.name}_flag_out"
-                # Assign weights - apply base weight to main, maybe reduced to flag
-                weights_dict[main_name] = weight
-                weights_dict[flag_name] = weight * 0.5 # Example: Reduce flag weight
+            if field.optional:
+                weights[f"{field.name}_main_out"] = field.weight
+                weights[f"{field.name}_flag_out"] = field.weight * 0.5
             else:
-                out_name = f"{field.name}_out"
-                weights_dict[out_name] = weight
-
-        return weights_dict
+                weights[f"{field.name}_out"] = field.weight
+        return weights
 
     def _print_model_architecture(self):
         """Prints summaries relevant to the sequence prediction model."""
@@ -469,13 +298,6 @@ class MoviesToPeopleSequenceAutoencoder:
 
         # Don't print movie field decoders - they aren't used
 
-        print("\n--- People Field Decoder Summaries (Used in Sequence Generation) ---")
-        if self.people_decoders:
-             for name, decoder in self.people_decoders.items():
-                 print(f"\nPeople Decoder for field: {name}")
-                 decoder.summary()
-        else:
-             print("People decoders not available.")
 
         print("\n--- Main Sequence Prediction Model Summary ---")
         self.model.summary() # Summary of the Movie->People model
@@ -485,6 +307,52 @@ class MoviesToPeopleSequenceAutoencoder:
         print(self.get_loss_dict())
         print("\n--- Loss Weights Dictionary (Sequence Model) ---")
         print(self.get_loss_weights_dict())
+
+    def _build_dataset(self) -> tf.data.Dataset:
+        seq_len = self.people_sequence_length
+        movie_fields = self.movie_autoencoder_instance.fields
+        people_fields = self.people_autoencoder_instance.fields
+        batch_size = self.config["batch_size"]
+
+        def gen():
+            for row in self.row_generator():
+                # 1) grab & fix-length your people list
+                ppl = row["people"]
+                # if too short, repeat the last person; if empty, skip
+                if len(ppl) < seq_len:
+                    if not ppl:
+                        continue
+                    ppl = ppl + [ppl[-1]] * (seq_len - len(ppl))
+                else:
+                    ppl = ppl[:seq_len]
+
+                # 2) movie inputs
+                x_inputs = [ f.transform(row[f.name]) for f in movie_fields ]
+
+                # 3) people-sequence targets
+                y_targets = []
+                for f in people_fields:
+                    # for each field, collect one tensor per person, then stack
+                    seq = [ f.transform_target(person.get(f.name)) for person in ppl ]
+                    y_targets.append(tf.stack(seq))
+
+                yield tuple(x_inputs), tuple(y_targets)
+
+        # build your TensorSpecs just like before…
+        input_specs = [
+            tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype)
+            for f in movie_fields
+        ]
+        output_specs = []
+        for f in people_fields:
+            shape = (seq_len,) + f.output_shape
+            output_specs.append(tf.TensorSpec(shape=shape, dtype=f.output_dtype))
+
+        ds = tf.data.Dataset.from_generator(
+            gen,
+            output_signature=(tuple(input_specs), tuple(output_specs))
+        )
+        return ds.batch(batch_size)
 
 
     def fit(self):
@@ -497,17 +365,10 @@ class MoviesToPeopleSequenceAutoencoder:
         self._print_model_architecture()
 
         initial_lr = self.config['learning_rate']
-        lr_callback = tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1
-        )
 
-        optimizer = tf.keras.optimizers.AdamW(
+        optimizer = tf.keras.optimizers.Adam(
             learning_rate=initial_lr, # Initial LR
-            weight_decay=self.config.get("weight_decay", 1e-4)
+            # weight_decay=self.config["weight_decay"],
         )
 
         # Compile the model
@@ -529,10 +390,12 @@ class MoviesToPeopleSequenceAutoencoder:
 
         self.model.compile(
             optimizer=optimizer,
-            loss=loss_dict, # Pass the dictionary
-            loss_weights=loss_weights_dict # Pass the dictionary
+            loss=loss_dict,
+            loss_weights=loss_weights_dict
+
             # Add metrics if needed
         )
+        
         print("Model compiled.")
 
         # Prepare dataset
@@ -565,8 +428,7 @@ class MoviesToPeopleSequenceAutoencoder:
 
         sequence_recon_callback = SequenceReconstructionCallback(
             sequence_model_instance=self, 
-            db_path=self.db_path,
-            num_samples=3,
+            num_samples=5,
             interval_batches=self.config["callback_interval"],
         )
         tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=log_dir, log_interval=20)
@@ -577,7 +439,6 @@ class MoviesToPeopleSequenceAutoencoder:
             epochs=self.config["epochs"],
             callbacks=[
                 tensorboard_callback,
-                lr_callback,
                 model_checkpoint_callback,
                 early_stopping_callback,
                 sequence_recon_callback,
@@ -586,71 +447,6 @@ class MoviesToPeopleSequenceAutoencoder:
         )
         print("\nTraining complete.")
         self.save_model() # Save the sequence model
-
-    def save_model(self):
-        """ Saves the main sequence prediction model and the movie encoder part. """
-        if not self.model:
-            print("Sequence prediction model not built. Cannot save.")
-            return
-
-        # Ensure model_dir exists
-        output_dir = Path(self.model_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save the main sequence prediction model
-        seq_model_path = output_dir / f"{self.__class__.__name__}_predictor_final.keras"
-        print(f"Saving final sequence predictor model to {seq_model_path}")
-        self.model.save(seq_model_path)
-
-        # Save the movie encoder part separately (optional but potentially useful)
-        if self.movie_encoder:
-            enc_path = output_dir / f"{self.__class__.__name__}_movie_encoder_final.keras"
-            print(f"Saving final movie encoder model (from sequence model) to {enc_path}")
-            self.movie_encoder.save(enc_path)
-        else:
-             print("Movie encoder instance not found, skipping saving.")
-
-        print("Sequence models saved.")
-
-    def load_model(self, compile_model=False):
-        """ Loads the saved sequence prediction model and its movie encoder. """
-        # Required for custom objects
-        # tf.keras.config.enable_unsafe_deserialization() # Use if needed, Keras 3 might handle better
-
-        # Define custom objects needed for loading
-        # Make sure ALL custom classes/functions used in the model are included
-        custom_objects = {
-            "MaskedSparseCategoricalCrossentropy": MaskedSparseCategoricalCrossentropy,
-            "add_positional_encoding": add_positional_encoding,
-        }
-
-        input_dir = Path(self.model_dir)
-        seq_model_path = input_dir / f"{self.__class__.__name__}_predictor_final.keras"
-        enc_path = input_dir / f"{self.__class__.__name__}_movie_encoder_final.keras"
-
-        if not seq_model_path.exists():
-            raise FileNotFoundError(f"Sequence predictor model file not found: {seq_model_path}")
-
-        print(f"Loading sequence predictor model from {seq_model_path}...")
-        self.model = tf.keras.models.load_model(
-            seq_model_path,
-            custom_objects=custom_objects,
-            compile=compile_model # Compile only if continuing training
-        )
-        print("Sequence predictor model loaded.")
-
-        if enc_path.exists():
-             print(f"Loading movie encoder model from {enc_path}...")
-             self.movie_encoder = tf.keras.models.load_model(
-                 enc_path,
-                 custom_objects=custom_objects,
-                 compile=False # Encoder typically doesn't need compiling standalone
-             )
-             print("Movie encoder model loaded.")
-        else:
-             print(f"Movie encoder file not found at {enc_path}, skipping load.")
-             self.movie_encoder = None # Ensure it's None if not loaded
-
 
 
 ##############################################################################

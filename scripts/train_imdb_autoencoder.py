@@ -20,7 +20,7 @@ def main():
     people_ae.fit()
     people_ae.save_model()
 
-    # title_ae = TitlesAutoencoder(config, db_path, model_dir)
+    title_ae = TitlesAutoencoder(config, db_path, model_dir)
     # title_ae.load_model()
     # title_ae.fit()
     # title_ae.save_model()
