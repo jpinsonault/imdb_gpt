@@ -53,7 +53,7 @@ class RowAutoencoder:
         self.latent_dim = self.config["latent_dim"]
         self.stats_accumulated = False
         # Added db_path reference needed for fit method's callback
-        self.db_path = config.get('db_path', None) # Get db_path from config if passed
+        self.db_path = config['db_path'] # Get db_path from config if passed
 
     def accumulate_stats(self):
         if self.stats_accumulated:

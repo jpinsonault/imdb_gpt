@@ -20,6 +20,7 @@ The end result is that
       either entity type back to its original columns.
 """
 from __future__ import annotations
+import logging
 import argparse, os, random, sqlite3
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -30,6 +31,7 @@ from tensorflow.keras import ops
 
 from config import project_config
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+logging.basicConfig(level=logging.INFO)
 
 ##########################################################################
 # helpers
@@ -55,6 +57,7 @@ def sample_random_person(conn: sqlite3.Connection, tconst: str) -> Dict[str, Any
         INNER JOIN principals pr ON pr.nconst = p.nconst
         WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
         GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
         ORDER BY RANDOM()
         LIMIT 1
     """
@@ -70,69 +73,35 @@ def sample_random_person(conn: sqlite3.Connection, tconst: str) -> Dict[str, Any
 ##########################################################################
 # dataset generator ‑‑ yields (movie_inputs, person_inputs)
 ##########################################################################
+# scripts/train_joint_autoencoder.py
+
 def make_pair_generator(
     db_path: Path,
     movie_ae: TitlesAutoencoder,
-    person_ae: PeopleAutoencoder
+    person_ae: PeopleAutoencoder,
+    limit: int = 100_000,
+    log_every: int = 10_000,
 ):
+    import logging
+    import random
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    movie_q = """
-        SELECT
-            t.tconst              AS tconst,
-            t.titleType,
-            t.primaryTitle,
-            t.startYear,
-            t.endYear,
-            t.runtimeMinutes,
-            t.averageRating,
-            t.numVotes,
-            GROUP_CONCAT(g.genre, ',') AS genres
-        FROM titles t
-        INNER JOIN title_genres g
-            ON t.tconst = g.tconst
-        WHERE t.startYear IS NOT NULL
-          AND t.averageRating IS NOT NULL
-          AND t.runtimeMinutes IS NOT NULL
-          AND t.runtimeMinutes >= 5
-          AND t.startYear >= 1850
-          AND t.titleType IN (
-              'movie','tvSeries','tvMovie','tvMiniSeries'
-          )
-          AND t.numVotes >= 10
-        GROUP BY t.tconst
-    """
+    movies = list(movie_ae.row_generator())[:limit]
+    random.shuffle(movies)
+    produced = 0
     while True:
-        row = conn.execute(movie_q + " ORDER BY RANDOM() LIMIT 1").fetchone()
-        if not row:
-            continue
-
-        movie_dict = {
-            "primaryTitle":   row[2],
-            "startYear":      row[3],
-            "endYear":        row[4],
-            "runtimeMinutes": row[5],
-            "averageRating":  row[6],
-            "numVotes":       row[7],
-            "genres":         row[8].split(',') if row[8] else [],
-        }
-
-        # pick one random person on that movie
-        person_dict = sample_random_person(conn, row[0])
+        if not movies:
+            movies = list(movie_ae.row_generator())[:limit]
+            random.shuffle(movies)
+        movie_dict = movies.pop()
+        person_dict = sample_random_person(conn, movie_dict["tconst"])
         if not person_dict:
             continue
-
-        movie_inputs  = tuple(
-            f.transform(movie_dict.get(f.name))
-            for f in movie_ae.fields
-        )
-        person_inputs = tuple(
-            f.transform(person_dict.get(f.name))
-            for f in person_ae.fields
-        )
-
-        # ONLY these two get sent through the tf.data pipeline now
+        movie_inputs = tuple(f.transform(movie_dict.get(f.name)) for f in movie_ae.fields)
+        person_inputs = tuple(f.transform(person_dict.get(f.name)) for f in person_ae.fields)
         yield movie_inputs, person_inputs
-
+        produced += 1
+        if produced % log_every == 0:
+            logging.info(f"joint generator: {produced:,} pairs")
 
 
 ##########################################################################
@@ -183,16 +152,28 @@ class JointAutoencoder(tf.keras.Model):
         movie_in, person_in = data
         with tf.GradientTape() as tape:
             m_z, p_z, m_recon, p_recon = self((movie_in, person_in), training=True)
+
             rec_loss = 0.0
-            for i, (loss_fn, w) in enumerate(zip(self.movie_losses.values(), self.movie_weights.values())):
-                rec_loss += w * tf.reduce_mean(loss_fn(movie_in[i], m_recon[i]))
-            for i, (loss_fn, w) in enumerate(zip(self.person_losses.values(), self.person_weights.values())):
-                rec_loss += w * tf.reduce_mean(loss_fn(person_in[i], p_recon[i]))
-            nce = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
+
+            # movie reconstruction
+            for idx, field in enumerate(self.movie_ae.fields):
+                rec_loss += field.weight * tf.reduce_mean(
+                    field.loss(movie_in[idx], m_recon[idx])
+                )
+
+            # person reconstruction
+            for idx, field in enumerate(self.person_ae.fields):
+                rec_loss += field.weight * tf.reduce_mean(
+                    field.loss(person_in[idx], p_recon[idx])
+                )
+
+            nce   = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
             total = rec_loss + nce
+
         grads = tape.gradient(total, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
         return {"loss": total, "rec_loss": rec_loss, "nce": nce}
+
 
 
 
@@ -212,8 +193,8 @@ def build_joint_trainer(
       ds:          tf.data.Dataset yielding (movie_inputs, person_inputs)
     """
     # 1) Instantiate row-autoencoders
-    movie_ae  = TitlesAutoencoder(cfg, db_path, model_dir / "TitlesAutoencoder")
-    people_ae = PeopleAutoencoder(cfg, db_path, model_dir / "PeopleAutoencoder")
+    movie_ae  = TitlesAutoencoder(cfg, model_dir / "TitlesAutoencoder")
+    people_ae = PeopleAutoencoder(cfg, model_dir / "PeopleAutoencoder")
 
     # 2) Either load pretrained or build from scratch
     if warm:
