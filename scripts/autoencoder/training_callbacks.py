@@ -9,6 +9,100 @@ import tensorflow as tf
 from .fields import BaseField, SPECIAL_PAD, SPECIAL_START, SPECIAL_END, NumericDigitCategoryField, TextField  # Import special tokens here
 import os
 
+def _sample_random_person(conn, tconst):
+    q = """
+        SELECT p.primaryName,
+               p.birthYear,
+               p.deathYear,
+               GROUP_CONCAT(pp.profession, ',')
+        FROM   people p
+        LEFT   JOIN people_professions pp ON pp.nconst = p.nconst
+        INNER  JOIN principals pr         ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? 
+          AND p.birthYear IS NOT NULL
+        GROUP  BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+        ORDER  BY RANDOM()
+        LIMIT  1
+    """
+    r = conn.execute(q, (tconst,)).fetchone()
+    if not r:
+        return None
+    return {
+        "primaryName": r[0],
+        "birthYear":   r[1],
+        "deathYear":   r[2],
+        "professions": r[3].split(',') if r[3] else None,
+    }
+
+
+class JointReconstructionCallback(tf.keras.callbacks.Callback):
+    """
+    Pretty print movie ↔ person reconstructions during joint training
+    """
+    def __init__(
+        self,
+        movie_ae,
+        person_ae,
+        db_path,
+        interval_batches=200,
+        num_samples=4,
+        table_width=38,
+    ):
+        super().__init__()
+        self.movie_ae = movie_ae
+        self.person_ae = person_ae
+        self.interval = interval_batches
+        self.width = table_width
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+
+        movies = list(islice(movie_ae.row_generator(), 50000))
+        self.samples = random.sample(movies, min(num_samples, len(movies)))
+        self.paired = [
+            (m_row, _sample_random_person(self.conn, m_row["tconst"]))
+            for m_row in self.samples
+        ]
+        self.paired = [(m, p) for m, p in self.paired if p]
+
+    def _encode(self, ae, row_dict):
+        tensors = [
+            tf.expand_dims(f.transform(row_dict.get(f.name)), 0)
+            for f in ae.fields
+        ]
+        z = ae.encoder(tensors, training=False)
+        return z.numpy()[0]
+
+    def _reconstruct(self, ae, z):
+        return ae.reconstruct_row(z)
+
+    def _show_pair(self, m_row, p_row, m_rec, p_rec, sim):
+        tbl_m = PrettyTable(["Movie Field", "Orig", "Recon"])
+        for f in self.movie_ae.fields:
+            o = m_row.get(f.name, "")
+            r = m_rec.get(f.name, "")
+            tbl_m.add_row([f.name, str(o)[:self.width], str(r)[:self.width]])
+        tbl_p = PrettyTable(["Person Field", "Orig", "Recon"])
+        for f in self.person_ae.fields:
+            o = p_row.get(f.name, "")
+            r = p_rec.get(f.name, "")
+            tbl_p.add_row([f.name, str(o)[:self.width], str(r)[:self.width]])
+        print("\n--- movie vs. person reconstruction ---")
+        print(f"latent cosine: {sim:.3f}")
+        print(tbl_m)
+        print(tbl_p)
+
+    def on_train_batch_end(self, batch, logs=None):
+        if (batch + 1) % self.interval:
+            return
+        for m_row, p_row in self.paired:
+            m_z = self._encode(self.movie_ae,  m_row)
+            p_z = self._encode(self.person_ae, p_row)
+            m_rec = self._reconstruct(self.movie_ae,  m_z)
+            p_rec = self._reconstruct(self.person_ae, p_z)
+            sim = float(np.dot(m_z, p_z) / (np.linalg.norm(m_z) * np.linalg.norm(p_z) + 1e-7))
+            self._show_pair(m_row, p_row, m_rec, p_rec, sim)
+
+
 class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
     def __init__(self, log_dir, log_interval: int = 1):
         super().__init__()

@@ -31,6 +31,7 @@ from tensorflow.keras import ops
 
 from config import project_config
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+from scripts.autoencoder.training_callbacks import JointReconstructionCallback, TensorBoardPerBatchLoggingCallback
 logging.basicConfig(level=logging.INFO)
 
 ##########################################################################
@@ -90,6 +91,7 @@ def make_pair_generator(
     produced = 0
     while True:
         if not movies:
+            logging.info("joint generator: reloading movie list")
             movies = list(movie_ae.row_generator())[:limit]
             random.shuffle(movies)
         movie_dict = movies.pop()
@@ -259,10 +261,20 @@ def main():
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=model_dir / "JointMoviePersonAE_epoch_{epoch:02d}.keras",
         save_weights_only=False, save_freq="epoch")
+    
+    recon_cb = JointReconstructionCallback(
+        movie_ae  = joint_model.movie_ae,
+        person_ae = joint_model.person_ae,
+        db_path   = project_config["autoencoder"]["db_path"],
+        interval_batches = 200,
+        num_samples      = 4,
+    )
+
+    tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=model_dir / "logs", log_interval=20)
 
     joint_model.fit(ds,
                     epochs=cfg["epochs"],
-                    callbacks=[ckpt])
+                    callbacks=[ckpt, recon_cb, tensorboard_callback],)
 
     # save components
     print("[✓] Training done. Saving models…")
