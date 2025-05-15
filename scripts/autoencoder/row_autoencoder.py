@@ -170,13 +170,11 @@ class RowAutoencoder:
             # Assumes keys are already the correct base names
             # Unbatch each tensor (get the first item)
             decoder_outputs_map = {k: v[0] for k, v in raw_decoder_outputs.items()}
-            logging.info("Decoder predict returned dict. Unbatched.")
 
         elif isinstance(raw_decoder_outputs, list):
             if actual_output_names and len(raw_decoder_outputs) == len(actual_output_names):
                 # Map using the cleaned output names from the decoder model
                 decoder_outputs_map = {name: tensor[0] for name, tensor in zip(actual_output_names, raw_decoder_outputs)} # Unbatch
-                logging.info(f"Decoder predict returned list matching output_names {actual_output_names}. Unbatched.")
             elif len(raw_decoder_outputs) == len(self.fields):
                  # Fallback: Map by order if lengths match (less reliable)
                  logging.warning("Decoder output names mismatched or unavailable. Mapping outputs to fields by order.")
@@ -198,7 +196,6 @@ class RowAutoencoder:
         # --- End of handling logic ---
 
         reconstructed_data = {}
-        logging.info(f"Decoder map keys after processing predict() output: {list(decoder_outputs_map.keys())}")
 
         for field in self.fields:
             # Determine the expected output name (consistent with build_autoencoder)
@@ -220,10 +217,6 @@ class RowAutoencoder:
                      continue # Skip to the next field
 
             try:
-                # The core change: Pass the raw, unbatched tensor directly.
-                # The field's to_string method must handle this raw tensor.
-                logging.info(f"Calling to_string for field '{field.name}' (type: {type(field).__name__}) using output key '{used_name}' with tensor shape: {output_tensor.shape}")
-
                 # Ensure the tensor passed is a numpy array
                 if not isinstance(output_tensor, np.ndarray):
                      output_tensor = np.array(output_tensor)

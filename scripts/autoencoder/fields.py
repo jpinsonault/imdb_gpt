@@ -751,17 +751,32 @@ class TextField(BaseField):
         else:
             return self._transform(raw_value)
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
-        token_indices = predicted_main.flatten().astype(int).tolist()
+    def to_string(
+        self,
+        predicted_main: np.ndarray,
+        predicted_flag: Optional[np.ndarray] = None
+    ) -> str:
+        arr = np.asarray(predicted_main)
+
+        # 2‑D ⇒ (length, vocab) → argmax over vocab
+        if arr.ndim >= 2 and arr.shape[-1] == self.tokenizer.get_vocab_size():
+            arr = np.argmax(arr, axis=-1)
+
+        if arr.ndim > 1:
+            arr = arr.flatten()
+
+        token_indices = arr.astype(int).tolist()
         tokens = [self.tokenizer.id_to_token(idx) for idx in token_indices]
-        out_tokens = []
-        for token in tokens:
-            if token == SPECIAL_END:
+
+        out = []
+        for t in tokens:
+            if t == SPECIAL_END:
                 break
-            if token in (SPECIAL_START, SPECIAL_PAD):
+            if t in (SPECIAL_START, SPECIAL_PAD):
                 continue
-            out_tokens.append(token)
-        return "".join(out_tokens)
+            out.append(t)
+
+        return "".join(out)
 
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(self.max_length,), dtype=tf.int32, name=f"{self.name}_input")
@@ -855,193 +870,115 @@ class MultiCategoryField(BaseField):
     def __init__(self, name: str, optional: bool = False):
         super().__init__(name, optional)
         self.category_set = set()
-        self.category_counts = {}  # Dictionary to count the number of rows for each category.
+        self.category_counts = {}
         self.category_list = []
 
+    # ---------- shapes / loss ----------
     def _get_input_shape(self):
-        # Shape depends on finalized stats.
         return (len(self.category_list),) if self.category_list else (0,)
 
     def _get_output_shape(self):
-        # Shape depends on finalized stats.
         return (len(self.category_list),) if self.category_list else (0,)
 
     def _get_loss(self):
-        # Multi-label classification loss for the main output head.
         return tf.keras.losses.BinaryCrossentropy()
 
+    # ---------- padding ----------
     def get_base_padding_value(self):
-        # Padding is a vector of zeros.
-        shape = self._get_output_shape()
-        return tf.zeros(shape, dtype=tf.float32)
+        return tf.zeros(self._get_output_shape(), dtype=tf.float32)
 
     def get_flag_padding_value(self):
-         return tf.constant([1.0], dtype=tf.float32)
+        return tf.constant([1.0], dtype=tf.float32)
 
+    # ---------- stats ----------
     def _accumulate_stats(self, raw_value):
         if raw_value:
-            # Handle both single value and list of values.
-            # Convert each value to a string (even if the underlying type is int) and count each unique category per row.
             cats = raw_value if isinstance(raw_value, list) else [raw_value]
             for c in set(cats):
-                 cat_str = str(c)  # Ensure conversion to string.
-                 if cat_str:
-                     self.category_set.add(cat_str)
-                     self.category_counts[cat_str] = self.category_counts.get(cat_str, 0) + 1
+                c = str(c)
+                if c:
+                    self.category_set.add(c)
+                    self.category_counts[c] = self.category_counts.get(c, 0) + 1
 
     def _finalize_stats(self):
-        # Sort categories alphabetically first for consistent indexing
-        self.category_list = sorted(list(self.category_set))
-        # Calculate overall frequency (optional but potentially useful info)
-        self.category_frequencies = {cat: self.category_counts.get(cat, 0) / sum(self.category_counts.values())
-                                     for cat in self.category_list} if sum(self.category_counts.values()) > 0 else {}
-        if not self.category_list:
-             logging.warning(f"No categories found for MultiCategoryField '{self.name}'. Output shape will be (0,).")
-        # Store index map for faster lookups in transform
-        self.category_to_index = {cat: i for i, cat in enumerate(self.category_list)}
+        self.category_list = sorted(self.category_set)
+        tot = sum(self.category_counts.values()) or 1
+        self.category_frequencies = {c: self.category_counts.get(c, 0) / tot
+                                     for c in self.category_list}
+        self.category_to_index = {c: i for i, c in enumerate(self.category_list)}
 
+    # ---------- transforms ----------
     def _transform(self, raw_value):
-        """Transforms a non-None list/value to a multi-hot vector."""
-        shape = self._get_output_shape()
-        if shape[0] == 0:
-            return tf.zeros(shape, dtype=tf.float32) # Handle case with no categories.
-
-        vec = np.zeros(shape[0], dtype=np.float32)
-        # Ensure input values are converted to strings.
-        cats = raw_value if isinstance(raw_value, list) else ([raw_value] if raw_value is not None else [])
-
+        vec = np.zeros(len(self.category_list), dtype=np.float32)
+        cats = raw_value if isinstance(raw_value, list) else [raw_value] if raw_value is not None else []
         for c in cats:
-            c_str = str(c)
-            idx = self.category_to_index.get(c_str) # Use the precomputed map
+            idx = self.category_to_index.get(str(c))
             if idx is not None:
                 vec[idx] = 1.0
         return tf.constant(vec, dtype=tf.float32)
 
-    def noise_function(self, x: tf.Tensor, training: bool = True) -> tf.Tensor:
-        # Optional: Add noise like randomly flipping some categories.
-        # For now, no noise is added.
-        return x
+    def transform(self, raw_value):
+        return self._transform(raw_value if raw_value is not None else [])
 
+    def transform_target(self, raw_value):
+        # same representation for y; makes the dataset builder explicit
+        return self._transform(raw_value if raw_value is not None else [])
+
+    # ---------- pretty‑print ----------
     def to_string(
         self,
         predicted_main: np.ndarray,
         predicted_flag: Optional[np.ndarray] = None,
-        cumulative_threshold: float = 0.9, # Target cumulative probability
-        min_absolute_prob: float = 0.1,   # Minimum probability for any included category
-        max_categories: Optional[int] = 10 # Optional upper limit on categories shown
-        ) -> str:
-
+        threshold: float = 0.5,
+    ) -> str:
         if self.optional:
             if predicted_flag is None:
-                raise ValueError("predicted_flag is required for optional MultiCategoryField.to_string")
-            is_null_prob = float(predicted_flag[0])
-            # Adjust threshold for determining null if needed, 0.5 is common
-            if is_null_prob > 0.5:
+                raise ValueError("predicted_flag required for optional field")
+            if float(predicted_flag[0]) > 0.5:
                 return "None"
-            # If not null, proceed with processing predicted_main
-            probs = predicted_main
-        else:
-            probs = predicted_main
 
-        if not self.category_list or probs.size == 0: # Handle no categories or empty prediction
-            return "(no categories defined)"
+        probs = predicted_main.flatten().astype(float)
+        if probs.size != len(self.category_list):
+            raise ValueError("probability vector length mismatch")
 
-        # Create pairs of (index, probability)
-        indexed_probs = list(enumerate(probs))
+        active = [c for c, p in zip(self.category_list, probs) if p >= threshold]
 
-        # Sort by probability in descending order
-        indexed_probs.sort(key=lambda x: x[1], reverse=True)
+        if active:
+            return ", ".join(active)
 
-        selected_indices: List[int] = []
-        cumulative_prob: float = 0.0
+        # fallback: at least show the most likely category
+        return self.category_list[int(np.argmax(probs))]
 
-        for index, prob in indexed_probs:
-            # Stop if max categories reached (if set)
-            if max_categories is not None and len(selected_indices) >= max_categories:
-                break
-
-            # Stop if current prob is below absolute minimum
-            # AND if we haven't selected anything yet (ensures we don't show only v. low probs)
-            # OR if we have selected something, stop adding items below the minimum threshold
-            if prob < min_absolute_prob:
-                 # If it's the very first item considered and it's below threshold, stop entirely.
-                 # Or if we've already met the cumulative goal, don't add small ones.
-                 # Or just generally stop adding items below the min threshold.
-                 # Let's choose the last one: stop adding any item below min_absolute_prob.
-                 break # Don't add this or any subsequent categories
-
-            # Add the category index
-            selected_indices.append(index)
-            cumulative_prob += prob
-
-            # Stop if cumulative probability threshold is met
-            if cumulative_prob >= cumulative_threshold:
-                break
-
-        # --- Post-selection checks ---
-        # If after filtering, we still selected an item below the threshold
-        # (this can happen if the *first* item was > min_abs but < target_cumul, and no others were added)
-        # It might be better to enforce the min_absolute_prob strictly on *all* selected items.
-        # Re-filter selected_indices based on the minimum absolute probability
-        final_selected_indices = [idx for idx in selected_indices if probs[idx] >= min_absolute_prob]
-
-        if not final_selected_indices:
-            # Check if there was at least *one* category above the min threshold initially
-            # If even the top one wasn't, return specific message
-            if not indexed_probs or indexed_probs[0][1] < min_absolute_prob:
-                 return "(all below min threshold)"
-            else:
-                 # This case means items were selected initially but *all* got filtered out
-                 # by the final absolute check, which is less likely with the logic above,
-                 # but good to handle. Could also mean cumulative target was met by items
-                 # just slightly below min_absolute_prob after the first.
-                 return "(none met criteria)"
-
-
-        # Get category names, preserving the order of selection (most probable first)
-        selected_cats = [self.category_list[i] for i in final_selected_indices]
-
-        return ', '.join(selected_cats)
-    
+    # ---------- simple encoder / decoder ----------
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
-        inp = tf.keras.Input(shape=self.input_shape, name=f"{self.name}_input", dtype=self.input_dtype)
-        num_categories = self._get_input_shape()[0]
-        units = num_categories // 4
-        x = Dense(units, activation='gelu')(inp)
+        inp = tf.keras.Input(shape=self.input_shape, name=f"{self.name}_input")
+        units = max(8, len(self.category_list) // 4)
+        x = Dense(units, activation="gelu")(inp)
         x = LayerNormalization()(x)
-        x = Dense(units, activation='gelu')(x)
+        x = Dense(units, activation="gelu")(x)
         out = LayerNormalization()(x)
         return tf.keras.Model(inp, out, name=f"{self.name}_encoder")
 
     def build_decoder(self, latent_dim: int) -> tf.keras.Model:
         inp = tf.keras.Input(shape=(latent_dim,), name=f"{self.name}_decoder_in")
-        num_categories = self._get_input_shape()[0]
-        units = num_categories // 4
-        # Normal case with categories.
-        x = Dense(units, activation='gelu')(inp)
+        units = max(8, len(self.category_list) // 4)
+        x = Dense(units, activation="gelu")(inp)
         x = LayerNormalization()(x)
-        x = Dense(units, activation='gelu')(x)
+        x = Dense(units, activation="gelu")(x)
         x = LayerNormalization()(x)
-        # Sigmoid activation for multi-label main output.
-        main_out = Dense(self._get_output_shape()[0], activation='sigmoid', name=f"{self.name}_main_out")(x)
+        main_out = Dense(len(self.category_list), activation="sigmoid",
+                         name=f"{self.name}_main_out")(x)
         return tf.keras.Model(inp, main_out, name=f"{self.name}_decoder")
 
+    # ---------- debug print ----------
     def print_stats(self):
-        t = PrettyTable()
-        t.field_names = [f"Category", "Row Count", "Frequency"]
-        t.align = "l"
-        num_cats = len(self.category_list)
-        t.add_row(["Unique categories", num_cats, "100%"])
-
-        # Sort categories by count (desc) for printing, or keep alphabetical
-        # sorted_cats = sorted(self.category_list, key=lambda cat: self.category_counts.get(cat, 0), reverse=True)
-        sorted_cats = self.category_list # Keep alphabetical from finalize
-
-        for cat in sorted_cats:
-            count = self.category_counts.get(cat, 0)
-            freq = self.category_frequencies.get(cat, 0.0)
-            t.add_row([cat, count, f"{freq:.4f}"])
+        t = PrettyTable(["Category", "Rows", "Freq"])
+        for c in self.category_list:
+            t.add_row([c,
+                       self.category_counts.get(c, 0),
+                       f"{self.category_frequencies.get(c, 0):.4f}"])
         print(t)
+
 
 
 class SingleCategoryField(BaseField):

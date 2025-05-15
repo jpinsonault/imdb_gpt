@@ -18,7 +18,7 @@ project_config = {
         'people_sequence_length': 1,
         'weight_decay': 1e-4,
         'early_stopping_patience': 10,
-        'movie_limit': 10,
+        'movie_limit': 1000000000,
         'db_path': './data/imdb.db',
     }
 }

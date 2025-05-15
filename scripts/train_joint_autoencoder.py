@@ -77,33 +77,90 @@ def sample_random_person(conn: sqlite3.Connection, tconst: str) -> Dict[str, Any
 # scripts/train_joint_autoencoder.py
 
 def make_pair_generator(
-    db_path: Path,
-    movie_ae: TitlesAutoencoder,
-    person_ae: PeopleAutoencoder,
-    limit: int = 100_000,
-    log_every: int = 10_000,
+        db_path: Path,
+        movie_ae: TitlesAutoencoder,
+        person_ae: PeopleAutoencoder,
+        limit: int = 100_000,
+        log_every: int = 10_000,
 ):
-    import logging
-    import random
+    import logging, sqlite3
+
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    cur = conn.cursor()
+
+    count_sql = """
+    WITH filtered_movies AS (
+        SELECT t.tconst
+        FROM titles t
+        INNER JOIN title_genres g ON g.tconst = t.tconst
+        WHERE
+            t.startYear IS NOT NULL
+            AND t.averageRating IS NOT NULL
+            AND t.runtimeMinutes IS NOT NULL
+            AND t.runtimeMinutes >= 5
+            AND t.startYear >= 1850
+            AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
+            AND t.numVotes >= 10
+        GROUP BY t.tconst
+        HAVING COUNT(g.genre) > 0
+        LIMIT ?
+    ),
+    filtered_people AS (
+        SELECT p.nconst
+        FROM people p
+        INNER JOIN people_professions pp ON pp.nconst = p.nconst
+        WHERE p.birthYear IS NOT NULL
+        GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+    )
+    SELECT COUNT(*)
+    FROM principals pr
+    JOIN filtered_movies fm ON fm.tconst = pr.tconst
+    JOIN filtered_people fp ON fp.nconst = pr.nconst
+    """
+
+    logging.info(f"> joint generator: counting pairs in {db_path}, this may take a while…")
+    total_pairs = cur.execute(count_sql, (limit,)).fetchone()[0]
+    logging.info(f"> joint generator: epoch size = {total_pairs:,} pairs")
+
     movies = list(movie_ae.row_generator())[:limit]
-    random.shuffle(movies)
     produced = 0
-    while True:
-        if not movies:
-            logging.info("joint generator: reloading movie list")
-            movies = list(movie_ae.row_generator())[:limit]
-            random.shuffle(movies)
-        movie_dict = movies.pop()
-        person_dict = sample_random_person(conn, movie_dict["tconst"])
-        if not person_dict:
-            continue
-        movie_inputs = tuple(f.transform(movie_dict.get(f.name)) for f in movie_ae.fields)
-        person_inputs = tuple(f.transform(person_dict.get(f.name)) for f in person_ae.fields)
-        yield movie_inputs, person_inputs
-        produced += 1
-        if produced % log_every == 0:
-            logging.info(f"joint generator: {produced:,} pairs")
+
+    person_sql = """
+    SELECT
+        p.primaryName,
+        p.birthYear,
+        p.deathYear,
+        GROUP_CONCAT(pp.profession, ',')
+    FROM people p
+    LEFT JOIN people_professions pp ON pp.nconst = p.nconst
+    INNER JOIN principals pr ON pr.nconst = p.nconst
+    WHERE pr.tconst = ?
+      AND p.birthYear IS NOT NULL
+    GROUP BY p.nconst
+    HAVING COUNT(pp.profession) > 0
+    """
+
+    for movie_dict in movies:
+        people_rows = cur.execute(person_sql, (movie_dict["tconst"],)).fetchall()
+        for row in people_rows:
+            person_dict = {
+                "primaryName": row[0],
+                "birthYear":   row[1],
+                "deathYear":   row[2],
+                "professions": row[3].split(',') if row[3] else None,
+            }
+            movie_inputs = tuple(
+                f.transform(movie_dict.get(f.name)) for f in movie_ae.fields
+            )
+            person_inputs = tuple(
+                f.transform(person_dict.get(f.name)) for f in person_ae.fields
+            )
+            yield movie_inputs, person_inputs
+            produced += 1
+            if produced % log_every == 0:
+                logging.info(f"joint generator: yielded {produced:,}/{total_pairs:,}")
+
 
 
 ##########################################################################
@@ -152,31 +209,35 @@ class JointAutoencoder(tf.keras.Model):
 
     def train_step(self, data):
         movie_in, person_in = data
+
         with tf.GradientTape() as tape:
-            m_z, p_z, m_recon, p_recon = self((movie_in, person_in), training=True)
+            m_z, p_z, m_rec, p_rec = self((movie_in, person_in), training=True)
+
+            field_losses = {}
 
             rec_loss = 0.0
-
-            # movie reconstruction
             for idx, field in enumerate(self.movie_ae.fields):
-                rec_loss += field.weight * tf.reduce_mean(
-                    field.loss(movie_in[idx], m_recon[idx])
-                )
+                l = tf.reduce_mean(field.loss(movie_in[idx], m_rec[idx])) * field.weight
+                rec_loss += l
+                field_losses[f"movie_{field.name}_loss"] = l
 
-            # person reconstruction
             for idx, field in enumerate(self.person_ae.fields):
-                rec_loss += field.weight * tf.reduce_mean(
-                    field.loss(person_in[idx], p_recon[idx])
-                )
+                l = tf.reduce_mean(field.loss(person_in[idx], p_rec[idx])) * field.weight
+                rec_loss += l
+                field_losses[f"person_{field.name}_loss"] = l
 
             nce   = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
             total = rec_loss + nce
 
         grads = tape.gradient(total, self.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
-        return {"loss": total, "rec_loss": rec_loss, "nce": nce}
 
-
+        return {
+            "loss"      : total,
+            "rec_loss"  : rec_loss,
+            "nce"       : nce,
+            **field_losses,
+        }
 
 
 
@@ -266,11 +327,11 @@ def main():
         movie_ae  = joint_model.movie_ae,
         person_ae = joint_model.person_ae,
         db_path   = project_config["autoencoder"]["db_path"],
-        interval_batches = 200,
+        interval_batches = 100,
         num_samples      = 4,
     )
 
-    tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=model_dir / "logs", log_interval=20)
+    tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=model_dir / "logs" / "joint", log_interval=20)
 
     joint_model.fit(ds,
                     epochs=cfg["epochs"],

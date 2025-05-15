@@ -104,11 +104,18 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
 
 
 class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
-    def __init__(self, log_dir, log_interval: int = 1):
+    def __init__(
+        self,
+        log_dir,
+        log_interval: int = 1
+    ):
         super().__init__()
         self.log_interval = log_interval
-        self.file_writer = tf.summary.create_file_writer(log_dir)
-        logging.info(f"filewriter:{self.file_writer}")
+
+        # tf.summary expects a plain string, not a pathlib.Path
+        self.log_dir = str(log_dir)
+
+        self.file_writer = tf.summary.create_file_writer(self.log_dir)
 
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
@@ -117,8 +124,8 @@ class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
         lr_value = lr(self.model.optimizer.iterations) if callable(lr) else lr
 
         field_losses = {
-            k.replace("_loss", ""): v 
-            for k, v in logs.items() 
+            k.replace("_loss", ""): v
+            for k, v in logs.items()
             if k.endswith("_loss") and k != "loss"
         }
         step = self.model.optimizer.iterations
@@ -131,12 +138,14 @@ class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
             self.file_writer.flush()
 
         if (batch + 1) % self.log_interval == 0:
-            field_loss_str = ", ".join([f"{field}: {loss:.4f}" for field, loss in field_losses.items()])
-            message = (
+            field_loss_str = ", ".join(
+                f"{field}: {loss:.4f}" for field, loss in field_losses.items()
+            )
+            msg = (
                 f"Batch {batch + 1} | Total Loss: {total_loss:.4f} | "
                 f"LR: {float(lr_value):.6f} | Field Losses: {field_loss_str}"
             )
-            logging.info(message)
+            logging.info(msg)
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
@@ -146,6 +155,7 @@ class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
                     tf.summary.scalar(key, value, step=epoch)
             self.file_writer.flush()
         logging.info(f"Epoch {epoch + 1} ended. Details: {logs}")
+
 
 
 class ModelSaveCallback(tf.keras.callbacks.Callback):
