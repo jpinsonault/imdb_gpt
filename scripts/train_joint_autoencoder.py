@@ -124,7 +124,6 @@ def make_pair_generator(
     logging.info(f"> joint generator: epoch size = {total_pairs:,} pairs")
 
     movies = list(movie_ae.row_generator())[:limit]
-    produced = 0
 
     person_sql = """
     SELECT
@@ -157,9 +156,6 @@ def make_pair_generator(
                 f.transform(person_dict.get(f.name)) for f in person_ae.fields
             )
             yield movie_inputs, person_inputs
-            produced += 1
-            if produced % log_every == 0:
-                logging.info(f"joint generator: yielded {produced:,}/{total_pairs:,}")
 
 
 

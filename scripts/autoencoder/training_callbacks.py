@@ -1,5 +1,7 @@
 from itertools import islice
+import datetime
 import logging
+from pathlib import Path
 import random
 import sqlite3
 import numpy as np
@@ -36,125 +38,154 @@ def _sample_random_person(conn, tconst):
     }
 
 
+def _norm(x): return np.linalg.norm(x) + 1e-9
+def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
+
 class JointReconstructionCallback(tf.keras.callbacks.Callback):
-    """
-    Pretty print movie ↔ person reconstructions during joint training
-    """
     def __init__(
         self,
         movie_ae,
         person_ae,
         db_path,
-        interval_batches=200,
-        num_samples=4,
-        table_width=38,
+        interval_batches: int = 200,
+        num_samples: int = 4,
+        neg_pool: int = 256,
+        table_width: int = 38,
     ):
         super().__init__()
-        self.movie_ae = movie_ae
-        self.person_ae = person_ae
-        self.interval = interval_batches
-        self.width = table_width
+        self.m_ae = movie_ae
+        self.p_ae = person_ae
+        self.every = interval_batches
+        self.w = table_width
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
 
         movies = list(islice(movie_ae.row_generator(), 50000))
-        self.samples = random.sample(movies, min(num_samples, len(movies)))
-        self.paired = [
-            (m_row, _sample_random_person(self.conn, m_row["tconst"]))
-            for m_row in self.samples
-        ]
-        self.paired = [(m, p) for m, p in self.paired if p]
+        self.pairs: List[Tuple[dict, dict]] = []
+        for m in random.sample(movies, min(num_samples * 3, len(movies))):
+            p = self._sample_person(m["tconst"])
+            if p: self.pairs.append((m, p))
+            if len(self.pairs) == num_samples:
+                break
 
-    def _encode(self, ae, row_dict):
-        tensors = [
-            tf.expand_dims(f.transform(row_dict.get(f.name)), 0)
-            for f in ae.fields
-        ]
-        z = ae.encoder(tensors, training=False)
-        return z.numpy()[0]
+        neg_movies = random.sample(movies, min(neg_pool, len(movies)))
+        self.neg_people_latents = []
+        for m in neg_movies:
+            p = self._sample_person(m["tconst"])
+            if p:
+                z = self._encode(self.p_ae, p)
+                self.neg_people_latents.append(z)
+        self.neg_people_latents = np.stack(self.neg_people_latents)  # (N,D)
 
-    def _reconstruct(self, ae, z):
+    # ------------------------------------------------------------------ utils
+    def _sample_person(self, tconst):
+        q = """
+        SELECT p.primaryName, p.birthYear, p.deathYear,
+               GROUP_CONCAT(pp.profession, ',')
+        FROM people p
+        LEFT JOIN people_professions pp ON pp.nconst = p.nconst
+        INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
+        GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+        ORDER BY RANDOM()
+        LIMIT 1
+        """
+        r = self.conn.execute(q, (tconst,)).fetchone()
+        if not r: return None
+        return {
+            "primaryName":  r[0],
+            "birthYear":    r[1],
+            "deathYear":    r[2],
+            "professions":  r[3].split(',') if r[3] else None,
+        }
+
+    def _encode(self, ae, row):
+        xs = [tf.expand_dims(f.transform(row.get(f.name)), 0) for f in ae.fields]
+        return ae.encoder(xs, training=False).numpy()[0]
+
+    def _recon(self, ae, z):  # → dict[str,str]
         return ae.reconstruct_row(z)
 
-    def _show_pair(self, m_row, p_row, m_rec, p_rec, sim):
-        tbl_m = PrettyTable(["Movie Field", "Orig", "Recon"])
-        for f in self.movie_ae.fields:
+    # -------------------------------------------------------------- metrics
+    def _pair_metrics(self, z_m, z_p):
+        cos = _cos(z_m, z_p)
+        l2 = float(np.linalg.norm(z_m - z_p))
+        ang = float(np.degrees(np.arccos(max(min(cos, 1.0), -1.0))))
+        rank = self._rank(z_m, z_p)
+        return cos, l2, ang, rank
+
+    def _rank(self, z_m, z_p):
+        sims = np.dot(self.neg_people_latents, z_m) / (_norm(self.neg_people_latents) * _norm(z_m))
+        sims = np.append(sims, _cos(z_m, z_p))
+        return int((-sims).argsort().tolist().index(len(sims) - 1)) + 1  # 1‑based
+
+    # ----------------------------------------------------------- pretty print
+    def _show(self, m_row, p_row, m_rec, p_rec, cos, l2, ang, rank):
+        tm = PrettyTable(["Movie field", "orig", "recon"])
+        for f in self.m_ae.fields:
             o = m_row.get(f.name, "")
             r = m_rec.get(f.name, "")
-            tbl_m.add_row([f.name, str(o)[:self.width], str(r)[:self.width]])
-        tbl_p = PrettyTable(["Person Field", "Orig", "Recon"])
-        for f in self.person_ae.fields:
+            tm.add_row([f.name, str(o)[:self.w], str(r)[:self.w]])
+
+        tp = PrettyTable(["Person field", "orig", "recon"])
+        for f in self.p_ae.fields:
             o = p_row.get(f.name, "")
             r = p_rec.get(f.name, "")
-            tbl_p.add_row([f.name, str(o)[:self.width], str(r)[:self.width]])
-        print("\n--- movie vs. person reconstruction ---")
-        print(f"latent cosine: {sim:.3f}")
-        print(tbl_m)
-        print(tbl_p)
+            tp.add_row([f.name, str(o)[:self.w], str(r)[:self.w]])
 
+        bar_len = 20
+        bar = "#" * int(cos * bar_len) + "-" * (bar_len - int(cos * bar_len))
+        print(
+            f"\n--- joint recon ---\n"
+            f"cos={cos:.3f}  angle={ang:5.1f}°  l2={l2:.3f}  rank@neg={rank}\n"
+            f"[{bar}]\n"
+            f"{tm}\n{tp}"
+        )
+
+    # ------------------------------------------------------------------ hook
     def on_train_batch_end(self, batch, logs=None):
-        if (batch + 1) % self.interval:
+        if (batch + 1) % self.every:
             return
-        for m_row, p_row in self.paired:
-            m_z = self._encode(self.movie_ae,  m_row)
-            p_z = self._encode(self.person_ae, p_row)
-            m_rec = self._reconstruct(self.movie_ae,  m_z)
-            p_rec = self._reconstruct(self.person_ae, p_z)
-            sim = float(np.dot(m_z, p_z) / (np.linalg.norm(m_z) * np.linalg.norm(p_z) + 1e-7))
-            self._show_pair(m_row, p_row, m_rec, p_rec, sim)
+        for m_row, p_row in self.pairs:
+            z_m = self._encode(self.m_ae, m_row)
+            z_p = self._encode(self.p_ae, p_row)
+            cos, l2, ang, rank = self._pair_metrics(z_m, z_p)
+            m_rec = self._recon(self.m_ae, z_m)
+            p_rec = self._recon(self.p_ae, z_p)
+            self._show(m_row, p_row, m_rec, p_rec, cos, l2, ang, rank)
+
 
 
 class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
-    def __init__(
-        self,
-        log_dir,
-        log_interval: int = 1
-    ):
+    def __init__(self, log_dir: Path, log_interval: int = 1):
         super().__init__()
         self.log_interval = log_interval
-
-        # tf.summary expects a plain string, not a pathlib.Path
-        self.log_dir = str(log_dir)
-
-        self.file_writer = tf.summary.create_file_writer(self.log_dir)
+        now = datetime.datetime.now()
+        run_id = f"{now:%Y%m%d-%H%M%S}"
+        self.file_writer = tf.summary.create_file_writer(str(log_dir / run_id))
 
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
-        total_loss = logs.get("loss", 0.0)
+
+        # ▲ read the variable’s *value*, not the variable itself
+        step = int(self.model.optimizer.iterations.numpy())
+
+        total_loss = float(logs.get("loss", 0.0))
+
         lr = self.model.optimizer.learning_rate
-        lr_value = lr(self.model.optimizer.iterations) if callable(lr) else lr
-
-        field_losses = {
-            k.replace("_loss", ""): v
-            for k, v in logs.items()
-            if k.endswith("_loss") and k != "loss"
-        }
-        step = self.model.optimizer.iterations
+        lr_value = (
+            float(lr(step)) if callable(lr)          # learning‑rate schedule
+            else float(tf.keras.backend.get_value(lr))
+        )
 
         with self.file_writer.as_default():
-            tf.summary.scalar("loss/total", total_loss, step=step)
-            tf.summary.scalar("learning_rate", float(lr_value), step=step)
-            for field, loss in field_losses.items():
-                tf.summary.scalar(f"loss/{field}", loss, step=step)
+            tf.summary.scalar("loss/total",      total_loss,  step=step)
+            tf.summary.scalar("learning_rate",   lr_value,    step=step)
+            for k, v in logs.items():
+                if k.endswith("_loss") and k != "loss":
+                    tf.summary.scalar(f"loss/{k[:-5]}", float(v), step=step)
             self.file_writer.flush()
 
-        if (batch + 1) % self.log_interval == 0:
-            field_loss_str = ", ".join(
-                f"{field}: {loss:.4f}" for field, loss in field_losses.items()
-            )
-            msg = (
-                f"Batch {batch + 1} | Total Loss: {total_loss:.4f} | "
-                f"LR: {float(lr_value):.6f} | Field Losses: {field_loss_str}"
-            )
-            logging.info(msg)
-
-    def on_epoch_end(self, epoch, logs=None):
-        logs = logs or {}
-        with self.file_writer.as_default():
-            for key, value in logs.items():
-                if isinstance(value, (int, float)):
-                    tf.summary.scalar(key, value, step=epoch)
-            self.file_writer.flush()
-        logging.info(f"Epoch {epoch + 1} ended. Details: {logs}")
 
 
 
