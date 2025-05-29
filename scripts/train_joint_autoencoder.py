@@ -25,6 +25,7 @@ import argparse, os, random, sqlite3
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
+from prettytable import PrettyTable
 import tensorflow as tf
 from tensorflow.keras import layers as KL
 from tensorflow.keras import ops
@@ -32,6 +33,7 @@ from tensorflow.keras import ops
 from config import project_config
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.training_callbacks import JointReconstructionCallback, TensorBoardPerBatchLoggingCallback
+from scripts.joint_edge_sampler import make_edge_sampler
 logging.basicConfig(level=logging.INFO)
 
 ##########################################################################
@@ -139,7 +141,7 @@ def make_pair_generator(
     GROUP BY p.nconst
     HAVING COUNT(pp.profession) > 0
     """
-
+    movie_count = 0
     for movie_dict in movies:
         people_rows = cur.execute(person_sql, (movie_dict["tconst"],)).fetchall()
         for row in people_rows:
@@ -155,7 +157,13 @@ def make_pair_generator(
             person_inputs = tuple(
                 f.transform(person_dict.get(f.name)) for f in person_ae.fields
             )
+            if movie_count < 10:
+                logging.info(f"movie: {movie_dict['tconst']}")
+                logging.info(f"  {movie_dict}")
+                logging.info(f"person: {person_dict['primaryName']}")
+                logging.info(f"  {person_dict}")
             yield movie_inputs, person_inputs
+        movie_count += 1
 
 
 
@@ -241,54 +249,42 @@ class JointAutoencoder(tf.keras.Model):
 # assemble everything & run
 ##########################################################################
 def build_joint_trainer(
-    cfg: Dict[str, Any],
-    warm: bool,
-    db_path: Path,
-    model_dir: Path
+        cfg: Dict[str, Any],
+        warm: bool,
+        db_path: Path,
+        model_dir: Path
 ) -> tuple[JointAutoencoder, tf.data.Dataset]:
-    """
-    Returns:
-      joint_model: JointAutoencoder wrapping TitlesAE & PeopleAE
-      ds:          tf.data.Dataset yielding (movie_inputs, person_inputs)
-    """
-    # 1) Instantiate row-autoencoders
+
     movie_ae  = TitlesAutoencoder(cfg, model_dir / "TitlesAutoencoder")
     people_ae = PeopleAutoencoder(cfg, model_dir / "PeopleAutoencoder")
 
-    # 2) Either load pretrained or build from scratch
     if warm:
-        print("[+] Warming up: loading pretrained row autoencoders…")
         movie_ae.load_model()
         people_ae.load_model()
     else:
-        print("[+] Cold start: accumulating stats for both AEs…")
-        movie_ae.accumulate_stats()
-        movie_ae.finalize_stats()
-        people_ae.accumulate_stats()
-        people_ae.finalize_stats()
-        print("[+] Building both autoencoders…")
-        movie_ae.build_autoencoder()
-        people_ae.build_autoencoder()
+        movie_ae.accumulate_stats();  movie_ae.finalize_stats();  movie_ae.build_autoencoder()
+        people_ae.accumulate_stats(); people_ae.finalize_stats(); people_ae.build_autoencoder()
 
-    # 4) Build the tf.data pipeline
-    movie_specs  = tuple(
-        tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype)
-        for f in movie_ae.fields
-    )
-    person_specs = tuple(
-        tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype)
-        for f in people_ae.fields
+    movie_specs  = tuple(tf.TensorSpec(shape=f.input_shape,  dtype=f.input_dtype) for f in movie_ae.fields)
+    person_specs = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in people_ae.fields)
+
+    edge_gen = make_edge_sampler(
+        db_path    = db_path,
+        movie_ae   = movie_ae,
+        person_ae  = people_ae,
+        batch_size = cfg["batch_size"],
     )
 
-    ds = tf.data.Dataset.from_generator(
-        lambda: make_pair_generator(db_path, movie_ae, people_ae),
-        output_signature=(movie_specs, person_specs)
+    ds = (
+        tf.data.Dataset
+        .from_generator(lambda: edge_gen, output_signature=(movie_specs, person_specs))
+        .batch(cfg["batch_size"])
+        .prefetch(tf.data.AUTOTUNE)
     )
-    ds = ds.batch(cfg["batch_size"]).prefetch(tf.data.AUTOTUNE)
 
-    # 5) Wrap into JointAutoencoder
     joint = JointAutoencoder(movie_ae, people_ae, temperature=0.07)
     return joint, ds
+
 
 
 ##########################################################################

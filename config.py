@@ -11,7 +11,7 @@ project_config = {
     'autoencoder': {
         'latent_dim': 256,
         'batch_size': 512,
-        'learning_rate': 0.001,
+        'learning_rate': 0.0005,
         'epochs': 20,
         'movies_file': 'movie.jsonl',
         'callback_interval': 100,
@@ -20,5 +20,6 @@ project_config = {
         'early_stopping_patience': 10,
         'movie_limit': 1000000000,
         'db_path': './data/imdb.db',
+        'nce_temp': 0.5,
     }
 }

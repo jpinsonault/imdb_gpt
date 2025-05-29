@@ -924,13 +924,20 @@ class MultiCategoryField(BaseField):
         # same representation for y; makes the dataset builder explicit
         return self._transform(raw_value if raw_value is not None else [])
 
-    # ---------- pretty‑print ----------
     def to_string(
         self,
         predicted_main: np.ndarray,
         predicted_flag: Optional[np.ndarray] = None,
         threshold: float = 0.5,
     ) -> str:
+        """
+        Return a terse “cat:prob” list.
+        Examples
+        --------
+        Drama:0.82 Comedy:0.11
+        or, if nothing passes `threshold`, the top guess:
+        Drama:0.34
+        """
         if self.optional:
             if predicted_flag is None:
                 raise ValueError("predicted_flag required for optional field")
@@ -941,13 +948,12 @@ class MultiCategoryField(BaseField):
         if probs.size != len(self.category_list):
             raise ValueError("probability vector length mismatch")
 
-        active = [c for c, p in zip(self.category_list, probs) if p >= threshold]
+        selected = [(c, p) for c, p in zip(self.category_list, probs) if p >= threshold]
+        if not selected:
+            idx = int(np.argmax(probs))
+            selected = [(self.category_list[idx], probs[idx])]
 
-        if active:
-            return ", ".join(active)
-
-        # fallback: at least show the most likely category
-        return self.category_list[int(np.argmax(probs))]
+        return " ".join(f"{c}:{p:.2f}" for c, p in selected)
 
     # ---------- simple encoder / decoder ----------
     def build_encoder(self, latent_dim: int) -> tf.keras.Model:
