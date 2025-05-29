@@ -20,6 +20,6 @@ project_config = {
         'early_stopping_patience': 10,
         'movie_limit': 1000000000,
         'db_path': './data/imdb.db',
-        'nce_temp': 0.5,
+        'nce_temp': 0.07,
     }
 }
