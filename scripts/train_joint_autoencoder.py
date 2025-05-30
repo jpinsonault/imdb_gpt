@@ -29,11 +29,13 @@ from prettytable import PrettyTable
 import tensorflow as tf
 from tensorflow.keras import layers as KL
 from tensorflow.keras import ops
+from tensorflow.keras.callbacks import Callback
 
 from config import project_config
+from scripts.autoencoder.edge_loss_logger import EdgeLossLogger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
 from scripts.autoencoder.training_callbacks import JointReconstructionCallback, TensorBoardPerBatchLoggingCallback
-from scripts.joint_edge_sampler import make_edge_sampler
 logging.basicConfig(level=logging.INFO)
 
 ##########################################################################
@@ -172,31 +174,83 @@ def make_pair_generator(
 ##########################################################################
 class JointAutoencoder(tf.keras.Model):
     """
-    Joint autoencoder wrapping a TitlesAutoencoder and a PeopleAutoencoder.
-    Computes reconstruction losses for both, plus an InfoNCE contrastive loss
-    between their latent vectors.
+    Joint autoencoder that logs per‑edge losses through EdgeLossLogger.
     """
     def __init__(
         self,
-        movie_ae: TitlesAutoencoder,
-        person_ae: PeopleAutoencoder,
-        temperature: float = 0.07
+        movie_ae,
+        person_ae,
+        temperature: float,
+        loss_logger: EdgeLossLogger,
     ):
         super().__init__()
-        self.movie_ae  = movie_ae
+        self.movie_ae = movie_ae
         self.person_ae = person_ae
-        self.temp      = temperature
+        self.temp = temperature
+        self.logger = loss_logger
 
-        # encoder shortcuts
         self.mov_enc = movie_ae.encoder
         self.per_enc = person_ae.encoder
 
-        # losses & weights from each row-AE
-        self.movie_losses   = movie_ae.get_loss_dict()
-        self.movie_weights  = movie_ae.get_loss_weights_dict()
-        self.person_losses  = person_ae.get_loss_dict()
+        self.movie_losses = movie_ae.get_loss_dict()
+        self.movie_weights = movie_ae.get_loss_weights_dict()
+        self.person_losses = person_ae.get_loss_dict()
         self.person_weights = person_ae.get_loss_weights_dict()
 
+        self._batch = 0
+        self._epoch = 0
+
+    # ------------------------------ train loop
+    def train_step(self, data):
+        movie_in, person_in, edge_ids = data       # ← unpack edgeIds
+        with tf.GradientTape() as tape:
+            m_z, p_z, m_rec, p_rec = self(
+                (movie_in, person_in), training=True
+            )
+
+            field_losses: Dict[str, tf.Tensor] = {}
+            rec_loss = 0.0
+
+            for idx, field in enumerate(self.movie_ae.fields):
+                l = tf.reduce_mean(
+                    field.loss(movie_in[idx], m_rec[idx])
+                ) * field.weight
+                rec_loss += l
+                field_losses[f"movie_{field.name}"] = l
+
+            for idx, field in enumerate(self.person_ae.fields):
+                l = tf.reduce_mean(
+                    field.loss(person_in[idx], p_rec[idx])
+                ) * field.weight
+                rec_loss += l
+                field_losses[f"person_{field.name}"] = l
+
+            nce = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
+            total = rec_loss + nce
+
+        grads = tape.gradient(total, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+
+        # ------------- log to SQLite (fast buffered)
+        total_val = float(total.numpy())
+        field_vals = {k: float(v.numpy()) for k, v in field_losses.items()}
+        for eid in edge_ids.numpy().tolist():
+            self.logger.add(
+                int(eid),
+                self._epoch,
+                self._batch,
+                total_val,
+                field_vals,
+            )
+        self._batch += 1
+
+        return {
+            "loss": total,
+            "rec_loss": rec_loss,
+            "nce": nce,
+            **field_losses,
+        }
+    
     def call(self, inputs, training=False):
         # inputs is a tuple: (movie_inputs, person_inputs)
         movie_in, person_in = inputs
@@ -211,51 +265,36 @@ class JointAutoencoder(tf.keras.Model):
 
         return m_z, p_z, m_recon, p_recon
 
-    def train_step(self, data):
-        movie_in, person_in = data
-
-        with tf.GradientTape() as tape:
-            m_z, p_z, m_rec, p_rec = self((movie_in, person_in), training=True)
-
-            field_losses = {}
-
-            rec_loss = 0.0
-            for idx, field in enumerate(self.movie_ae.fields):
-                l = tf.reduce_mean(field.loss(movie_in[idx], m_rec[idx])) * field.weight
-                rec_loss += l
-                field_losses[f"movie_{field.name}_loss"] = l
-
-            for idx, field in enumerate(self.person_ae.fields):
-                l = tf.reduce_mean(field.loss(person_in[idx], p_rec[idx])) * field.weight
-                rec_loss += l
-                field_losses[f"person_{field.name}_loss"] = l
-
-            nce   = tf.reduce_mean(info_nce_loss(m_z, p_z, self.temp))
-            total = rec_loss + nce
-
-        grads = tape.gradient(total, self.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
-
-        return {
-            "loss"      : total,
-            "rec_loss"  : rec_loss,
-            "nce"       : nce,
-            **field_losses,
-        }
-
+    # ------------------------------ epoch hooks
+    def reset_metrics(self):
+        super().reset_metrics()
+        self._batch = 0
+        self._epoch += 1
 
 
 ##########################################################################
 # assemble everything & run
 ##########################################################################
-def build_joint_trainer(
-        cfg: Dict[str, Any],
-        warm: bool,
-        db_path: Path,
-        model_dir: Path
-) -> tuple[JointAutoencoder, tf.data.Dataset]:
+class _FlushLogger(Callback):
+    def __init__(self, logger: EdgeLossLogger):
+        super().__init__()
+        self.logger = logger
 
-    movie_ae  = TitlesAutoencoder(cfg, model_dir / "TitlesAutoencoder")
+    def on_epoch_end(self, epoch, logs=None):
+        self.logger.flush()
+
+    def on_train_end(self, logs=None):
+        self.logger.close()
+
+
+def build_joint_trainer(
+    cfg: Dict[str, Any],
+    warm: bool,
+    db_path: Path,
+    model_dir: Path,
+) -> tuple[JointAutoencoder, tf.data.Dataset, EdgeLossLogger]:
+
+    movie_ae = TitlesAutoencoder(cfg, model_dir / "TitlesAutoencoder")
     people_ae = PeopleAutoencoder(cfg, model_dir / "PeopleAutoencoder")
 
     if warm:
@@ -265,25 +304,40 @@ def build_joint_trainer(
         movie_ae.accumulate_stats();  movie_ae.finalize_stats();  movie_ae.build_autoencoder()
         people_ae.accumulate_stats(); people_ae.finalize_stats(); people_ae.build_autoencoder()
 
-    movie_specs  = tuple(tf.TensorSpec(shape=f.input_shape,  dtype=f.input_dtype) for f in movie_ae.fields)
-    person_specs = tuple(tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in people_ae.fields)
+    movie_specs = tuple(
+        tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in movie_ae.fields
+    )
+    person_specs = tuple(
+        tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in people_ae.fields
+    )
+    edge_spec = tf.TensorSpec(shape=(), dtype=tf.int64)
 
     edge_gen = make_edge_sampler(
-        db_path    = db_path,
-        movie_ae   = movie_ae,
-        person_ae  = people_ae,
-        batch_size = cfg["batch_size"],
+        db_path=db_path,
+        movie_ae=movie_ae,
+        person_ae=people_ae,
+        batch_size=cfg["batch_size"],
     )
 
     ds = (
-        tf.data.Dataset
-        .from_generator(lambda: edge_gen, output_signature=(movie_specs, person_specs))
+        tf.data.Dataset.from_generator(
+            lambda: edge_gen,
+            output_signature=(movie_specs, person_specs, edge_spec),
+        )
         .batch(cfg["batch_size"])
         .prefetch(tf.data.AUTOTUNE)
     )
 
-    joint = JointAutoencoder(movie_ae, people_ae, temperature=0.07)
-    return joint, ds
+    loss_logger = EdgeLossLogger(db_path)
+
+    joint = JointAutoencoder(
+        movie_ae,
+        people_ae,
+        temperature=0.07,
+        loss_logger=loss_logger,
+    )
+    return joint, ds, loss_logger
+
 
 
 
@@ -304,30 +358,53 @@ def main():
     model_dir = Path(project_config["model_dir"])
     model_dir.mkdir(exist_ok=True, parents=True)
 
-    joint_model, ds = build_joint_trainer(cfg, args.warm, db_path, model_dir)
-
-    # simple optimizer – tweak as you like
-    joint_model.compile(optimizer=tf.keras.optimizers.AdamW(
-        learning_rate=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"]))
+    joint_model, ds, logger = build_joint_trainer(cfg, args.warm, db_path, model_dir)
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
-        filepath=model_dir / "JointMoviePersonAE_epoch_{epoch:02d}.keras",
-        save_weights_only=False, save_freq="epoch")
-    
-    recon_cb = JointReconstructionCallback(
-        movie_ae  = joint_model.movie_ae,
-        person_ae = joint_model.person_ae,
-        db_path   = project_config["autoencoder"]["db_path"],
-        interval_batches = 100,
-        num_samples      = 4,
+    filepath=model_dir / "JointMoviePersonAE_epoch_{epoch:02d}.keras",
+    save_weights_only=False,
+    monitor="loss",
+    mode="min",
+    save_best_only=False,
+    save_freq="epoch",
+)
+
+    tensorboard_cb = TensorBoardPerBatchLoggingCallback(
+        log_dir=model_dir / "logs" / "joint",
+        log_interval=20,
     )
 
-    tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=model_dir / "logs" / "joint", log_interval=20)
+    recon_cb = JointReconstructionCallback(
+        movie_ae=joint_model.movie_ae,
+        person_ae=joint_model.person_ae,
+        db_path=project_config["autoencoder"]["db_path"],
+        interval_batches=100,
+        num_samples=4,
+    )
 
-    joint_model.fit(ds,
-                    epochs=cfg["epochs"],
-                    callbacks=[ckpt, recon_cb, tensorboard_callback],)
+    joint_model.compile(
+        optimizer=tf.keras.optimizers.AdamW(
+            learning_rate=cfg["learning_rate"],
+            weight_decay=cfg["weight_decay"],
+        ),
+        run_eagerly=True,
+    )
+
+    joint_model.fit(
+        ds,
+        epochs=cfg["epochs"],
+        callbacks=[
+            _FlushLogger(logger),
+            tf.keras.callbacks.TerminateOnNaN(),
+            ckpt,
+            tensorboard_cb,
+            recon_cb,
+        ],
+    )
+
+    logger.close()
+    joint_model.save(model_dir / "JointMoviePersonAE_final.keras")
+
 
     # save components
     print("[✓] Training done. Saving models…")

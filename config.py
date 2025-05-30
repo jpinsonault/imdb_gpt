@@ -13,13 +13,12 @@ project_config = {
         'batch_size': 512,
         'learning_rate': 0.0005,
         'epochs': 20,
-        'movies_file': 'movie.jsonl',
         'callback_interval': 100,
         'people_sequence_length': 1,
         'weight_decay': 1e-4,
         'early_stopping_patience': 10,
         'movie_limit': 1000000000,
         'db_path': './data/imdb.db',
-        'nce_temp': 0.07,
+        'nce_temp': 0.03,
     }
 }

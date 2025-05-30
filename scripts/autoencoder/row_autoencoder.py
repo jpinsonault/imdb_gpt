@@ -140,7 +140,7 @@ class RowAutoencoder:
     def accumulate_stats(
         self,
         use_cache: bool = True,
-        refresh_cache: bool = True,
+        refresh_cache: bool = False,
     ):
         if refresh_cache:
             self._drop_cache_table()
