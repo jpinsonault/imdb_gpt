@@ -44,7 +44,7 @@ def cosine_similarity(a, b):
     b = tf.math.l2_normalize(b, -1)
     return tf.matmul(a, b, transpose_b=True)          # (B, B)
 
-def info_nce_loss(movie_z, person_z, temperature: float = 0.07):
+def info_nce_loss(movie_z, person_z, temperature: float):
     logits = cosine_similarity(movie_z, person_z) / temperature     # (B, B)
     labels = tf.range(tf.shape(logits)[0])
     loss_a = tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)

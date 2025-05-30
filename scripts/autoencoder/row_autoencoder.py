@@ -1,4 +1,6 @@
 import logging
+import pickle
+import sqlite3
 import numpy as np
 from pathlib import Path
 from prettytable import PrettyTable
@@ -12,74 +14,168 @@ from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCall
 # Alias for distributions
 logging.basicConfig(level=logging.info, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    
-@tf.keras.utils.register_keras_serializable(package="Custom", name="BatchRepel")
+
+def _attention_fuse(
+        latents,
+        latent_dim,
+        num_heads=4,
+        key_dim=None,
+):
+    if key_dim is None:
+        key_dim = max(8, latent_dim // num_heads)
+
+    proj_tokens = []
+    for i, t in enumerate(latents):
+        if t.shape[-1] != latent_dim:
+            t = tf.keras.layers.Dense(latent_dim, name=f"field_proj_{i}")(t)
+        t = tf.keras.layers.Lambda(lambda x: tf.expand_dims(x, 1))(t)
+        proj_tokens.append(t)
+
+    tokens = tf.keras.layers.Concatenate(axis=1, name="token_concat")(proj_tokens)
+
+    attn_out = tf.keras.layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        value_dim=latent_dim,
+        output_shape=latent_dim,
+        name="field_mha",
+    )(tokens, tokens)
+
+    x = tf.keras.layers.Add()([tokens, attn_out])
+    x = tf.keras.layers.LayerNormalization()(x)
+
+    pooled = tf.keras.layers.Lambda(lambda t: tf.reduce_mean(t, axis=1))(x)
+    return tf.keras.layers.LayerNormalization(name="latent")(pooled)
+
+
+@tf.keras.utils.register_keras_serializable("Custom", "BatchRepel")
 class BatchRepel(tf.keras.layers.Layer):
-    def __init__(self, coeff=1e-2, **kw):
+    def __init__(self, coeff: float = 1e-2, **kw):
         super().__init__(**kw)
         self.coeff = coeff
 
     def call(self, z):
-        # unit‑length so that cosine == dot product
         z = tf.nn.l2_normalize(z, axis=-1)
-
-        sim = tf.matmul(z, z, transpose_b=True)          # (B,B)
+        sim = tf.matmul(z, z, transpose_b=True)
         b = tf.shape(sim)[0]
-        mask = tf.ones_like(sim) - tf.eye(b)             # zero out self‑similarities
-        off_diag = sim * mask
-        reg = tf.reduce_sum(tf.square(off_diag)) / tf.cast(b * (b - 1), tf.float32)
-
+        mask = tf.ones_like(sim) - tf.eye(b)
+        off = sim * mask
+        reg = tf.reduce_sum(tf.square(off)) / tf.cast(b * (b - 1), tf.float32)
         self.add_loss(self.coeff * reg)
         return z
-    
+
     def get_config(self):
-        config = super().get_config()
-        config.update({"coeff": self.coeff})
-        return config
+        cfg = super().get_config()
+        cfg.update({"coeff": self.coeff})
+        return cfg
 
 
-################################################################################
-# RowAutoencoder (Updated to use the custom latent layer)
-################################################################################
 class RowAutoencoder:
     def __init__(self, config: Dict[str, Any], model_dir: Path):
         self.config = config
-        self.model: Optional[tf.keras.Model] = None
-        self.encoder: Optional[tf.keras.Model] = None
-        self.decoder: Optional[tf.keras.Model] = None
-        self.model_dir = Path(model_dir) # Ensure it's a Path object
-        self.fields = self.build_fields()
-        self.num_rows_in_dataset = 0
-        self.latent_dim = self.config["latent_dim"]
-        self.stats_accumulated = False
-        # Added db_path reference needed for fit method's callback
-        self.db_path = config['db_path'] # Get db_path from config if passed
+        self.model_dir = Path(model_dir)
+        self.model = None
+        self.encoder = None
+        self.decoder = None
 
-    def accumulate_stats(self):
-        if self.stats_accumulated:
-            logging.info("Stats already accumulated.")
+        self.fields: List[BaseField] = self.build_fields()
+        self.latent_dim = self.config["latent_dim"]
+        self.num_rows_in_dataset = 0
+
+        self.db_path: str = config["db_path"]
+        self.stats_accumulated = False
+
+    # --------------------------------------------------------------------- #
+    # cache helpers
+    # --------------------------------------------------------------------- #
+    def _cache_table_name(self) -> str:
+        return f"{self.__class__.__name__}_stats_cache"
+
+    def _drop_cache_table(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {self._cache_table_name()};")
+            conn.commit()
+
+    def _save_cache(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._cache_table_name()} ("
+                "field_name TEXT PRIMARY KEY, data BLOB)"
+            )
+            for f in self.fields:
+                blob = pickle.dumps(f)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self._cache_table_name()} "
+                    "(field_name, data) VALUES (?, ?);",
+                    (f.name, blob),
+                )
+            conn.commit()
+
+    def _load_cache(self) -> bool:
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name=?;", (self._cache_table_name(),)
+            )
+            if cur.fetchone() is None:
+                return False
+
+            cur.execute(f"SELECT field_name, data FROM {self._cache_table_name()};")
+            rows = cur.fetchall()
+            if not rows:
+                return False
+
+            cache_map = {name: pickle.loads(blob) for name, blob in rows}
+            for i, f in enumerate(self.fields):
+                if f.name in cache_map:
+                    self.fields[i] = cache_map[f.name]
+
+        self.stats_accumulated = True
+        return True
+
+    # --------------------------------------------------------------------- #
+    # public API
+    # --------------------------------------------------------------------- #
+    def accumulate_stats(
+        self,
+        use_cache: bool = True,
+        refresh_cache: bool = True,
+    ):
+        if refresh_cache:
+            self._drop_cache_table()
+
+        if use_cache and self._load_cache():
+            logging.info("stats loaded from cache")
             return
 
-        num_rows = 0
-        logging.info(f"Starting accumulation of stats for {self.__class__.__name__}.")
-        # Wrap row_generator with tqdm for progress bar
-        for row in tqdm(self.row_generator(), desc=f"Accumulating stats ({self.__class__.__name__})"):
+        if self.stats_accumulated:
+            logging.info("stats already accumulated")
+            return
+
+        n = 0
+        logging.info("accumulating stats")
+        for row in tqdm(self.row_generator(), desc=self.__class__.__name__):
             self.accumulate_stats_for_row(row)
-            num_rows += 1
-        self.num_rows_in_dataset = num_rows
-        logging.info(f"Finished accumulating stats for {num_rows} rows for {self.__class__.__name__}.")
+            n += 1
+        self.num_rows_in_dataset = n
+        logging.info(f"stats accumulation finished ({n} rows)")
+
+    def finalize_stats(self):
+        if self.stats_accumulated:
+            return
+
+        logging.info("finalizing stats")
+        for f in self.fields:
+            f.finalize_stats()
+        self.stats_accumulated = True
+        self._save_cache()
+        logging.info("stats finalized and cached")
 
     def accumulate_stats_for_row(self, row: Dict):
         for f in self.fields:
-            raw_value = row.get(f.name, None)
-            f.accumulate_stats(raw_value)
+            f.accumulate_stats(row.get(f.name))
 
-    def finalize_stats(self):
-        logging.info(f"Finalizing stats for {self.__class__.__name__}...")
-        for f in self.fields:
-            f.finalize_stats()
-        self.stats_accumulated = True # Set flag here
-        logging.info(f"Stats finalized for {self.__class__.__name__}.")
 
 
     def _build_dataset(self) -> tf.data.Dataset:
@@ -110,25 +206,9 @@ class RowAutoencoder:
 
 
     def transform_row(self, row: Dict) -> Dict[str, tf.Tensor]:
-        """Transforms a dictionary row into a dictionary of tensors for encoder input."""
-        out = {}
+        out: Dict[str, tf.Tensor] = {}
         for f in self.fields:
-            raw_value = row.get(f.name, None)
-            try:
-                 # Ensure field stats are finalized before transforming
-                if not f.stats_finalized(): # Add a check method to BaseField if needed
-                     raise RuntimeError(f"Stats for field '{f.name}' must be finalized before transforming.")
-                out[f.name] = f.transform(raw_value)
-            except Exception as e:
-                logging.error(f"Error transforming field '{f.name}' with value '{raw_value}': {e}", exc_info=True)
-                # Handle error appropriately, e.g., return default padding or raise
-                # For now, let's try to return padding, assuming get_base_padding_value works
-                try:
-                    out[f.name] = f.get_base_padding_value()
-                    logging.warning(f"Using padding value for field '{f.name}' due to transformation error.")
-                except Exception as pad_e:
-                     logging.error(f"Could not get padding value for field '{f.name}': {pad_e}")
-                     raise e # Re-raise original error if padding fails
+            out[f.name] = f.transform(row.get(f.name))
         return out
 
     def reconstruct_row(self, latent_vector: np.ndarray) -> Dict[str, str]:
@@ -274,49 +354,47 @@ class RowAutoencoder:
 
         latent_dim = self.latent_dim
 
-        # ---------- inputs ----------
-        inp_list = []
-        for f in self.fields:
-            inp = tf.keras.Input(shape=f.input_shape,
-                                name=f"{f.name}_input",
-                                dtype=f.input_dtype)
-            inp_list.append(inp)
+        inp_list = [
+            tf.keras.Input(
+                shape = f.input_shape,
+                name  = f"{f.name}_input",
+                dtype = f.input_dtype,
+            )
+            for f in self.fields
+        ]
 
-        # ---------- encoders ----------
         enc_outs = []
         decoders = {}
         for f, inp in zip(self.fields, inp_list):
             enc = f.build_encoder(latent_dim)
             dec = f.build_decoder(latent_dim)
             enc_outs.append(enc(inp))
-            decoders[f.name] = dec             # keep for the combined decoder
+            decoders[f.name] = dec
 
-        # ---------- latent bottleneck ----------
         if len(enc_outs) == 1:
             z = enc_outs[0]
         else:
-            z = tf.keras.layers.Concatenate(name="concat_latent")(enc_outs)
+            z = _attention_fuse(
+                enc_outs,
+                latent_dim  = latent_dim,
+                num_heads   = 4,
+                key_dim     = max(8, latent_dim // 8),   # tweak as you like
+            )
 
-        z = tf.keras.layers.Dense(latent_dim * 2, activation="gelu")(z)
-        z = tf.keras.layers.LayerNormalization()(z)
-        z = tf.keras.layers.Dense(latent_dim, activation="gelu")(z)
-        z = tf.keras.layers.LayerNormalization(name="latent")(z)
+        self.encoder = tf.keras.Model(inp_list, z, name = "Encoder")
 
-        self.encoder = tf.keras.Model(inp_list, z, name="Encoder")
-
-        # ---------- combined decoder (NEW) ----------
-        dec_in = tf.keras.Input(shape=(latent_dim,), name="decoder_latent")
+        dec_in   = tf.keras.Input(shape = (latent_dim,), name = "decoder_latent")
         dec_outs = []
         for f in self.fields:
-            out = decoders[f.name](dec_in)
-            main = out[0] if isinstance(out, (list, tuple)) else out
-            dec_outs.append(main)
-        self.decoder = tf.keras.Model(dec_in, dec_outs, name="Decoder")
+            o = decoders[f.name](dec_in)
+            dec_outs.append(o[0] if isinstance(o, (list, tuple)) else o)
 
-        # ---------- full autoencoder ----------
+        self.decoder = tf.keras.Model(dec_in, dec_outs, name = "Decoder")
+
         ae_outs = self.decoder(z)
-        self.model = tf.keras.Model(inp_list, ae_outs, name="RowAutoencoder")
+        self.model = tf.keras.Model(inp_list, ae_outs, name = "RowAutoencoder")
         return self.model
+
 
 
     def save_model(self):
