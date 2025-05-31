@@ -176,35 +176,26 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
 
 
 class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
-    def __init__(self, log_dir: Path, log_interval: int = 1):
+    def __init__(self, log_dir, log_interval: int = 1):
         super().__init__()
         self.log_interval = log_interval
-        now = datetime.datetime.now()
-        run_id = f"{now:%Y%m%d-%H%M%S}"
-        self.file_writer = tf.summary.create_file_writer(str(log_dir / run_id))
+        log_root = Path(log_dir)          # always Path
+        run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.file_writer = tf.summary.create_file_writer(str(log_root / run_id))
 
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
-
-        # ▲ read the variable’s *value*, not the variable itself
         step = int(self.model.optimizer.iterations.numpy())
-
         total_loss = float(logs.get("loss", 0.0))
-
         lr = self.model.optimizer.learning_rate
-        lr_value = (
-            float(lr(step)) if callable(lr)          # learning‑rate schedule
-            else float(tf.keras.backend.get_value(lr))
-        )
-
+        lr_val = float(lr(step)) if callable(lr) else float(tf.keras.backend.get_value(lr))
         with self.file_writer.as_default():
-            tf.summary.scalar("loss/total",      total_loss,  step=step)
-            tf.summary.scalar("learning_rate",   lr_value,    step=step)
+            tf.summary.scalar("loss/total",      total_loss, step=step)
+            tf.summary.scalar("learning_rate",   lr_val,     step=step)
             for k, v in logs.items():
                 if k.endswith("_loss") and k != "loss":
                     tf.summary.scalar(f"loss/{k[:-5]}", float(v), step=step)
             self.file_writer.flush()
-
 
 
 

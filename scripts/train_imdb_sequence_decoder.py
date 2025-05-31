@@ -26,7 +26,6 @@ from autoencoder.fields import (
     BaseField
 )
 from scripts.autoencoder.imdb_row_autoencoders import PeopleAutoencoder, TitlesAutoencoder
-from scripts.autoencoder.row_autoencoder import RowAutoencoder
 
 @tf.keras.utils.register_keras_serializable()
 def add_positional_encoding(input_sequence):
@@ -431,7 +430,14 @@ class MoviesToPeopleSequenceAutoencoder:
             num_samples=5,
             interval_batches=self.config["callback_interval"],
         )
-        tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=log_dir, log_interval=20)
+        log_root = Path(self.config["log_dir"])
+        log_dir  = log_root / f"{self.__class__.__name__}_fit"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        tensorboard_callback = TensorBoardPerBatchLoggingCallback(
+            log_dir=log_dir,
+            log_interval=20,
+        )
 
         print("Starting sequence prediction model training...")
         self.model.fit(
@@ -457,13 +463,12 @@ def main():
     # Assume project_config is imported
     from config import project_config
     # Use the 'autoencoder' sub-config for the sequence model too
-    config = project_config["autoencoder"]
     db_path = Path(project_config["data_dir"]) / "imdb.db"
     # Main directory for saving the sequence model and its components
     sequence_model_dir = Path(project_config["model_dir"]) / "SequencePredictor"
 
     print("\n--- Training Movie-to-People Sequence Predictor ---")
-    sequence_predictor = MoviesToPeopleSequenceAutoencoder(config, db_path, sequence_model_dir)
+    sequence_predictor = MoviesToPeopleSequenceAutoencoder(project_config, db_path, sequence_model_dir)
     sequence_predictor.fit()
 
 

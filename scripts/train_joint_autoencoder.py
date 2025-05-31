@@ -271,14 +271,14 @@ class _FlushLogger(Callback):
 
 
 def build_joint_trainer(
-    cfg: Dict[str, Any],
+    config: Dict[str, Any],
     warm: bool,
     db_path: Path,
     model_dir: Path,
 ) -> tuple[JointAutoencoder, tf.data.Dataset, EdgeLossLogger]:
 
-    movie_ae = TitlesAutoencoder(cfg, model_dir / "TitlesAutoencoder")
-    people_ae = PeopleAutoencoder(cfg, model_dir / "PeopleAutoencoder")
+    movie_ae = TitlesAutoencoder(config)
+    people_ae = PeopleAutoencoder(config)
 
     if warm:
         movie_ae.load_model()
@@ -299,9 +299,9 @@ def build_joint_trainer(
         db_path       = db_path,
         movie_ae      = movie_ae,
         person_ae     = people_ae,
-        batch_size    = cfg["batch_size"],
-        refresh_batches = cfg['edge_sampler']["refresh_batches"],
-        boost         = cfg['edge_sampler']["weak_edge_boost"],
+        batch_size    = config["batch_size"],
+        refresh_batches = config['edge_sampler']["refresh_batches"],
+        boost         = config['edge_sampler']["weak_edge_boost"],
     )
 
 
@@ -310,7 +310,7 @@ def build_joint_trainer(
             lambda: edge_gen,
             output_signature=(movie_specs, person_specs, edge_spec),
         )
-        .batch(cfg["batch_size"])
+        .batch(config["batch_size"])
         .prefetch(tf.data.AUTOTUNE)
     )
 
@@ -336,15 +336,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=None, help="override epochs in config")
     args = parser.parse_args()
 
-    cfg = dict(project_config["autoencoder"])                       # shallow copy
-    if args.epochs: cfg["epochs"] = args.epochs
+    if args.epochs: project_config["epochs"] = args.epochs
 
     data_dir  = Path(project_config["data_dir"])
     db_path   = data_dir / "imdb.db"
     model_dir = Path(project_config["model_dir"])
     model_dir.mkdir(exist_ok=True, parents=True)
 
-    joint_model, ds, logger = build_joint_trainer(cfg, args.warm, db_path, model_dir)
+    joint_model, ds, logger = build_joint_trainer(project_config, args.warm, db_path, model_dir)
 
     ckpt = tf.keras.callbacks.ModelCheckpoint(
         filepath=model_dir / "JointMoviePersonAE_epoch_{epoch:02d}.keras",
@@ -356,29 +355,29 @@ def main():
     )
 
     tensorboard_cb = TensorBoardPerBatchLoggingCallback(
-        log_dir=model_dir / "logs" / "joint",
+        log_dir=Path(project_config["log_dir"]) / "joint",
         log_interval=20,
     )
 
     recon_cb = JointReconstructionCallback(
         movie_ae=joint_model.movie_ae,
         person_ae=joint_model.person_ae,
-        db_path=project_config["autoencoder"]["db_path"],
+        db_path=project_config["db_path"],
         interval_batches=100,
         num_samples=4,
     )
 
     joint_model.compile(
         optimizer=tf.keras.optimizers.AdamW(
-            learning_rate=cfg["learning_rate"],
-            weight_decay=cfg["weight_decay"],
+            learning_rate=project_config["learning_rate"],
+            weight_decay=project_config["weight_decay"],
         ),
         run_eagerly=True,
     )
 
     joint_model.fit(
         ds,
-        epochs=cfg["epochs"],
+        epochs=project_config["epochs"],
         callbacks=[
             _FlushLogger(logger),
             tf.keras.callbacks.TerminateOnNaN(),

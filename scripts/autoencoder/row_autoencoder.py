@@ -71,9 +71,9 @@ class BatchRepel(tf.keras.layers.Layer):
 
 
 class RowAutoencoder:
-    def __init__(self, config: Dict[str, Any], model_dir: Path):
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.model_dir = Path(model_dir)
+        self.model_dir = Path(config['model_dir'])
         self.model = None
         self.encoder = None
         self.decoder = None
@@ -280,7 +280,8 @@ class RowAutoencoder:
         for field in self.fields:
             # Determine the expected output name (consistent with build_autoencoder)
             # Also check just field.name as a fallback if mapping by order occurred
-            expected_output_name_primary = f"{field.name}_decoder"
+            # expected_output_name_primary = f"{field.name}_decoder"
+            expected_output_name_primary = f"{field.name}_recon"
             expected_output_name_fallback = field.name
 
             output_tensor = decoder_outputs_map.get(expected_output_name_primary)
@@ -516,95 +517,68 @@ class RowAutoencoder:
 
 
     def fit(self):
-        # Ensure stats are ready
         if not self.stats_accumulated:
-            print("Stats not accumulated, running accumulation first.")
             self.accumulate_stats()
             self.finalize_stats()
 
-        # Build model if not loaded/built
         if self.model is None:
-            print("Model not found, building autoencoder...")
             self.build_autoencoder()
-            print("Autoencoder built.")
 
-        # Print architecture
         self._print_model_architecture()
 
-        # --- Training Configuration ---
-        epochs = self.config.get("epochs", 10)
-        initial_lr = self.config.get("learning_rate", 0.0002)
-        weight_decay = self.config.get("weight_decay", 1e-4)
-        callback_interval = self.config.get("callback_interval", 100)
+        epochs          = self.config.get("epochs", 10)
+        initial_lr      = self.config.get("learning_rate", 2e-4)
+        weight_decay    = self.config.get("weight_decay", 1e-4)
+        callback_every  = self.config.get("callback_interval", 100)
 
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr, weight_decay=weight_decay)
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=initial_lr,
+            weight_decay=weight_decay,
+        )
 
-        # Compile the model using lists of losses and weights in field order
-        losses = [f.loss for f in self.fields]
-        loss_weights = [f.weight for f in self.fields]
-
-        print("\nCompiling model with:")
-        print("  Losses:", losses)
-        print("  Loss Weights:", loss_weights)
         self.model.compile(
             optimizer=optimizer,
-            loss=losses,
-            loss_weights=loss_weights
+            loss=[f.loss for f in self.fields],
+            loss_weights=[f.weight for f in self.fields],
         )
-        print("Model compiled successfully.")
 
-        # Callbacks
-        log_dir = "logs/fit/" + self.__class__.__name__ + "_" + str(int(tf.timestamp().numpy()))
-        os.makedirs(log_dir, exist_ok=True)
-        tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=log_dir, log_interval=callback_interval)
+        log_root = Path(self.config["log_dir"])
+        log_dir  = log_root / "fit" / self.__class__.__name__
+        log_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.db_path:
-            self.db_path = getattr(self, 'db_path', None)
-            if not self.db_path:
-                raise ValueError("db_path is required for ReconstructionCallback but not found in config or class.")
+        tensorboard_callback = TensorBoardPerBatchLoggingCallback(
+            log_dir=log_dir,
+            log_interval=callback_every,
+        )
 
         reconstruction_callback = ReconstructionCallback(
-            interval_batches=callback_interval,
+            interval_batches=callback_every,
             row_autoencoder=self,
             db_path=self.db_path,
-            num_samples=5
+            num_samples=5,
         )
 
         model_save_callback = ModelSaveCallback(self, output_dir=self.model_dir)
 
-        callbacks_list = [
-            tensorboard_callback,
-            reconstruction_callback,
-            model_save_callback,
-            tf.keras.callbacks.TerminateOnNaN()
-        ]
-
-        # Build the dataset
-        print("Building dataset...")
         ds = self._build_dataset()
-        print("Dataset built.")
 
-        # Determine steps per epoch if possible
-        steps_per_epoch = None
-        if self.num_rows_in_dataset > 0 and self.config.get("batch_size", 32) > 0:
-            steps_per_epoch = self.num_rows_in_dataset // self.config.get("batch_size", 32)
-            print(f"Estimated steps per epoch: {steps_per_epoch}")
-        else:
-            print("Could not determine steps per epoch (num_rows_in_dataset or batch_size missing/zero).")
+        steps_per_epoch = (
+            self.num_rows_in_dataset // self.config.get("batch_size", 32)
+            if self.num_rows_in_dataset else None
+        )
 
-        # Train the model
-        print(f"\nStarting training for {epochs} epochs...")
         history = self.model.fit(
             ds,
             epochs=epochs,
-            callbacks=callbacks_list,
+            callbacks=[
+                tensorboard_callback,
+                reconstruction_callback,
+                model_save_callback,
+                tf.keras.callbacks.TerminateOnNaN(),
+            ],
             steps_per_epoch=steps_per_epoch,
-            verbose=1
+            verbose=1,
         )
-        print("\nTraining complete.")
 
-        # Save final model
-        print("Saving final model...")
         self.save_model()
-
         return history

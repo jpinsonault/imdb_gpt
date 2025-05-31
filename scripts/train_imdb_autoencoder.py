@@ -10,15 +10,11 @@ from config import project_config
 from autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 
 def main():
-    config = project_config["autoencoder"]
-    model_dir = Path(project_config["model_dir"])
-
-
-    # people_ae = PeopleAutoencoder(config, model_dir)
+    # people_ae = PeopleAutoencoder(project_config)
     # people_ae.fit()
     # people_ae.save_model()
 
-    title_ae = TitlesAutoencoder(config, model_dir)
+    title_ae = TitlesAutoencoder(project_config)
     # title_ae.load_model()
     title_ae.fit()
     # title_ae.save_model()
