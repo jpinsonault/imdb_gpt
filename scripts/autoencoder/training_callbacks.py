@@ -42,45 +42,33 @@ def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
 
 class JointReconstructionCallback(tf.keras.callbacks.Callback):
-    def __init__(
-        self,
-        movie_ae,
-        person_ae,
-        db_path,
-        interval_batches: int = 200,
-        num_samples: int = 4,
-        neg_pool: int = 256,
-        table_width: int = 38,
-    ):
+    def __init__(self, movie_ae, person_ae, db_path, interval_batches=200, num_samples=4, table_width=38):
         super().__init__()
         self.m_ae = movie_ae
         self.p_ae = person_ae
         self.every = interval_batches
         self.w = table_width
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-
         movies = list(islice(movie_ae.row_generator(), 50000))
-        self.pairs: List[Tuple[dict, dict]] = []
+        self.pairs = []
         for m in random.sample(movies, min(num_samples * 3, len(movies))):
             p = self._sample_person(m["tconst"])
-            if p: self.pairs.append((m, p))
+            if p:
+                self.pairs.append((m, p))
             if len(self.pairs) == num_samples:
                 break
-
-        neg_movies = random.sample(movies, min(neg_pool, len(movies)))
+        neg_movies = random.sample(movies, min(256, len(movies)))
         self.neg_people_latents = []
         for m in neg_movies:
             p = self._sample_person(m["tconst"])
             if p:
                 z = self._encode(self.p_ae, p)
                 self.neg_people_latents.append(z)
-        self.neg_people_latents = np.stack(self.neg_people_latents)  # (N,D)
+        self.neg_people_latents = np.stack(self.neg_people_latents)
 
-    # ------------------------------------------------------------------ utils
     def _sample_person(self, tconst):
         q = """
-        SELECT p.primaryName, p.birthYear, p.deathYear,
-               GROUP_CONCAT(pp.profession, ',')
+        SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
         FROM people p
         LEFT JOIN people_professions pp ON pp.nconst = p.nconst
         INNER JOIN principals pr ON pr.nconst = p.nconst
@@ -91,69 +79,100 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
         LIMIT 1
         """
         r = self.conn.execute(q, (tconst,)).fetchone()
-        if not r: return None
+        if not r:
+            return None
         return {
-            "primaryName":  r[0],
-            "birthYear":    r[1],
-            "deathYear":    r[2],
-            "professions":  r[3].split(',') if r[3] else None,
+            "primaryName": r[0],
+            "birthYear": r[1],
+            "deathYear": r[2],
+            "professions": r[3].split(',') if r[3] else None,
         }
 
     def _encode(self, ae, row):
         xs = [tf.expand_dims(f.transform(row.get(f.name)), 0) for f in ae.fields]
         return ae.encoder(xs, training=False).numpy()[0]
 
-    def _recon(self, ae, z):  # → dict[str,str]
+    def _recon(self, ae, z):
         return ae.reconstruct_row(z)
 
-    # -------------------------------------------------------------- metrics
-    def _pair_metrics(self, z_m, z_p):
-        cos = _cos(z_m, z_p)
-        l2 = float(np.linalg.norm(z_m - z_p))
-        ang = float(np.degrees(np.arccos(max(min(cos, 1.0), -1.0))))
-        rank = self._rank(z_m, z_p)
-        return cos, l2, ang, rank
+    def _cos(self, a, b):
+        a_norm = a / (np.linalg.norm(a) + 1e-9)
+        b_norm = b / (np.linalg.norm(b) + 1e-9)
+        return float(np.dot(a_norm, b_norm))
 
     def _rank(self, z_m, z_p):
-        sims = np.dot(self.neg_people_latents, z_m) / (_norm(self.neg_people_latents) * _norm(z_m))
-        sims = np.append(sims, _cos(z_m, z_p))
-        return int((-sims).argsort().tolist().index(len(sims) - 1)) + 1  # 1‑based
-
-    # ----------------------------------------------------------- pretty print
-    def _show(self, m_row, p_row, m_rec, p_rec, cos, l2, ang, rank):
-        tm = PrettyTable(["Movie field", "orig", "recon"])
-        for f in self.m_ae.fields:
-            o = m_row.get(f.name, "")
-            r = m_rec.get(f.name, "")
-            tm.add_row([f.name, str(o)[:self.w], str(r)[:self.w]])
-
-        tp = PrettyTable(["Person field", "orig", "recon"])
-        for f in self.p_ae.fields:
-            o = p_row.get(f.name, "")
-            r = p_rec.get(f.name, "")
-            tp.add_row([f.name, str(o)[:self.w], str(r)[:self.w]])
-
-        bar_len = 20
-        bar = "#" * int(cos * bar_len) + "-" * (bar_len - int(cos * bar_len))
-        print(
-            f"\n--- joint recon ---\n"
-            f"cos={cos:.3f}  angle={ang:5.1f}°  l2={l2:.3f}  rank@neg={rank}\n"
-            f"[{bar}]\n"
-            f"{tm}\n{tp}"
+        sims = np.dot(self.neg_people_latents, z_m) / (
+            (np.linalg.norm(self.neg_people_latents, axis=1) + 1e-9) * (np.linalg.norm(z_m) + 1e-9)
         )
+        sims = np.append(sims, self._cos(z_m, z_p))
+        return int((-sims).argsort().tolist().index(len(sims) - 1)) + 1
 
-    # ------------------------------------------------------------------ hook
+    def _tensor_to_string(self, field, main_tensor, flag_tensor=None):
+        try:
+            if isinstance(field, NumericDigitCategoryField):
+                arr = np.array(main_tensor)
+                if arr.ndim == 3:
+                    return field.to_string(arr)
+                arr = arr.flatten()
+                return field.to_string(arr)
+            if hasattr(field, "tokenizer") and field.tokenizer is not None:
+                arr = np.array(main_tensor)
+                if arr.ndim >= 2 and arr.shape[-1] == field.tokenizer.get_vocab_size():
+                    arr = np.argmax(arr, axis=-1)
+            else:
+                arr = np.array(main_tensor).flatten()
+            if flag_tensor is not None:
+                ft = np.array(flag_tensor)
+                if ft.ndim > 1:
+                    ft = ft.flatten()
+                if ft.size > 1:
+                    ft = ft[:1]
+                elif ft.size == 0:
+                    ft = None
+            else:
+                ft = None
+            return field.to_string(arr, ft)
+        except Exception:
+            return "[Conversion Error]"
+
     def on_train_batch_end(self, batch, logs=None):
         if (batch + 1) % self.every:
             return
         for m_row, p_row in self.pairs:
             z_m = self._encode(self.m_ae, m_row)
             z_p = self._encode(self.p_ae, p_row)
-            cos, l2, ang, rank = self._pair_metrics(z_m, z_p)
+            cos = self._cos(z_m, z_p)
+            l2 = float(np.linalg.norm(z_m - z_p))
+            ang = float(np.degrees(np.arccos(max(min(cos, 1.0), -1.0))))
+            rank = self._rank(z_m, z_p)
             m_rec = self._recon(self.m_ae, z_m)
             p_rec = self._recon(self.p_ae, z_p)
-            self._show(m_row, p_row, m_rec, p_rec, cos, l2, ang, rank)
-
+            tm = PrettyTable(["Movie field", "orig", "recon"])
+            for f in self.m_ae.fields:
+                o = m_row.get(f.name, "")
+                r_raw = m_rec.get(f.name, "")
+                if isinstance(r_raw, np.ndarray):
+                    r = self._tensor_to_string(f, r_raw)
+                else:
+                    r = r_raw
+                tm.add_row([f.name, str(o)[: self.w], str(r)[: self.w]])
+            tp = PrettyTable(["Person field", "orig", "recon"])
+            for f in self.p_ae.fields:
+                o = p_row.get(f.name, "")
+                r_raw = p_rec.get(f.name, "")
+                if isinstance(r_raw, np.ndarray):
+                    r = self._tensor_to_string(f, r_raw)
+                else:
+                    r = r_raw
+                tp.add_row([f.name, str(o)[: self.w], str(r)[: self.w]])
+            bar_len = 20
+            bar = "#" * int(cos * bar_len) + "-" * (bar_len - int(cos * bar_len))
+            print(
+                f"\n--- joint recon ---\n"
+                f"cos={cos:.3f}  angle={ang:5.1f}°  l2={l2:.3f}  rank@neg={rank}\n"
+                f"[{bar}]\n"
+                f"{tm}\n{tp}"
+            )
 
 
 class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
@@ -205,11 +224,10 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
         super().__init__()
         self.interval_batches = interval_batches
         self.row_autoencoder = row_autoencoder
-        self.db_path = db_path  # kept for consistency
+        self.db_path = db_path
         self.num_samples = num_samples
 
         if not self.row_autoencoder.stats_accumulated:
-            print("Warning: Stats not accumulated before initializing ReconstructionCallback. Accumulating now.")
             self.row_autoencoder.accumulate_stats()
 
         all_rows = list(row_autoencoder.row_generator())
@@ -218,15 +236,16 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
             self.samples = random.sample(all_rows, actual_num_samples)
         else:
             self.samples = []
-            print("Warning: No rows found for sampling in ReconstructionCallback.")
 
-    def _tensor_to_string(self, field, main_tensor: np.ndarray, flag_tensor: Optional[np.ndarray] = None) -> str:
+    def _tensor_to_string(self, field, main_tensor: np.ndarray, flag_tensor: np.ndarray = None) -> str:
         try:
+            if isinstance(field, NumericDigitCategoryField):
+                if main_tensor.ndim == 3:
+                    return field.to_string(main_tensor)
+                arr = np.array(main_tensor)
+                return field.to_string(arr)
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
                 if main_tensor.ndim >= 2 and main_tensor.shape[-1] == field.tokenizer.get_vocab_size():
-                    main_tensor = np.argmax(main_tensor, axis=-1)
-            elif hasattr(field, "base") and hasattr(field, "fraction_digits"):
-                if main_tensor.ndim >= 2:
                     main_tensor = np.argmax(main_tensor, axis=-1)
             if main_tensor.ndim > 1:
                 main_tensor = main_tensor.flatten()
@@ -238,8 +257,7 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
                 elif flag_tensor.size == 0:
                     flag_tensor = None
             return field.to_string(main_tensor, flag_tensor)
-        except Exception as e:
-            logging.warning(f"Callback: Error converting tensor to string for field {field.name}: {e}", exc_info=False)
+        except Exception:
             return "[Conversion Error]"
 
     def _top5_predictions(self, field, pred_vector: np.ndarray) -> str:
@@ -253,11 +271,10 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
         for i in top_indices:
             if i < len(field.category_list):
                 cat = field.category_list[i]
-                top5_list.append(f"{cat}: {probs[i]:.2f}")
+                top5_list.append(f"{cat}:{probs[i]:.2f}")
         return ", ".join(top5_list)
 
     def _digits_to_base_str(self, digits, base):
-        # Convert a list or array of digit values to a string representation.
         return "".join(str(int(d)) for d in digits)
 
     def on_train_batch_end(self, batch, logs=None):
@@ -279,8 +296,7 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
                 try:
                     input_tensors[field.name] = field.transform(row_dict.get(field.name))
                     valid_field_indices.append(field_idx)
-                except Exception as e:
-                    print(f"Error transforming field '{field.name}' for sample {i+1}: {e}")
+                except Exception:
                     input_tensors[field.name] = None
 
             valid_fields = [self.row_autoencoder.fields[idx] for idx in valid_field_indices]
@@ -290,9 +306,6 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
 
             inputs = [np.expand_dims(input_tensors[field.name], axis=0) for field in valid_fields]
             try:
-                if not hasattr(self, 'model') or self.model is None:
-                    print("Error: model is not available in ReconstructionCallback.")
-                    continue
                 predictions = self.model.predict(inputs, verbose=0)
                 if not isinstance(predictions, list):
                     predictions = [predictions]
@@ -310,40 +323,24 @@ class ReconstructionCallback(tf.keras.callbacks.Callback):
                 original_raw = row_dict.get(field_name, "N/A")
                 original_str = ", ".join(map(str, original_raw)) if isinstance(original_raw, list) else str(original_raw)
 
-                argmax_str = ""
                 reconstructed_str = "N/A"
-                top5_str = ""
-
                 if field_name in prediction_map:
                     main_tensor = np.array(prediction_map[field_name][0])
-                    if main_tensor.ndim >= 2 and main_tensor.shape[-1] != 1:
-                        argmaxed = np.argmax(main_tensor, axis=-1)
-                    else:
-                        argmaxed = main_tensor
-                    argmaxed = argmaxed.flatten()
-                    argmax_str = " ".join(str(x) for x in argmaxed[:20])
-                    if len(argmaxed) > 20:
-                        argmax_str += " ..."
-
-                    try:
-                        reconstructed_str = field.to_string(argmaxed)
-                    except Exception as e:
-                        print(f"Error decoding reconstructed field '{field_name}' for sample {i+1}: {e}")
-                        reconstructed_str = "Error decoding"
-
-                    if hasattr(field, "category_list") and field.category_list:
-                        # Show top 5 distribution for single-category fields
-                        pred_vec = main_tensor.flatten()
-                        top5_str = self._top5_predictions(field, pred_vec)
-                    elif isinstance(field, NumericDigitCategoryField):
-                        # Numeric digit field logic (omitted for brevity)
-                        ...
+                    flag_tensor = None
+                    if field.optional:
+                        flag_tensor = np.array(prediction_map.get(f"{field.name}_flag_out", [np.array([])])[0])
+                    reconstructed_str = self._tensor_to_string(field, main_tensor, flag_tensor)
+                    if hasattr(field, "category_list") and field.category_list and not isinstance(field, NumericDigitCategoryField):
+                        top5_str = self._top5_predictions(field, main_tensor.flatten())
+                        reconstructed_str += f" ({top5_str})"
                 elif input_tensors[field_name] is None:
                     reconstructed_str = "N/A (transform failed)"
 
                 table.add_row([field_name, original_str, reconstructed_str])
 
             print(table)
+
+
 
 class SequenceReconstructionCallback(tf.keras.callbacks.Callback):
     """

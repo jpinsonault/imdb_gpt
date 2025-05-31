@@ -9,7 +9,7 @@ import os
 from tqdm import tqdm
 import tensorflow as tf
 from autoencoder.fields import BaseField, BooleanField, MaskedSparseCategoricalCrossentropy, MultiCategoryField, NumericDigitCategoryField, ScalarField, SingleCategoryField, add_positional_encoding, TextField
-from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCallback
+from autoencoder.training_callbacks import ModelSaveCallback, ReconstructionCallback, TensorBoardPerBatchLoggingCallback
 
 # Alias for distributions
 logging.basicConfig(level=logging.info, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -504,110 +504,79 @@ class RowAutoencoder:
         else:
             print("\n--- Decoder not built or loaded yet ---")
 
-        # Optionally print field-specific encoder/decoder summaries if needed
-        # print("\n--- Field Specific Model Summaries ---")
-        # for field in self.fields:
-        #      try:
-        #         print(f"\n--- {field.name} Encoder ---")
-        #         field.build_encoder(self.latent_dim).summary()
-        #         print(f"\n--- {field.name} Decoder ---")
-        #         field.build_decoder(self.latent_dim).summary()
-        #      except Exception as e:
-        #         print(f"Could not build/summarize models for field {field.name}: {e}")
+        print("\n--- Field Specific Model Summaries ---")
+        for field in self.fields:
+             try:
+                print(f"\n--- {field.name} Encoder ---")
+                field.build_encoder(self.latent_dim).summary()
+                print(f"\n--- {field.name} Decoder ---")
+                field.build_decoder(self.latent_dim).summary()
+             except Exception as e:
+                print(f"Could not build/summarize models for field {field.name}: {e}")
 
 
     def fit(self):
         # Ensure stats are ready
         if not self.stats_accumulated:
-             print("Stats not accumulated, running accumulation first.")
-             self.accumulate_stats()
-             self.finalize_stats() # Ensure finalization happens after accumulation
+            print("Stats not accumulated, running accumulation first.")
+            self.accumulate_stats()
+            self.finalize_stats()
 
         # Build model if not loaded/built
         if self.model is None:
-             print("Model not found, building autoencoder...")
-             self.build_autoencoder()
-             print("Autoencoder built.")
+            print("Model not found, building autoencoder...")
+            self.build_autoencoder()
+            print("Autoencoder built.")
 
         # Print architecture
         self._print_model_architecture()
 
         # --- Training Configuration ---
-        epochs = self.config.get("epochs", 10) # Default epochs
+        epochs = self.config.get("epochs", 10)
         initial_lr = self.config.get("learning_rate", 0.0002)
         weight_decay = self.config.get("weight_decay", 1e-4)
-        callback_interval = self.config.get("callback_interval", 100) # Batches
+        callback_interval = self.config.get("callback_interval", 100)
 
-        # Learning Rate Schedule (Example: fixed for simplicity)
-        # schedule = [initial_lr] * epochs # Fixed LR
-        # More complex schedules can be defined here
-        # def scheduler(epoch, lr):
-        #     if epoch < 10: return initial_lr
-        #     else: return initial_lr * tf.math.exp(-0.1 * (epoch - 9))
-        # lr_callback = tf.keras.callbacks.LearningRateScheduler(scheduler)
-
-        # Optimizer
         optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr, weight_decay=weight_decay)
 
-        # Compile the model
-        try:
-            loss_dict = self.get_loss_dict()
-            loss_weights_dict = self.get_loss_weights_dict()
-            print("\nCompiling model with:")
-            print("  Losses:", loss_dict)
-            print("  Loss Weights:", loss_weights_dict)
-            self.model.compile(
-                optimizer=optimizer,
-                loss=loss_dict,
-                loss_weights=loss_weights_dict,
-                 # Add metrics if needed, e.g., ['accuracy'] for categorical outputs
-                 # metrics={output_name: ['accuracy'] for output_name in loss_dict}
-             )
-            print("Model compiled successfully.")
-        except Exception as e:
-             logging.error(f"Error compiling model: {e}", exc_info=True)
-             logging.error(f"Model Output Names: {self.model.output_names if self.model else 'N/A'}")
-             logging.error(f"Loss Dict Keys: {list(self.get_loss_dict().keys())}")
-             raise RuntimeError("Failed to compile model.") from e
+        # Compile the model using lists of losses and weights in field order
+        losses = [f.loss for f in self.fields]
+        loss_weights = [f.weight for f in self.fields]
 
+        print("\nCompiling model with:")
+        print("  Losses:", losses)
+        print("  Loss Weights:", loss_weights)
+        self.model.compile(
+            optimizer=optimizer,
+            loss=losses,
+            loss_weights=loss_weights
+        )
+        print("Model compiled successfully.")
 
         # Callbacks
         log_dir = "logs/fit/" + self.__class__.__name__ + "_" + str(int(tf.timestamp().numpy()))
         os.makedirs(log_dir, exist_ok=True)
-        tensorboard_callback = tf.keras.callbacks.TensorBoard(
-            log_dir=log_dir,
-            histogram_freq=1, # Log histograms every epoch
-             write_graph=True,
-             write_images=False,
-             update_freq='epoch', # Log metrics each epoch
-            # embeddings_freq=1, # Log embeddings if layer names provided
-             profile_batch=0 # Disable profiler or set range e.g., '10,20'
-        )
+        tensorboard_callback = TensorBoardPerBatchLoggingCallback(log_dir=log_dir, log_interval=callback_interval)
 
-        # Ensure db_path is available for ReconstructionCallback
         if not self.db_path:
-             # Try to get it from the class if it was set directly
-             self.db_path = getattr(self, 'db_path', None)
-             if not self.db_path:
-                  raise ValueError("db_path is required for ReconstructionCallback but not found in config or class.")
-
+            self.db_path = getattr(self, 'db_path', None)
+            if not self.db_path:
+                raise ValueError("db_path is required for ReconstructionCallback but not found in config or class.")
 
         reconstruction_callback = ReconstructionCallback(
             interval_batches=callback_interval,
             row_autoencoder=self,
-            db_path=self.db_path, # Pass db_path here
-             num_samples=5 # Reduced sample count for faster callback
+            db_path=self.db_path,
+            num_samples=5
         )
 
-        # Model saving callback (saves at end of epochs)
         model_save_callback = ModelSaveCallback(self, output_dir=self.model_dir)
 
         callbacks_list = [
             tensorboard_callback,
             reconstruction_callback,
-             # lr_callback, # Add LR scheduler if using one
             model_save_callback,
-            tf.keras.callbacks.TerminateOnNaN() # Stop training if loss becomes NaN
+            tf.keras.callbacks.TerminateOnNaN()
         ]
 
         # Build the dataset
@@ -618,11 +587,10 @@ class RowAutoencoder:
         # Determine steps per epoch if possible
         steps_per_epoch = None
         if self.num_rows_in_dataset > 0 and self.config.get("batch_size", 32) > 0:
-             steps_per_epoch = self.num_rows_in_dataset // self.config.get("batch_size", 32)
-             print(f"Estimated steps per epoch: {steps_per_epoch}")
+            steps_per_epoch = self.num_rows_in_dataset // self.config.get("batch_size", 32)
+            print(f"Estimated steps per epoch: {steps_per_epoch}")
         else:
-             print("Could not determine steps per epoch (num_rows_in_dataset or batch_size missing/zero).")
-
+            print("Could not determine steps per epoch (num_rows_in_dataset or batch_size missing/zero).")
 
         # Train the model
         print(f"\nStarting training for {epochs} epochs...")
@@ -630,12 +598,12 @@ class RowAutoencoder:
             ds,
             epochs=epochs,
             callbacks=callbacks_list,
-            steps_per_epoch=steps_per_epoch, # Optional: useful with tf.data repeat()
-             verbose=1 # Show progress bar and metrics per epoch
+            steps_per_epoch=steps_per_epoch,
+            verbose=1
         )
         print("\nTraining complete.")
 
-        # Optionally save again explicitly after training finishes
+        # Save final model
         print("Saving final model...")
         self.save_model()
 

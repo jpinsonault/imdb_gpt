@@ -1,7 +1,6 @@
 from __future__ import annotations
 import sqlite3, numpy as np
 from typing import List, Tuple, Dict
-
 from tqdm import tqdm
 
 
@@ -9,8 +8,8 @@ class AliasSampler:
     def __init__(self, probs: np.ndarray):
         n = len(probs)
         self.n = n
-        self.p  = np.zeros(n, dtype=np.float32)
-        self.a  = np.zeros(n, dtype=np.int32)
+        self.p = np.zeros(n, dtype=np.float32)
+        self.a = np.zeros(n, dtype=np.int32)
 
         scaled = probs * n
         small, large = [], []
@@ -35,6 +34,8 @@ class AliasSampler:
 
 
 class WeightedEdgeSampler:
+    """Edge sampler that builds tensors on demand and favours high‑loss edges."""
+
     def __init__(
         self,
         db_path: str,
@@ -45,13 +46,17 @@ class WeightedEdgeSampler:
         boost: float = 0.10,
     ):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.mov  = movie_ae
-        self.per  = person_ae
-        self.bs   = batch_size
+        self.mov = movie_ae
+        self.per = person_ae
+        self.bs = batch_size
         self.refresh_edges = max(1, refresh_batches) * batch_size
         self.boost = boost
 
         self.edges = self._load_edges()
+        self.edge_to_idx = {eid: i for i, (eid, _, _) in enumerate(self.edges)}
+        self.movie_tensors = [None] * len(self.edges)
+        self.person_tensors = [None] * len(self.edges)
+
         self.mov_cache: Dict[str, Tuple] = {}
         self.per_cache: Dict[str, Tuple] = {}
 
@@ -69,28 +74,35 @@ class WeightedEdgeSampler:
         FROM people WHERE nconst = ? LIMIT 1
         """
 
-        self.movie_tensors, self.person_tensors = self._build_tensors()
         self.weights = np.ones(len(self.edges), dtype=np.float32)
         self.alias = AliasSampler(self.weights / self.weights.sum())
         self.seen = 0
 
-    # ----------------------------------------------------------------- iterator
-    def __iter__(self): return self
+    # ----------------------------------------------------------- iterator
+    def __iter__(self):
+        return self
+
     def __next__(self):
         if self.seen % self.refresh_edges == 0:
             self._refresh_weights()
 
         idx = self.alias.draw(1)[0]
         self.seen += 1
-        return (
-            self.movie_tensors[idx],
-            self.person_tensors[idx],
-            self.edges[idx][0],      # edgeId
-        )
+        movie_t, person_t = self._get_tensors(idx)
+        return movie_t, person_t, self.edges[idx][0]
 
-    # ----------------------------------------------------------------- preload
+    # -------------------------------------------------------- tensor cache
+    def _get_tensors(self, idx: int):
+        if self.movie_tensors[idx] is None:
+            eid, tconst, nconst = self.edges[idx]
+            mr = self._movie_row(tconst)
+            pr = self._person_row(nconst)
+            self.movie_tensors[idx] = tuple(f.transform(mr.get(f.name)) for f in self.mov.fields)
+            self.person_tensors[idx] = tuple(f.transform(pr.get(f.name)) for f in self.per.fields)
+        return self.movie_tensors[idx], self.person_tensors[idx]
+
+    # ----------------------------------------------------------- preload
     def _load_edges(self) -> List[Tuple[int, str, str]]:
-        print("Loading edges from database …")
         cur = self.conn.cursor()
         cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
         return cur.fetchall()
@@ -100,14 +112,14 @@ class WeightedEdgeSampler:
             return self.mov_cache[tconst]
         r = self.movie_cur.execute(self.movie_sql, (tconst, tconst)).fetchone()
         row = {
-            "tconst":        tconst,
-            "primaryTitle":  r[0],
-            "startYear":     r[1],
-            "endYear":       r[2],
-            "runtimeMinutes":r[3],
+            "tconst": tconst,
+            "primaryTitle": r[0],
+            "startYear": r[1],
+            "endYear": r[2],
+            "runtimeMinutes": r[3],
             "averageRating": r[4],
-            "numVotes":      r[5],
-            "genres":        r[6].split(',') if r[6] else [],
+            "numVotes": r[5],
+            "genres": r[6].split(",") if r[6] else [],
         }
         self.mov_cache[tconst] = row
         return row
@@ -117,37 +129,23 @@ class WeightedEdgeSampler:
             return self.per_cache[nconst]
         r = self.person_cur.execute(self.person_sql, (nconst, nconst)).fetchone()
         row = {
-            "primaryName":  r[0],
-            "birthYear":    r[1],
-            "deathYear":    r[2],
-            "professions":  r[3].split(',') if r[3] else None,
+            "primaryName": r[0],
+            "birthYear": r[1],
+            "deathYear": r[2],
+            "professions": r[3].split(",") if r[3] else None,
         }
         self.per_cache[nconst] = row
         return row
 
-    def _build_tensors(self):
-        m_tensors, p_tensors = [], []
-        for _, tconst, nconst in tqdm(self.edges, desc="Building tensors", unit="edge", leave=False):
-            mr = self._movie_row(tconst)
-            pr = self._person_row(nconst)
-            m_tensors.append(tuple(f.transform(mr.get(f.name))  for f in self.mov.fields))
-            p_tensors.append(tuple(f.transform(pr.get(f.name))  for f in self.per.fields))
-        return m_tensors, p_tensors
-
-    # ----------------------------------------------------------------- weights
+    # ------------------------------------------------------------ weights
     def _refresh_weights(self):
         cur = self.conn.cursor()
         try:
-            print("Fetching edge losses from database …")
             cur.execute("SELECT edgeId,total_loss FROM edge_losses;")
-            worst = {}
-            for eid, loss in tqdm(cur.fetchall(), desc="Refreshing edge weights", unit="edge", leave=False):
-                if eid not in worst or loss > worst[eid]:
-                    worst[eid] = loss
-            loss_vec = np.zeros(len(self.edges), dtype=np.float32)
-            edge_to_idx = {eid: i for i, (eid, _, _) in enumerate(self.edges)}
-            for eid, loss in worst.items():
-                idx = edge_to_idx.get(eid)
+            recorded = {eid: loss for eid, loss in cur.fetchall()}
+            loss_vec = np.full(len(self.edges), 1000.0, dtype=np.float32)
+            for eid, loss in recorded.items():
+                idx = self.edge_to_idx.get(eid)
                 if idx is not None:
                     loss_vec[idx] = loss
             lo, hi = loss_vec.min(), loss_vec.max()
@@ -158,6 +156,7 @@ class WeightedEdgeSampler:
                 self.weights.fill(1.0)
         except sqlite3.Error:
             self.weights.fill(1.0)
+
         probs = self.weights / self.weights.sum()
         self.alias = AliasSampler(probs)
 
