@@ -20,5 +20,10 @@ project_config = {
         'movie_limit': 1000000000,
         'db_path': './data/imdb.db',
         'nce_temp': 0.03,
+        'weak_sample_boost': 0.01,
+        'edge_sampler': {
+            'refresh_batches': 100,
+            'weak_edge_boost': 0.10,
+        },
     }
 }

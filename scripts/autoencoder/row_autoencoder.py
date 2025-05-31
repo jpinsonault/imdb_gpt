@@ -318,22 +318,24 @@ class RowAutoencoder:
         return reconstructed_data
 
     
-    def get_loss_dict(self) -> Dict[str, Any]:
-        if self.model is None or not hasattr(self.model, "output_names"):
-            raise RuntimeError("Model must be built (and assigned to self.model) before calling get_loss_dict().")
-        # Zip the model's actual outputs with the fields in the same order you appended them
+    def get_loss_dict(self) -> dict[str, tf.keras.losses.Loss]:
+        if self.model is None:
+            raise RuntimeError("build_autoencoder() hasn’t been called yet")
+
         return {
-            output_name: field.loss
-            for output_name, field in zip(self.model.output_names, self.fields)
+            f"{f.name}_recon": f.loss
+            for f in self.fields
         }
 
-    def get_loss_weights_dict(self) -> Dict[str, float]:
-        if self.model is None or not hasattr(self.model, "output_names"):
-            raise RuntimeError("Model must be built (and assigned to self.model) before calling get_loss_weights_dict().")
+    def get_loss_weights_dict(self) -> dict[str, float]:
+        if self.model is None:
+            raise RuntimeError("build_autoencoder() hasn’t been called yet")
+
         return {
-            output_name: field.weight
-            for output_name, field in zip(self.model.output_names, self.fields)
+            f"{f.name}_recon": f.weight
+            for f in self.fields
         }
+
 
 
     def print_stats(self):
@@ -350,50 +352,55 @@ class RowAutoencoder:
 
     def build_autoencoder(self) -> tf.keras.Model:
         if not self.stats_accumulated:
-            raise RuntimeError("Stats must be accumulated and finalized before building the model.")
+            raise RuntimeError("Call accumulate_stats() / finalize_stats() first")
 
         latent_dim = self.latent_dim
 
-        inp_list = [
+        # ---------- inputs ----------
+        enc_inputs = [
             tf.keras.Input(
-                shape = f.input_shape,
-                name  = f"{f.name}_input",
-                dtype = f.input_dtype,
+                shape=f.input_shape,
+                name=f"{f.name}_input",
+                dtype=f.input_dtype,
             )
             for f in self.fields
         ]
 
-        enc_outs = []
-        decoders = {}
-        for f, inp in zip(self.fields, inp_list):
-            enc = f.build_encoder(latent_dim)
-            dec = f.build_decoder(latent_dim)
-            enc_outs.append(enc(inp))
-            decoders[f.name] = dec
+        # ---------- per‑field encoders / decoders ----------
+        enc_outs, decoders = [], {}
+        for f, x_in in zip(self.fields, enc_inputs):
+            enc_outs.append(f.build_encoder(latent_dim)(x_in))
+            decoders[f.name] = f.build_decoder(latent_dim)
 
-        if len(enc_outs) == 1:
-            z = enc_outs[0]
-        else:
-            z = _attention_fuse(
-                enc_outs,
-                latent_dim  = latent_dim,
-                num_heads   = 4,
-                key_dim     = max(8, latent_dim // 8),   # tweak as you like
-            )
+        # ---------- fuse latents ----------
+        z = enc_outs[0] if len(enc_outs) == 1 else _attention_fuse(
+            enc_outs,
+            latent_dim=latent_dim,
+            num_heads=4,
+            key_dim=max(8, latent_dim // 8),
+        )
+        self.encoder = tf.keras.Model(enc_inputs, z, name="Encoder")
 
-        self.encoder = tf.keras.Model(inp_list, z, name = "Encoder")
-
-        dec_in   = tf.keras.Input(shape = (latent_dim,), name = "decoder_latent")
-        dec_outs = []
+        # ---------- field decoders ----------
+        latent_in = tf.keras.Input(shape=(latent_dim,), name="decoder_latent")
+        recon_outs = []
         for f in self.fields:
-            o = decoders[f.name](dec_in)
-            dec_outs.append(o[0] if isinstance(o, (list, tuple)) else o)
+            raw = decoders[f.name](latent_in)
+            raw = raw[0] if isinstance(raw, (list, tuple)) else raw
 
-        self.decoder = tf.keras.Model(dec_in, dec_outs, name = "Decoder")
+            # wrap in a uniquely‑named linear layer so the tensor gets that name
+            recon = tf.keras.layers.Activation(
+                "linear", name=f"{f.name}_recon"
+            )(raw)
+            recon_outs.append(recon)
 
-        ae_outs = self.decoder(z)
-        self.model = tf.keras.Model(inp_list, ae_outs, name = "RowAutoencoder")
+        self.decoder = tf.keras.Model(latent_in, recon_outs, name="Decoder")
+
+        # ---------- full AE ----------
+        full_outs = self.decoder(self.encoder(enc_inputs))
+        self.model = tf.keras.Model(enc_inputs, full_outs, name="RowAutoencoder")
         return self.model
+
 
 
 
