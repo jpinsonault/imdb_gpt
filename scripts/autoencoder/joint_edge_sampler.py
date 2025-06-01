@@ -1,7 +1,21 @@
 from __future__ import annotations
 import sqlite3, numpy as np
 from typing import List, Tuple, Dict
+from prettytable import PrettyTable
 from tqdm import tqdm
+
+
+def _tensor_to_string(field, tensor):
+    arr = np.array(tensor)
+    if hasattr(field, "tokenizer") and field.tokenizer is not None:
+        if arr.ndim >= 2 and arr.shape[-1] == field.tokenizer.get_vocab_size():
+            arr = np.argmax(arr, axis=-1)
+    if arr.ndim > 1:
+        arr = arr.flatten()
+    try:
+        return field.to_string(arr)
+    except Exception:
+        return "[conv‑err]"
 
 
 class AliasSampler:
@@ -34,8 +48,7 @@ class AliasSampler:
 
 
 class WeightedEdgeSampler:
-    """Edge sampler that builds tensors on demand and favours high‑loss edges."""
-
+    """Edge sampler that builds tensors on demand and validates IO pairs."""
     def __init__(
         self,
         db_path: str,
@@ -44,6 +57,7 @@ class WeightedEdgeSampler:
         batch_size: int,
         refresh_batches: int = 1_000,
         boost: float = 0.10,
+        log_every: int = 512,          # <─ new
     ):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.mov = movie_ae
@@ -51,6 +65,7 @@ class WeightedEdgeSampler:
         self.bs = batch_size
         self.refresh_edges = max(1, refresh_batches) * batch_size
         self.boost = boost
+        self.log_every = max(1, log_every)
 
         self.edges = self._load_edges()
         self.edge_to_idx = {eid: i for i, (eid, _, _) in enumerate(self.edges)}
@@ -89,6 +104,11 @@ class WeightedEdgeSampler:
         idx = self.alias.draw(1)[0]
         self.seen += 1
         movie_t, person_t = self._get_tensors(idx)
+
+        if self.seen % self.log_every == 1:              # ── log a sample
+            eid, tconst, nconst = self.edges[idx]
+            self._log_sample(eid, tconst, nconst, movie_t, person_t)
+
         return movie_t, person_t, self.edges[idx][0]
 
     # -------------------------------------------------------- tensor cache
@@ -97,8 +117,12 @@ class WeightedEdgeSampler:
             eid, tconst, nconst = self.edges[idx]
             mr = self._movie_row(tconst)
             pr = self._person_row(nconst)
-            self.movie_tensors[idx] = tuple(f.transform(mr.get(f.name)) for f in self.mov.fields)
-            self.person_tensors[idx] = tuple(f.transform(pr.get(f.name)) for f in self.per.fields)
+            self.movie_tensors[idx] = tuple(
+                f.transform(mr.get(f.name)) for f in self.mov.fields
+            )
+            self.person_tensors[idx] = tuple(
+                f.transform(pr.get(f.name)) for f in self.per.fields
+            )
         return self.movie_tensors[idx], self.person_tensors[idx]
 
     # ----------------------------------------------------------- preload
@@ -107,6 +131,7 @@ class WeightedEdgeSampler:
         cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
         return cur.fetchall()
 
+    # ----------------------------------------------------------- SQL helpers
     def _movie_row(self, tconst: str):
         if tconst in self.mov_cache:
             return self.mov_cache[tconst]
@@ -159,6 +184,28 @@ class WeightedEdgeSampler:
 
         probs = self.weights / self.weights.sum()
         self.alias = AliasSampler(probs)
+
+    # ------------------------------------------------------------ logging
+    def _log_sample(self, eid, tconst, nconst, movie_t, person_t):
+        mr = self._movie_row(tconst)
+        pr = self._person_row(nconst)
+
+        tm = PrettyTable(["movie", "orig", "tensor→str"])
+        for f, t in zip(self.mov.fields, movie_t):
+            tm.add_row([f.name,
+                        str(mr.get(f.name))[:38],
+                        _tensor_to_string(f, t)[:38]])
+
+        tp = PrettyTable(["person", "orig", "tensor→str"])
+        for f, t in zip(self.per.fields, person_t):
+            tp.add_row([f.name,
+                        str(pr.get(f.name))[:38],
+                        _tensor_to_string(f, t)[:38]])
+
+        print(f"\n=== sampler‑check eid={eid} ===")
+        print(tm)
+        print(tp)
+        print("=" * 60)
 
 
 def make_edge_sampler(

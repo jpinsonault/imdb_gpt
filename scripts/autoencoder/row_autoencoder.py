@@ -280,7 +280,6 @@ class RowAutoencoder:
         for field in self.fields:
             # Determine the expected output name (consistent with build_autoencoder)
             # Also check just field.name as a fallback if mapping by order occurred
-            # expected_output_name_primary = f"{field.name}_decoder"
             expected_output_name_primary = f"{field.name}_recon"
             expected_output_name_fallback = field.name
 

@@ -33,6 +33,7 @@ from tensorflow.keras.callbacks import Callback
 
 from config import project_config
 from scripts.autoencoder.edge_loss_logger import EdgeLossLogger
+from scripts.autoencoder.fields import TextField
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
 from scripts.autoencoder.training_callbacks import JointReconstructionCallback, TensorBoardPerBatchLoggingCallback
@@ -363,7 +364,7 @@ def main():
         movie_ae=joint_model.movie_ae,
         person_ae=joint_model.person_ae,
         db_path=project_config["db_path"],
-        interval_batches=100,
+        interval_batches=20,
         num_samples=4,
     )
 
@@ -374,6 +375,16 @@ def main():
         ),
         run_eagerly=True,
     )
+
+    # run *before* joint training starts
+    for f in joint_model.movie_ae.fields:
+        if str(type(f)) == "<class 'autoencoder.fields.TextField'>":
+            print(f.name, f.tokenizer.get_vocab_size(), f.pad_token_id)
+
+    for f in joint_model.person_ae.fields:
+        if str(type(f)) == "<class 'autoencoder.fields.TextField'>":
+            print(f.name, f.tokenizer.get_vocab_size(), f.pad_token_id)
+
 
     joint_model.fit(
         ds,

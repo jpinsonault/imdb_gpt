@@ -42,13 +42,15 @@ def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
 
 class JointReconstructionCallback(tf.keras.callbacks.Callback):
-    def __init__(self, movie_ae, person_ae, db_path, interval_batches=200, num_samples=4, table_width=38):
+    def __init__(self, movie_ae, person_ae, db_path,
+                 interval_batches=200, num_samples=4, table_width=38):
         super().__init__()
         self.m_ae = movie_ae
         self.p_ae = person_ae
         self.every = interval_batches
         self.w = table_width
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+
         movies = list(islice(movie_ae.row_generator(), 50000))
         self.pairs = []
         for m in random.sample(movies, min(num_samples * 3, len(movies))):
@@ -57,6 +59,7 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
                 self.pairs.append((m, p))
             if len(self.pairs) == num_samples:
                 break
+
         neg_movies = random.sample(movies, min(256, len(movies)))
         self.neg_people_latents = []
         for m in neg_movies:
@@ -66,6 +69,7 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
                 self.neg_people_latents.append(z)
         self.neg_people_latents = np.stack(self.neg_people_latents)
 
+    # ------------------------------------------------------------------- helpers
     def _sample_person(self, tconst):
         q = """
         SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
@@ -76,16 +80,15 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
         GROUP BY p.nconst
         HAVING COUNT(pp.profession) > 0
         ORDER BY RANDOM()
-        LIMIT 1
-        """
+        LIMIT 1"""
         r = self.conn.execute(q, (tconst,)).fetchone()
         if not r:
             return None
         return {
-            "primaryName": r[0],
-            "birthYear": r[1],
-            "deathYear": r[2],
-            "professions": r[3].split(',') if r[3] else None,
+            "primaryName":  r[0],
+            "birthYear":    r[1],
+            "deathYear":    r[2],
+            "professions":  r[3].split(',') if r[3] else None,
         }
 
     def _encode(self, ae, row):
@@ -96,9 +99,9 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
         return ae.reconstruct_row(z)
 
     def _cos(self, a, b):
-        a_norm = a / (np.linalg.norm(a) + 1e-9)
-        b_norm = b / (np.linalg.norm(b) + 1e-9)
-        return float(np.dot(a_norm, b_norm))
+        a = a / (np.linalg.norm(a) + 1e-9)
+        b = b / (np.linalg.norm(b) + 1e-9)
+        return float(np.dot(a, b))
 
     def _rank(self, z_m, z_p):
         sims = np.dot(self.neg_people_latents, z_m) / (
@@ -113,58 +116,65 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
                 arr = np.array(main_tensor)
                 if arr.ndim == 3:
                     return field.to_string(arr)
-                arr = arr.flatten()
-                return field.to_string(arr)
+                return field.to_string(arr.flatten())
+            arr = np.array(main_tensor)
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                arr = np.array(main_tensor)
                 if arr.ndim >= 2 and arr.shape[-1] == field.tokenizer.get_vocab_size():
                     arr = np.argmax(arr, axis=-1)
-            else:
-                arr = np.array(main_tensor).flatten()
+            if arr.ndim > 1:
+                arr = arr.flatten()
             if flag_tensor is not None:
-                ft = np.array(flag_tensor)
-                if ft.ndim > 1:
-                    ft = ft.flatten()
+                ft = np.array(flag_tensor).flatten()
                 if ft.size > 1:
                     ft = ft[:1]
-                elif ft.size == 0:
-                    ft = None
             else:
                 ft = None
             return field.to_string(arr, ft)
         except Exception:
             return "[Conversion Error]"
 
+    def _roundtrip_string(self, field, raw_value):
+        try:
+            t = field.transform(raw_value)
+            if isinstance(t, (list, tuple)):
+                t = t[0]
+            return self._tensor_to_string(field, t)
+        except Exception:
+            return "[RT Error]"
+
+    # ------------------------------------------------------------------- callback
     def on_train_batch_end(self, batch, logs=None):
         if (batch + 1) % self.every:
             return
+
         for m_row, p_row in self.pairs:
             z_m = self._encode(self.m_ae, m_row)
             z_p = self._encode(self.p_ae, p_row)
+
             cos = self._cos(z_m, z_p)
             l2 = float(np.linalg.norm(z_m - z_p))
             ang = float(np.degrees(np.arccos(max(min(cos, 1.0), -1.0))))
             rank = self._rank(z_m, z_p)
+
             m_rec = self._recon(self.m_ae, z_m)
             p_rec = self._recon(self.p_ae, z_p)
-            tm = PrettyTable(["Movie field", "orig", "recon"])
+
+            tm = PrettyTable(["Movie field", "orig", "round", "recon"])
             for f in self.m_ae.fields:
                 o = m_row.get(f.name, "")
+                rt = self._roundtrip_string(f, o)
                 r_raw = m_rec.get(f.name, "")
-                if isinstance(r_raw, np.ndarray):
-                    r = self._tensor_to_string(f, r_raw)
-                else:
-                    r = r_raw
-                tm.add_row([f.name, str(o)[: self.w], str(r)[: self.w]])
-            tp = PrettyTable(["Person field", "orig", "recon"])
+                r = self._tensor_to_string(f, r_raw) if isinstance(r_raw, np.ndarray) else r_raw
+                tm.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
+
+            tp = PrettyTable(["Person field", "orig", "round", "recon"])
             for f in self.p_ae.fields:
                 o = p_row.get(f.name, "")
+                rt = self._roundtrip_string(f, o)
                 r_raw = p_rec.get(f.name, "")
-                if isinstance(r_raw, np.ndarray):
-                    r = self._tensor_to_string(f, r_raw)
-                else:
-                    r = r_raw
-                tp.add_row([f.name, str(o)[: self.w], str(r)[: self.w]])
+                r = self._tensor_to_string(f, r_raw) if isinstance(r_raw, np.ndarray) else r_raw
+                tp.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
+
             bar_len = 20
             bar = "#" * int(cos * bar_len) + "-" * (bar_len - int(cos * bar_len))
             print(

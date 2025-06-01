@@ -45,7 +45,7 @@ class CharacterTokenizer:
         return self.char_to_index.get(token, self.char_to_index[self.special_tokens[0]])
 
     def id_to_token(self, token_id: int):
-        return self.index_to_char.get(token_id, "")
+        return self.index_to_char.get(token_id, "🙈")
 
     def get_vocab_size(self):
         return len(self.char_to_index)

@@ -8,7 +8,7 @@ project_config = {
     'corpus_dir': "./data/corpus/",
     'docker_data_dir_mount': '/app/imdb',
 
-    'latent_dim': 256,
+    'latent_dim': 368,
     'batch_size': 512,
     'learning_rate': 0.0005,
     'epochs': 20,
