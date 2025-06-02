@@ -137,11 +137,9 @@ class RowAutoencoder:
     # --------------------------------------------------------------------- #
     # public API
     # --------------------------------------------------------------------- #
-    def accumulate_stats(
-        self,
-        use_cache: bool = True,
-        refresh_cache: bool = False,
-    ):
+    def accumulate_stats(self):
+        use_cache = self.config.get("use_cache", True)
+        refresh_cache = self.config.get("refresh_cache", False)
         if refresh_cache:
             self._drop_cache_table()
 

@@ -543,27 +543,37 @@ class TextSwapNoise(tf.keras.layers.Layer):
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class MaskedSparseCategoricalCrossentropy(
         tf.keras.losses.SparseCategoricalCrossentropy):
-    def __init__(self, ignore_class: int,
-                 reduction=tf.keras.losses.Reduction.NONE, name=None):
-        super().__init__(from_logits=False, reduction=reduction, name=name)
+    """
+    Sparse‑categorical CE that completely ignores `ignore_class`
+    (usually the PAD token).  Works on raw *logits* by default;
+    pass probabilities by setting  ``from_logits=False``.
+    """
+    def __init__(
+        self,
+        ignore_class: int,
+        from_logits: bool = True,
+        reduction=tf.keras.losses.Reduction.NONE,
+        name: str | None = None,
+    ):
+        super().__init__(from_logits=from_logits,
+                         reduction=reduction,
+                         name=name)
         self.ignore_class = int(ignore_class)
 
     def call(self, y_true, y_pred):
-        # y_true : (B, L)               int32
-        # y_pred : (B, L, V)            float32, probs
-        loss = super().call(y_true, y_pred)          # still rank‑2  (B, L)
-        mask = tf.cast(tf.not_equal(y_true, self.ignore_class), loss.dtype)
-        loss = loss * mask                           # zero‑out PAD
+        # y_true : (B, L)         int32
+        # y_pred : (B, L, V)      logits  (or probs if from_logits=False)
+        loss = super().call(y_true, y_pred)          # (B, L)
+        mask = tf.cast(tf.not_equal(y_true,
+                                    self.ignore_class), loss.dtype)
+        loss = loss * mask                           # zero PAD
         return tf.reduce_mean(loss, axis=-1)         # (B,)
 
     def get_config(self):
-        config = super().get_config()
-        config.update({"ignore_class": self.ignore_class})
-        return config
+        cfg = super().get_config()
+        cfg.update({"ignore_class": self.ignore_class})
+        return cfg
 
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
 
 
 ################################################################################
@@ -618,8 +628,12 @@ class TextField(BaseField):
 
     def _get_loss(self):
         if self.pad_token_id is None:
-            raise ValueError("TextField stats not finalized or PAD token ID not set.")
-        return MaskedSparseCategoricalCrossentropy(ignore_class=self.pad_token_id)
+            raise ValueError("TextField stats not finalised.")
+        # expects *logits* now
+        return MaskedSparseCategoricalCrossentropy(
+            ignore_class=self.pad_token_id,
+            from_logits=True,
+        )
 
     def get_flag_loss(self):
         return None
@@ -710,18 +724,15 @@ class TextField(BaseField):
     def _transform(self, raw_value):
         txt = str(raw_value)
         token_ids = self.tokenizer.encode(txt)
-        start_token_id = self.tokenizer.token_to_id(SPECIAL_START)
-        end_token_id = self.tokenizer.token_to_id(SPECIAL_END)
-        token_ids = [start_token_id] + token_ids + [end_token_id]
+
         current_len = len(token_ids)
         if current_len < self.max_length:
-            pad_length = self.max_length - current_len
-            token_ids += [self.pad_token_id] * pad_length
+            token_ids += [self.pad_token_id] * (self.max_length - current_len)
         else:
-            token_ids = token_ids[:self.max_length]
-            if token_ids[-1] != end_token_id:
-                pass
+            token_ids = token_ids[: self.max_length]
+
         return tf.constant(token_ids, dtype=tf.int32)
+
 
     def transform_target(self, raw_value):
         if raw_value is None:
@@ -799,53 +810,38 @@ class TextField(BaseField):
         return tf.keras.Model(inp, token_latent, name=f"{self.name}_encoder")
 
     def build_decoder(self, latent_dim: int) -> tf.keras.Model:
-        if self.max_length is None or self.tokenizer is None or self.base_size is None:
-            raise RuntimeError(f"Decoder for TextField '{self.name}' cannot be built before stats are finalized.")
-        latent_in = tf.keras.Input(shape=(latent_dim,), name=f"{self.name}_decoder_latent_in")
-        initial_seq_len_before_transpose = self.max_length // 2
-        if initial_seq_len_before_transpose * self.base_size == 0:
-            raise ValueError(f"Cannot build decoder for {self.name}: calculated dense units are zero.")
-        dense_units = initial_seq_len_before_transpose * self.base_size
-        x = Dense(dense_units, activation='gelu', name=f"{self.name}_dec_dense_expand")(latent_in)
-        x = Reshape((initial_seq_len_before_transpose, self.base_size), name=f"{self.name}_dec_reshape")(x)
-        x = Conv1DTranspose(
-            self.base_size,
-            kernel_size=5,
-            strides=2,
-            activation='gelu',
-            padding='same',
-            name=f"{self.name}_decoder_conv_transpose"
-        )(x)
-        main_logits = Conv1D(
-            self.tokenizer.get_vocab_size(),
-            kernel_size=1,
-            activation='linear',
-            padding='same',
-            name=f"{self.name}_dec_to_vocab_logits"
-        )(x)
-        main_probs = Softmax(axis=-1, name=f"{self.name}_dec_output_softmax")(main_logits)
-        main_output_named = Activation("linear", name=f"{self.name}_main_out")(main_probs)
-        if self.optional:
-            flag_intermediate = Dense(max(8, latent_dim // 4), activation='relu', name=f"{self.name}_dec_flag_dense")(latent_in)
-            flag_intermediate = Dropout(0.1)(flag_intermediate)
-            optional_flag = Dense(1, activation='sigmoid', name=f"{self.name}_dec_flag_raw")(flag_intermediate)
-            flag_output_named = Activation("linear", name=f"{self.name}_flag_out")(optional_flag)
-            model = tf.keras.Model(
-                inputs=latent_in,
-                outputs=[main_output_named, flag_output_named],
-                name=f"{self.name}_decoder"
-            )
-            print(f"Built OPTIONAL decoder for {self.name} with outputs: {[o.name for o in model.outputs]}")
-            return model
-        else:
-            model = tf.keras.Model(
-                inputs=latent_in,
-                outputs=main_output_named,
-                name=f"{self.name}_decoder"
-            )
-            print(f"Built NON-OPTIONAL decoder for {self.name} with output: {model.output.name}")
-            return model
+        if self.max_length is None or self.tokenizer is None:
+            raise RuntimeError(f"Stats not finalised for '{self.name}'")
 
+        z_in = tf.keras.Input(shape=(latent_dim,),
+                              name=f"{self.name}_lat_in")
+
+        seq_half  = self.max_length // 2
+        dense_sz  = seq_half * self.base_size
+
+        x = Dense(dense_sz, activation='gelu',
+                  name=f"{self.name}_dec_dense")(z_in)
+        x = Reshape((seq_half, self.base_size),
+                    name=f"{self.name}_dec_reshape")(x)
+        x = Conv1DTranspose(self.base_size, 5, strides=2,
+                            activation='gelu', padding='same',
+                            name=f"{self.name}_dec_deconv")(x)
+
+        # **logits, no soft‑max**
+        logits = Conv1D(self.tokenizer.get_vocab_size(), 1,
+                        activation=None, padding='same',
+                        name=f"{self.name}_dec_logits")(x)
+        main_out = Activation('linear',
+                              name=f"{self.name}_main_out")(logits)
+
+        if self.optional:
+            flag = Dense(1, activation='sigmoid',
+                         name=f"{self.name}_flag_out")(z_in)
+            return tf.keras.Model(z_in, [main_out, flag],
+                                  name=f"{self.name}_decoder")
+        return tf.keras.Model(z_in, main_out,
+                              name=f"{self.name}_decoder")
+    
     def print_stats(self):
         from prettytable import PrettyTable
         t = PrettyTable()

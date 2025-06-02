@@ -189,22 +189,24 @@ class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
     def __init__(self, log_dir, log_interval: int = 1):
         super().__init__()
         self.log_interval = log_interval
-        log_root = Path(log_dir)          # always Path
+        log_root = Path(log_dir)
         run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.file_writer = tf.summary.create_file_writer(str(log_root / run_id))
 
     def on_train_batch_end(self, batch, logs=None):
         logs = logs or {}
         step = int(self.model.optimizer.iterations.numpy())
-        total_loss = float(logs.get("loss", 0.0))
         lr = self.model.optimizer.learning_rate
         lr_val = float(lr(step)) if callable(lr) else float(tf.keras.backend.get_value(lr))
+        total_loss = float(logs.get("loss", 0.0))
         with self.file_writer.as_default():
-            tf.summary.scalar("loss/total",      total_loss, step=step)
-            tf.summary.scalar("learning_rate",   lr_val,     step=step)
-            for k, v in logs.items():
-                if k.endswith("_loss") and k != "loss":
-                    tf.summary.scalar(f"loss/{k[:-5]}", float(v), step=step)
+            tf.summary.scalar("loss/total", total_loss, step=step)
+            tf.summary.scalar("learning_rate", lr_val, step=step)
+            if "rec_loss" in logs:
+                tf.summary.scalar("loss/rec", float(logs["rec_loss"]), step=step)
+            for key, value in logs.items():
+                if key not in ("loss", "rec_loss"):
+                    tf.summary.scalar(f"loss/{key}", float(value), step=step)
             self.file_writer.flush()
 
 

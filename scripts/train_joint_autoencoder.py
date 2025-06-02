@@ -285,8 +285,17 @@ def build_joint_trainer(
         movie_ae.load_model()
         people_ae.load_model()
     else:
-        movie_ae.accumulate_stats();  movie_ae.finalize_stats();  movie_ae.build_autoencoder()
-        people_ae.accumulate_stats(); people_ae.finalize_stats(); people_ae.build_autoencoder()
+        movie_ae.accumulate_stats()
+        movie_ae.finalize_stats()
+        movie_ae.build_autoencoder()
+        people_ae.accumulate_stats()
+        people_ae.finalize_stats()
+        people_ae.build_autoencoder()
+
+    movie_ae.encoder.trainable = True
+    movie_ae.decoder.trainable = True
+    people_ae.encoder.trainable = True
+    people_ae.decoder.trainable = True
 
     movie_specs = tuple(
         tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype) for f in movie_ae.fields
@@ -304,7 +313,6 @@ def build_joint_trainer(
         refresh_batches = config['edge_sampler']["refresh_batches"],
         boost         = config['edge_sampler']["weak_edge_boost"],
     )
-
 
     ds = (
         tf.data.Dataset.from_generator(

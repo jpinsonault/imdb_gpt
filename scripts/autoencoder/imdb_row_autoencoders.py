@@ -16,10 +16,10 @@ class TitlesAutoencoder(RowAutoencoder):
         return [
             TextField("primaryTitle"),
             NumericDigitCategoryField("startYear"),
-            NumericDigitCategoryField("runtimeMinutes"),
-            NumericDigitCategoryField("averageRating", fraction_digits=1),
-            NumericDigitCategoryField("numVotes"),
-            MultiCategoryField("genres"),
+            # NumericDigitCategoryField("runtimeMinutes"),
+            # NumericDigitCategoryField("averageRating", fraction_digits=1),
+            # NumericDigitCategoryField("numVotes"),
+            # MultiCategoryField("genres"),
         ]
 
     def row_generator(self):
@@ -100,7 +100,7 @@ class PeopleAutoencoder(RowAutoencoder):
             TextField("primaryName"),
             NumericDigitCategoryField("birthYear"),
             # NumericDigitCategoryField("deathYear", optional=True),
-            MultiCategoryField("professions")
+            # MultiCategoryField("professions")
         ]
 
     def row_generator(self):
