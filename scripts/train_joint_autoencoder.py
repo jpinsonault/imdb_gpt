@@ -282,6 +282,7 @@ def build_joint_trainer(
     people_ae = PeopleAutoencoder(config)
 
     if warm:
+        raise NotImplementedError("Warm start is not implemented yet.")
         movie_ae.load_model()
         people_ae.load_model()
     else:
@@ -372,7 +373,7 @@ def main():
         movie_ae=joint_model.movie_ae,
         person_ae=joint_model.person_ae,
         db_path=project_config["db_path"],
-        interval_batches=20,
+        interval_batches=5,
         num_samples=4,
     )
 

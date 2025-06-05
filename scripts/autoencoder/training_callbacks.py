@@ -112,27 +112,57 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
 
     def _tensor_to_string(self, field, main_tensor, flag_tensor=None):
         try:
+            if hasattr(field, "tokenizer"):
+                print(f"TextField {field.name}:")
+                print(f"  Raw tensor shape: {main_tensor.shape}")
+                print(f"  Raw tensor dtype: {main_tensor.dtype}")
+                print(f"  Expected vocab size: {field.tokenizer.get_vocab_size()}")
+                
+                # Convert TF tensor to numpy first
+                if hasattr(main_tensor, 'numpy'):
+                    main_tensor_np = main_tensor.numpy()
+                else:
+                    main_tensor_np = np.array(main_tensor)
+                
+                print(f"  Raw values sample: {main_tensor_np.flat[:10]}")
+                
+                if main_tensor_np.ndim >= 2 and main_tensor_np.shape[-1] == field.tokenizer.get_vocab_size():
+                    print(f"  Detected logits - taking argmax")
+                    argmaxed = np.argmax(main_tensor_np, axis=-1)
+                    print(f"  After argmax: {argmaxed[:10]}")
+                else:
+                    print(f"  Not taking argmax - passing raw tokens")
+                    print(f"  Token IDs: {main_tensor_np[:10]}")
+        except Exception as e:
+            print(f"  Error during debug: {e}")
+
+        try:
+            # Convert TF tensor to numpy if needed
+            if hasattr(main_tensor, 'numpy'):
+                main_tensor = main_tensor.numpy()
+            if flag_tensor is not None and hasattr(flag_tensor, 'numpy'):
+                flag_tensor = flag_tensor.numpy()
+                
             if isinstance(field, NumericDigitCategoryField):
+                # Handle numeric fields
                 arr = np.array(main_tensor)
                 if arr.ndim == 3:
                     return field.to_string(arr)
                 return field.to_string(arr.flatten())
-            arr = np.array(main_tensor)
+            
+            # For text fields, pass raw tensor directly to field.to_string()
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                if arr.ndim >= 2 and arr.shape[-1] == field.tokenizer.get_vocab_size():
-                    arr = np.argmax(arr, axis=-1)
+                return field.to_string(main_tensor, flag_tensor)
+            
+            # For other fields, do the standard processing
+            arr = np.array(main_tensor)
             if arr.ndim > 1:
                 arr = arr.flatten()
-            if flag_tensor is not None:
-                ft = np.array(flag_tensor).flatten()
-                if ft.size > 1:
-                    ft = ft[:1]
-            else:
-                ft = None
-            return field.to_string(arr, ft)
-        except Exception:
+            return field.to_string(arr, flag_tensor)
+        except Exception as e:
+            print(f"  Conversion error for field {field.name}: {e}")
             return "[Conversion Error]"
-
+        
     def _roundtrip_string(self, field, raw_value):
         try:
             t = field.transform(raw_value)
