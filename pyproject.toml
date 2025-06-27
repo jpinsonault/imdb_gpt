@@ -1,0 +1,21 @@
+[project]
+name = "imdb-gpt-2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "keras",
+    "requests",
+    "tensorboard",
+    "tensorflow==2.16.2",
+    "numpy>=1.22.0",
+    "tqdm",
+    "openai",
+    "datasets",
+    "pyfiglet",
+    "prettytable>=3.16.0",
+    "flask>=3.1.0",
+    "flask-cors>=5.0.1",
+    "yt-dlp>=2025.5.22",
+]

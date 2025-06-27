@@ -373,7 +373,7 @@ def main():
         movie_ae=joint_model.movie_ae,
         person_ae=joint_model.person_ae,
         db_path=project_config["db_path"],
-        interval_batches=5,
+        interval_batches=project_config["reconstruction_interval"],
         num_samples=4,
     )
 
@@ -393,6 +393,10 @@ def main():
     for f in joint_model.person_ae.fields:
         if str(type(f)) == "<class 'autoencoder.fields.TextField'>":
             print(f.name, f.tokenizer.get_vocab_size(), f.pad_token_id)
+
+
+    print(f"movie alphabet: {joint_model.movie_ae.fields[0].tokenizer.alphabet}")
+    print(f"movie alphabet: {joint_model.person_ae.fields[0].tokenizer.alphabet}")
 
 
     joint_model.fit(

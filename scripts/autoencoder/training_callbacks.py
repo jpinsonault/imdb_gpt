@@ -6,7 +6,7 @@ import random
 import sqlite3
 import numpy as np
 from prettytable import PrettyTable, TableStyle
-from typing import Any, List, Dict, Optional
+from typing import Any, Counter, List, Dict, Optional
 import tensorflow as tf
 from .fields import BaseField, SPECIAL_PAD, SPECIAL_START, SPECIAL_END, NumericDigitCategoryField, TextField  # Import special tokens here
 import os
@@ -40,6 +40,7 @@ def _sample_random_person(conn, tconst):
 
 def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
+
 
 class JointReconstructionCallback(tf.keras.callbacks.Callback):
     def __init__(self, movie_ae, person_ae, db_path,
