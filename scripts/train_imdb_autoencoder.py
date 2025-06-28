@@ -10,14 +10,15 @@ from config import project_config
 from autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 
 def main():
-    # people_ae = PeopleAutoencoder(project_config)
-    # people_ae.fit()
-    # people_ae.save_model()
+    print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+
+    people_ae = PeopleAutoencoder(project_config)
+    people_ae.fit()
+    people_ae.save_model()
 
     title_ae = TitlesAutoencoder(project_config)
-    # title_ae.load_model()
     title_ae.fit()
-    # title_ae.save_model()
+    title_ae.save_model()
 
 if __name__ == "__main__":
     main()
