@@ -122,7 +122,7 @@ def estimate_edges(conn: sqlite3.Connection, sample_size: int = 1_000, *, seed: 
 INSERT_CHUNK = 10_000
 
 def stream_and_insert_edges(conn: sqlite3.Connection, *, chunk_size: int = INSERT_CHUNK) -> None:
-    print("[3/4] Streaming (movie, person) edges …  (Ctrl‑C to abort safely)")
+    print("[3/4] Running edge insertion …")
 
     read_cur  = conn.cursor()
     write_cur = conn.cursor()
