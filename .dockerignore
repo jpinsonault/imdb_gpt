@@ -1,0 +1,14 @@
+# --- dev artefacts -------------------------------------------------
+.venv
+.env
+__pycache__/
+*.py[cod]
+
+# --- big / generated stuff ----------------------------------------
+data/
+models/
+logs/
+*.db
+*.tsv
+*.gz
+*.zip
