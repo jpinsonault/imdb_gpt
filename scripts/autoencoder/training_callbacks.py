@@ -5,43 +5,18 @@ from pathlib import Path
 import random
 import sqlite3
 import os
+import time
 import numpy as np
 import torch
 from prettytable import PrettyTable
 from typing import Any, List, Dict, Optional
 from .fields import NumericDigitCategoryField, TextField
 
-def _sample_random_person(conn, tconst):
-    q = """
-        SELECT p.primaryName,
-               p.birthYear,
-               p.deathYear,
-               GROUP_CONCAT(pp.profession, ',')
-        FROM   people p
-        LEFT   JOIN people_professions pp ON pp.nconst = p.nconst
-        INNER  JOIN principals pr         ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? 
-          AND p.birthYear IS NOT NULL
-        GROUP  BY p.nconst
-        HAVING COUNT(pp.profession) > 0
-        ORDER  BY RANDOM()
-        LIMIT  1
-    """
-    r = conn.execute(q, (tconst,)).fetchone()
-    if not r:
-        return None
-    return {
-        "primaryName": r[0],
-        "birthYear":   r[1],
-        "deathYear":   r[2],
-        "professions": r[3].split(',') if r[3] else None,
-    }
 
 def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
 
 class JointReconstructionLogger:
-    """Periodically prints movie↔person reconstructions and embedding similarity."""
     def __init__(
         self,
         movie_ae,
@@ -190,7 +165,6 @@ class JointReconstructionLogger:
             )
 
 class TensorBoardPerBatchLogger:
-    """Writes basic scalars to a unique TensorBoard run directory."""
     def __init__(self, log_dir: str, run_prefix: str = "run"):
         from torch.utils.tensorboard import SummaryWriter
         root = Path(log_dir)
@@ -221,7 +195,6 @@ class TensorBoardPerBatchLogger:
         self.writer.close()
 
 class ModelSaveHook:
-    """Calls row_autoencoder.save_model() on epoch end."""
     def __init__(self, row_autoencoder, output_dir: str):
         self.row_autoencoder = row_autoencoder
         self.output_dir = output_dir
@@ -231,7 +204,6 @@ class ModelSaveHook:
         print(f"Model saved to {self.output_dir} at the end of epoch {epoch + 1}")
 
 class RowReconstructionLogger:
-    """Prints reconstructions for a single RowAutoencoder at intervals."""
     def __init__(
         self,
         interval_steps: int,
@@ -239,19 +211,47 @@ class RowReconstructionLogger:
         db_path: str,
         num_samples: int = 5,
         table_width: int = 40,
+        max_scan: int = 20000,
+        sample_strategy: str = "fast",
     ):
         self.interval_steps = max(1, int(interval_steps))
         self.row_autoencoder = row_autoencoder
         self.db_path = db_path
         self.num_samples = num_samples
         self.w = table_width
+        self.samples: List[Dict] = []
 
-        if not self.row_autoencoder.stats_accumulated:
-            self.row_autoencoder.accumulate_stats()
+        t0 = time.perf_counter()
+        fast_ok = False
+        if sample_strategy == "fast":
+            try:
+                from .row_ae import imdb as imdb_mod
+                from .row_ae import db as row_db
+                names = [f.name for f in self.row_autoencoder.fields]
+                if "primaryTitle" in names:
+                    cand = row_db.sample_titles_fast(self.db_path, self.num_samples)
+                    if cand:
+                        self.samples = cand
+                        fast_ok = True
+                elif "primaryName" in names:
+                    cand = row_db.sample_people_fast(self.db_path, self.num_samples)
+                    if cand:
+                        self.samples = cand
+                        fast_ok = True
+            except Exception:
+                fast_ok = False
 
-        all_rows = list(self.row_autoencoder.row_generator())
-        n = min(num_samples, len(all_rows))
-        self.samples = random.sample(all_rows, n) if n > 0 else []
+        if not fast_ok:
+            try:
+                it = islice(self.row_autoencoder.row_generator(), max_scan)
+                all_rows = list(it)
+                n = min(self.num_samples, len(all_rows))
+                self.samples = random.sample(all_rows, n) if n > 0 else []
+            except Exception:
+                self.samples = []
+
+        dt = time.perf_counter() - t0
+        logging.info(f"RowReconstructionLogger: prepared {len(self.samples)} samples in {dt:.2f}s (strategy={'fast' if fast_ok else 'scan'})")
 
     @torch.no_grad()
     def _encode(self, row):

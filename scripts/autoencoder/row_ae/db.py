@@ -124,3 +124,29 @@ def get_person_by_nconst(db_path: str, nconst: str) -> Dict:
             "deathYear": r[2],
             "professions": r[3].split(",") if r[3] else None,
         }
+
+def sample_titles_fast(db_path: str, k: int) -> List[Dict]:
+    out: List[Dict] = []
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT DISTINCT tconst FROM edges ORDER BY RANDOM() LIMIT ?;", (k,))
+            rows = cur.fetchall()
+            for (tconst,) in rows:
+                out.append(get_title_by_tconst(db_path, tconst))
+        except sqlite3.Error:
+            out = []
+    return out
+
+def sample_people_fast(db_path: str, k: int) -> List[Dict]:
+    out: List[Dict] = []
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT DISTINCT nconst FROM edges ORDER BY RANDOM() LIMIT ?;", (k,))
+            rows = cur.fetchall()
+            for (nconst,) in rows:
+                out.append(get_person_by_nconst(db_path, nconst))
+        except sqlite3.Error:
+            out = []
+    return out

@@ -1,5 +1,7 @@
 from __future__ import annotations
 import sqlite3
+import time
+import logging
 import numpy as np
 from typing import Dict, List, Tuple
 
@@ -73,10 +75,12 @@ class WeightedEdgeSampler:
         self.alias = AliasSampler(self.weights / self.weights.sum())
         self.seen = 0
         self._cache_misses = 0
+        self._first_refresh_logged = False
 
     def _ensure_conn(self):
         if self.conn is not None:
             return
+        t0 = time.perf_counter()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
         self.conn.execute("PRAGMA journal_mode = WAL;")
         self.conn.execute("PRAGMA synchronous = NORMAL;")
@@ -86,6 +90,7 @@ class WeightedEdgeSampler:
         self.conn.execute("PRAGMA busy_timeout = 5000;")
         self.movie_cur = self.conn.cursor()
         self.person_cur = self.conn.cursor()
+        logging.info(f"edge sampler: DB connection ready in {time.perf_counter() - t0:.2f}s")
 
     def __iter__(self):
         self._ensure_conn()
@@ -109,10 +114,22 @@ class WeightedEdgeSampler:
         return self.movie_tensors[idx], self.person_tensors[idx]
 
     def _load_edges(self) -> List[Tuple[int, str, str]]:
+        t0 = time.perf_counter()
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             cur = conn.cursor()
+            total = None
+            try:
+                total = cur.execute("SELECT COUNT(1) FROM edges;").fetchone()[0]
+            except sqlite3.Error:
+                pass
+            if total is not None:
+                logging.info(f"edge sampler: loading edges table ({total} rows)…")
+            else:
+                logging.info("edge sampler: loading edges table…")
             cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
-            return cur.fetchall()
+            rows = cur.fetchall()
+        logging.info(f"edge sampler: edges loaded ({len(rows)} rows) in {time.perf_counter() - t0:.2f}s")
+        return rows
 
     def _movie_row(self, tconst: str):
         if tconst in self.mov_cache:
@@ -145,6 +162,7 @@ class WeightedEdgeSampler:
         return row
 
     def _refresh_weights(self):
+        t0 = time.perf_counter()
         cur = self.conn.cursor()
         try:
             cur.execute("SELECT edgeId,total_loss FROM edge_losses;")
@@ -162,8 +180,13 @@ class WeightedEdgeSampler:
                 self.weights.fill(1.0)
         except sqlite3.Error:
             self.weights.fill(1.0)
+            recorded = {}
         probs = self.weights / self.weights.sum()
         self.alias = AliasSampler(probs)
+        dt = time.perf_counter() - t0
+        if not self._first_refresh_logged:
+            self._first_refresh_logged = True
+            logging.info(f"edge sampler: initial weight refresh using {len(recorded)} records in {dt:.2f}s")
 
 def make_edge_sampler(
     db_path: str,

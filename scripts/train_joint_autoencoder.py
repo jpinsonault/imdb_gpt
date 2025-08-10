@@ -6,7 +6,7 @@ import signal
 import time
 import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any
 
 import torch
 import torch.nn.functional as F
@@ -87,23 +87,33 @@ def build_joint_trainer(
 ):
     from scripts.autoencoder.joint.model import JointAutoencoder
 
+    t0 = time.perf_counter()
+    logging.info("init: building row autoencoders (movies, people)…")
+
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
 
     if warm:
         raise NotImplementedError("Warm start is not implemented yet.")
     else:
+        s0 = time.perf_counter()
         movie_ae.accumulate_stats()
         movie_ae.finalize_stats()
         movie_ae.build_autoencoder()
+        logging.info(f"init: movie AE ready in {time.perf_counter() - s0:.2f}s")
+
+        s1 = time.perf_counter()
         people_ae.accumulate_stats()
         people_ae.finalize_stats()
         people_ae.build_autoencoder()
+        logging.info(f"init: people AE ready in {time.perf_counter() - s1:.2f}s")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     movie_ae.model.to(device)
     people_ae.model.to(device)
 
+    s2 = time.perf_counter()
+    logging.info("init: creating edge sampler (this may read the full edges table)…")
     edge_gen = make_edge_sampler(
         db_path=str(db_path),
         movie_ae=movie_ae,
@@ -112,6 +122,7 @@ def build_joint_trainer(
         refresh_batches=config["edge_sampler"]["refresh_batches"],
         boost=config["edge_sampler"]["weak_edge_boost"],
     )
+    logging.info(f"init: edge sampler ready in {time.perf_counter() - s2:.2f}s")
 
     ds = _EdgeIterable(edge_gen, movie_ae, people_ae)
 
@@ -119,6 +130,8 @@ def build_joint_trainer(
     prefetch_factor = int(config.get("prefetch_factor", 2))
     pin = bool(torch.cuda.is_available())
 
+    s3 = time.perf_counter()
+    logging.info(f"init: constructing DataLoader workers={num_workers} prefetch={prefetch_factor if num_workers>0 else None} pin_memory={pin}")
     loader = DataLoader(
         ds,
         batch_size=config["batch_size"],
@@ -128,12 +141,13 @@ def build_joint_trainer(
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
+    logging.info(f"init: DataLoader ready in {time.perf_counter() - s3:.2f}s")
 
     loss_logger = EdgeLossLogger(str(db_path))
 
     joint = JointAutoencoder(movie_ae, people_ae).to(device)
     total_edges = len(edge_gen.edges)
-    logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config['batch_size']} workers={num_workers}")
+    logging.info(f"init: joint trainer ready device={device} edges={total_edges} bs={config['batch_size']} workers={num_workers} in {time.perf_counter() - t0:.2f}s")
     return joint, loader, loss_logger, movie_ae, people_ae, total_edges
 
 def main():
@@ -159,6 +173,7 @@ def main():
     flush_interval = int(project_config.get("flush_interval", 2000))
 
     writer = None
+    run_dir = None
     if SummaryWriter is not None:
         tb_root = project_config.get("tensorboard_dir", "logs")
         run_dir = _unique_log_dir(tb_root, "joint_autoencoder")
@@ -169,6 +184,8 @@ def main():
     rr_interval = int(project_config.get("row_recon_interval", 1000))
     rr_samples = int(project_config.get("row_recon_samples", 3))
 
+    t_recon = time.perf_counter()
+    logging.info(f"init: building JointReconstructionLogger (scan up to {project_config.get('movie_limit')} movies)…")
     joint_recon = JointReconstructionLogger(
         mov_ae,
         per_ae,
@@ -177,6 +194,10 @@ def main():
         num_samples=4,
         table_width=38,
     )
+    logging.info(f"init: JointReconstructionLogger ready in {time.perf_counter() - t_recon:.2f}s")
+
+    t_rrm = time.perf_counter()
+    logging.info("init: building RowReconstructionLogger for movies (this scans dataset once)…")
     row_recon_movies = RowReconstructionLogger(
         interval_steps=rr_interval,
         row_autoencoder=mov_ae,
@@ -184,6 +205,10 @@ def main():
         num_samples=rr_samples,
         table_width=40,
     )
+    logging.info(f"init: RowReconstructionLogger[movies] ready in {time.perf_counter() - t_rrm:.2f}s")
+
+    t_rrp = time.perf_counter()
+    logging.info("init: building RowReconstructionLogger for people (this scans dataset once)…")
     row_recon_people = RowReconstructionLogger(
         interval_steps=rr_interval,
         row_autoencoder=per_ae,
@@ -191,6 +216,7 @@ def main():
         num_samples=rr_samples,
         table_width=40,
     )
+    logging.info(f"init: RowReconstructionLogger[people] ready in {time.perf_counter() - t_rrp:.2f}s")
 
     stop_flag = {"stop": False}
 
@@ -204,16 +230,32 @@ def main():
         logging.info(f"cuda={torch.version.cuda} device={torch.cuda.get_device_name(0)}")
 
     joint_model.train()
-    global_step = 0
-    data_iter = iter(loader)
 
+    logging.info("init: warming up DataLoader by prefetching first batch…")
+    t_warm = time.perf_counter()
+    data_iter = iter(loader)
+    try:
+        warm_M, warm_P, warm_eids = next(data_iter)
+        warm_dt = time.perf_counter() - t_warm
+        logging.info(f"init: first batch fetched in {warm_dt:.2f}s (batch_size={project_config['batch_size']})")
+    except StopIteration:
+        logging.error("init: DataLoader produced no data")
+        return
+
+    global_step = 0
     last_log_t = time.perf_counter()
     since_last_log = 0
+    pending_batch = (warm_M, warm_P, warm_eids)
 
     while True:
         t_fetch0 = time.perf_counter()
-        M, P, eids = next(data_iter)
-        data_time = time.perf_counter() - t_fetch0
+        if pending_batch is not None:
+            M, P, eids = pending_batch
+            pending_batch = None
+            data_time = time.perf_counter() - t_fetch0
+        else:
+            M, P, eids = next(data_iter)
+            data_time = time.perf_counter() - t_fetch0
 
         M = [m.to(device, non_blocking=True) for m in M]
         P = [p.to(device, non_blocking=True) for p in P]
@@ -260,9 +302,7 @@ def main():
             ips = (log_interval * project_config["batch_size"]) / elapsed
             last_log_t = now
             logging.info(
-                f"step {global_step} "
-                f"loss {total_val:.4f} rec {rec_val:.4f} nce {nce_val:.4f} "
-                f"dt {data_time:.3f}s bt {batch_time:.3f}s ips {_fmt(ips)}"
+                f"step {global_step} loss {total_val:.4f} rec {rec_val:.4f} nce {nce_val:.4f} dt {data_time:.3f}s bt {batch_time:.3f}s ips {_fmt(ips)}"
             )
 
         JointReconstructionLogger.on_batch_end(joint_recon, global_step)

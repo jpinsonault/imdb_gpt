@@ -165,6 +165,18 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
             total = total + clw * _info_nce(z_seq.view(B * T, D), z_true.view(B * T, D), temperature=temp)
         return total
 
+    def compute_field_losses(self, preds: List[torch.Tensor], targets: List[torch.Tensor]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for idx, pred in zip(self.active_idx, preds):
+            f = self.people_ae.fields[idx]
+            tgt = targets[idx]
+            B, T = pred.size(0), pred.size(1)
+            p = _merge_bt(pred, B, T)
+            y = _merge_bt(tgt, B, T)
+            l = f.compute_loss(p, y) * float(f.weight)
+            out[f.name] = float(l.detach().cpu().item())
+        return out
+
     def _row_gen(self):
         return seq_db.iter_movie_with_people(self.db_path, self.seq_len)
 
@@ -236,6 +248,22 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
                 pbar.set_postfix(loss=loss_val)
                 if writer is not None:
                     writer.add_scalar("loss/total", loss_val, global_step)
+                    field_losses = self.compute_field_losses(preds, P)
+                    for k, v in field_losses.items():
+                        writer.add_scalar(f"loss/fields/{k}", v, global_step)
+                    llw = float(self.config.get("latent_loss_weight", 0.0))
+                    clw = float(self.config.get("contrastive_loss_weight", 0.0))
+                    if llw > 0.0 or clw > 0.0:
+                        B = preds[0].size(0)
+                        T = preds[0].size(1)
+                        z_true = self._encode_people_targets(P, B, T)
+                        if llw > 0.0:
+                            l_lat = F.mse_loss(z_seq.view(B * self.seq_len, self.latent_dim), z_true.view(B * self.seq_len, self.latent_dim))
+                            writer.add_scalar("loss/latent", float((llw * l_lat).detach().cpu().item()), global_step)
+                        if clw > 0.0:
+                            temp = float(self.config.get("nce_temp", 0.07))
+                            l_nce = _info_nce(z_seq.view(B * self.seq_len, self.latent_dim), z_true.view(B * self.seq_len, self.latent_dim), temperature=temp)
+                            writer.add_scalar("loss/contrastive", float((clw * l_nce).detach().cpu().item()), global_step)
                 recon_logger.on_batch_end(global_step)
                 global_step += 1
 

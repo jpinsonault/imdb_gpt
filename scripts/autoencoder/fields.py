@@ -742,9 +742,14 @@ class NumericDigitCategoryField(BaseField):
     def to_string(self, predicted_tensor: np.ndarray, flag_tensor: Optional[np.ndarray] = None) -> str:
         if self.total_positions is None or self.base is None or self.integer_digits is None:
             self._finalize_stats()
+
         arr = np.asarray(predicted_tensor)
-        if arr.ndim == 3:
+
+        # If this looks like distributions over digits, collapse to digit IDs.
+        # Works for (B, P, base) or (P, base).
+        if arr.ndim >= 2 and arr.shape[-1] == self.base:
             arr = np.argmax(arr, axis=-1)
+
         digits = arr.flatten().astype(int).tolist()
         idx = 0
         if self.has_nan:

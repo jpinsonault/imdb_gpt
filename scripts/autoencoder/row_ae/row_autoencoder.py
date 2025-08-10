@@ -3,6 +3,7 @@ import pickle
 import sqlite3
 from pathlib import Path
 from typing import Any, List, Dict, Tuple
+import datetime
 
 import numpy as np
 import torch
@@ -12,6 +13,11 @@ from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
 from autoencoder.fields import BaseField
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -263,6 +269,13 @@ class RowAutoencoder:
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
         loader = self._make_loader()
 
+        writer = None
+        if SummaryWriter is not None:
+            root = self.config.get("tensorboard_dir", "logs")
+            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+            logdir = Path(root) / f"row_ae_{self.__class__.__name__}_{ts}"
+            writer = SummaryWriter(log_dir=str(logdir))
+
         self.model.train()
         global_step = 0
         for epoch in range(epochs):
@@ -272,13 +285,23 @@ class RowAutoencoder:
                 ys = [y.to(self.device) for y in ys]
                 outs = self.model(xs)
                 total = 0.0
+                field_losses = {}
                 for f, pred, tgt in zip(self.fields, outs, ys):
-                    loss = f.compute_loss(pred, tgt) * float(f.weight)
-                    total = total + loss
+                    l = f.compute_loss(pred, tgt) * float(f.weight)
+                    total = total + l
+                    field_losses[f.name] = float(l.detach().cpu().item())
                 opt.zero_grad()
                 total.backward()
                 opt.step()
+                total_val = float(total.detach().cpu().item())
+                pbar.set_postfix(loss=total_val)
+                if writer is not None:
+                    writer.add_scalar("loss/total", total_val, global_step)
+                    for k, v in field_losses.items():
+                        writer.add_scalar(f"loss/fields/{k}", v, global_step)
                 global_step += 1
-                pbar.set_postfix(loss=float(total.detach().cpu().item()))
             self.save_model()
+        if writer is not None:
+            writer.flush()
+            writer.close()
         return None
