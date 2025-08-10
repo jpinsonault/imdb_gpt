@@ -16,10 +16,8 @@ from config import project_config
 from scripts.autoencoder.joint.loss_loggers import EdgeLossLogger
 from scripts.autoencoder.row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint.dataset import make_edge_sampler
-from scripts.autoencoder.joint.loggin import (
-    JointReconstructionLogger,
-    RowReconstructionLogger,
-)
+from scripts.autoencoder.joint.reconstruction_logger import JointReconstructionLogger
+from scripts.autoencoder.row_ae.reconstruction_logger import RowReconstructionLogger
 
 try:
     from torch.utils.tensorboard import SummaryWriter
