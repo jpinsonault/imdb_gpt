@@ -13,7 +13,7 @@ from tqdm import tqdm
 from ..row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
 from .dataset import MoviesPeopleSequenceDataset, collate_movies_people
 from . import db as seq_db
-from ..sequence_reconstruction_logger import SequenceReconstructionLogger
+from .sequence_reconstruction_logger import SequenceReconstructionLogger
 
 try:
     from torch.utils.tensorboard import SummaryWriter

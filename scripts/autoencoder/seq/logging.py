@@ -1,1 +1,1 @@
-from ..sequence_reconstruction_logger import SequenceReconstructionLogger
+from .sequence_reconstruction_logger import SequenceReconstructionLogger
