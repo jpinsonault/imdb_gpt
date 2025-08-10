@@ -744,33 +744,48 @@ class NumericDigitCategoryField(BaseField):
             self._finalize_stats()
 
         arr = np.asarray(predicted_tensor)
+        positions = self._get_input_shape()[0]
 
-        # If this looks like distributions over digits, collapse to digit IDs.
-        # Works for (B, P, base) or (P, base).
+        if arr.ndim == 1 and arr.size == positions * self.base:
+            arr = arr.reshape(positions, self.base)
+
         if arr.ndim >= 2 and arr.shape[-1] == self.base:
             arr = np.argmax(arr, axis=-1)
 
-        digits = arr.flatten().astype(int).tolist()
+        flat = arr.flatten().astype(int).tolist()
+
+        if len(flat) < positions:
+            flat += [0] * (positions - len(flat))
+        elif len(flat) > positions:
+            flat = flat[:positions]
+
+        digits = [min(max(int(x), 0), self.base - 1) for x in flat]
+
         idx = 0
         if self.has_nan:
             if digits[idx] == 1:
                 return "NaN"
             idx += 1
+
         negative = False
         if self.has_negative:
             negative = bool(digits[idx] == 1)
             idx += 1
+
         int_val = 0
         for _ in range(self.integer_digits):
             int_val = int_val * self.base + digits[idx]
             idx += 1
+
         frac_val = 0
         for _ in range(self.fraction_digits):
             frac_val = frac_val * self.base + digits[idx]
             idx += 1
+
         s = f"{int_val}"
         if self.fraction_digits > 0:
             s += "." + f"{frac_val:0{self.fraction_digits}d}"
+
         return ("-" if negative else "") + s
 
     def build_encoder(self, latent_dim: int) -> nn.Module:

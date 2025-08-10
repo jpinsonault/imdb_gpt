@@ -1,0 +1,190 @@
+import logging
+import pickle
+import sqlite3
+from pathlib import Path
+from typing import Any, List, Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+from autoencoder.fields import BaseField
+from .encoders import _FieldEncoders, _FieldDecoders
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class RowAutoencoder:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.model_dir = Path(config["model_dir"])
+        self.model = None
+        self.encoder = None
+        self.decoder = None
+
+        self.fields: List[BaseField] = self.build_fields()
+        self.latent_dim = int(self.config["latent_dim"])
+        self.num_rows_in_dataset = 0
+
+        self.db_path: str = config["db_path"]
+        self.stats_accumulated = False
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _cache_table_name(self) -> str:
+        return f"{self.__class__.__name__}_stats_cache"
+
+    def _drop_cache_table(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {self._cache_table_name()};")
+            conn.commit()
+
+    def _save_cache(self):
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._cache_table_name()} (field_name TEXT PRIMARY KEY, data BLOB)"
+            )
+            for f in self.fields:
+                blob = pickle.dumps(f)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {self._cache_table_name()} (field_name, data) VALUES (?, ?);",
+                    (f.name, blob),
+                )
+            conn.commit()
+
+    def _load_cache(self) -> bool:
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (self._cache_table_name(),)
+            )
+            if cur.fetchone() is None:
+                return False
+            cur.execute(f"SELECT field_name, data FROM {self._cache_table_name()};")
+            rows = cur.fetchall()
+            if not rows:
+                return False
+            cache_map = {name: pickle.loads(blob) for name, blob in rows}
+            for i, f in enumerate(self.fields):
+                if f.name in cache_map:
+                    self.fields[i] = cache_map[f.name]
+        self.stats_accumulated = True
+        return True
+
+    def accumulate_stats(self):
+        use_cache = self.config.get("use_cache", True)
+        refresh_cache = self.config.get("refresh_cache", False)
+        if refresh_cache:
+            self._drop_cache_table()
+        if use_cache and self._load_cache():
+            logging.info("stats loaded from cache")
+            return
+        if self.stats_accumulated:
+            logging.info("stats already accumulated")
+            return
+        n = 0
+        logging.info("accumulating stats")
+        for row in tqdm(self.row_generator(), desc=self.__class__.__name__):
+            self.accumulate_stats_for_row(row)
+            n += 1
+        self.num_rows_in_dataset = n
+        logging.info(f"stats accumulation finished ({n} rows)")
+
+    def finalize_stats(self):
+        if self.stats_accumulated:
+            return
+        logging.info("finalizing stats")
+        for f in self.fields:
+            f.finalize_stats()
+        self.stats_accumulated = True
+        self._save_cache()
+        logging.info("stats finalized and cached")
+
+    def accumulate_stats_for_row(self, row: Dict):
+        for f in self.fields:
+            f.accumulate_stats(row.get(f.name))
+
+    def transform_row(self, row: Dict) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for f in self.fields:
+            out[f.name] = f.transform(row.get(f.name))
+        return out
+
+    def reconstruct_row(self, latent_vector: np.ndarray) -> Dict[str, str]:
+        if self.decoder is None:
+            raise RuntimeError("Decoder not built")
+        if not self.stats_accumulated:
+            raise RuntimeError("Field stats must be finalized")
+        z = torch.tensor(latent_vector, dtype=torch.float32, device=self.device)
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+        with torch.no_grad():
+            outs = self.decoder(z)
+        rec = {}
+        for f, o in zip(self.fields, outs):
+            arr = o.detach().cpu().numpy()[0]
+            rec[f.name] = f.to_string(arr)
+        return rec
+
+    def build_fields(self) -> List["BaseField"]:
+        raise NotImplementedError
+
+    def row_generator(self):
+        raise NotImplementedError
+
+    def build_autoencoder(self):
+        if not self.stats_accumulated:
+            raise RuntimeError("Call accumulate_stats()/finalize_stats() first")
+        self.encoder = _FieldEncoders(self.fields, self.latent_dim).to(self.device)
+        self.decoder = _FieldDecoders(self.fields, self.latent_dim).to(self.device)
+
+        class _AE(nn.Module):
+            def __init__(self, enc, dec):
+                super().__init__()
+                self.enc = enc
+                self.dec = dec
+            def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
+                z = self.enc(xs)
+                outs = self.dec(z)
+                return outs
+
+        self.model = _AE(self.encoder, self.decoder).to(self.device)
+        return self.model
+
+    def _make_loader(self):
+        from .data import _RowDataset, _collate
+        from torch.utils.data import DataLoader
+
+        ds = _RowDataset(self.row_generator, self.fields)
+        bs = int(self.config.get("batch_size", 32))
+        return DataLoader(ds, batch_size=bs, collate_fn=_collate)
+
+    def save_model(self):
+        out = Path(self.model_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        name = self.__class__.__name__
+        torch.save(self.model.state_dict(), out / f"{name}_autoencoder.pt")
+        torch.save(self.encoder.state_dict(), out / f"{name}_encoder.pt")
+        torch.save(self.decoder.state_dict(), out / f"{name}_decoder.pt")
+
+    def load_model(self):
+        if not self.stats_accumulated:
+            self.accumulate_stats()
+            self.finalize_stats()
+        if self.model is None:
+            self.build_autoencoder()
+        name = self.__class__.__name__
+        enc_p = Path(self.model_dir) / f"{name}_encoder.pt"
+        dec_p = Path(self.model_dir) / f"{name}_decoder.pt"
+        if enc_p.exists():
+            self.encoder.load_state_dict(torch.load(enc_p, map_location=self.device))
+        if dec_p.exists():
+            self.decoder.load_state_dict(torch.load(dec_p, map_location=self.device))
+        self.model.eval()
+        self.encoder.eval()
+        self.decoder.eval()
+        return self
+
+    def fit(self):
+        from .trainer import fit_row_autoencoder
+        return fit_row_autoencoder(self)
