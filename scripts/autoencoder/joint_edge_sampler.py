@@ -1,7 +1,7 @@
 from __future__ import annotations
-import sqlite3, numpy as np
+import sqlite3
+import numpy as np
 from typing import List, Tuple, Dict
-from tqdm import tqdm
 
 
 class AliasSampler:
@@ -10,19 +10,16 @@ class AliasSampler:
         self.n = n
         self.p = np.zeros(n, dtype=np.float32)
         self.a = np.zeros(n, dtype=np.int32)
-
         scaled = probs * n
         small, large = [], []
         for i, v in enumerate(scaled):
             (small if v < 1.0 else large).append(i)
-
         while small and large:
             s, l = small.pop(), large.pop()
             self.p[s] = scaled[s]
             self.a[s] = l
             scaled[l] = (scaled[l] - 1) + scaled[s]
             (small if scaled[l] < 1.0 else large).append(l)
-
         for i in large + small:
             self.p[i] = 1.0
             self.a[i] = i
@@ -34,8 +31,6 @@ class AliasSampler:
 
 
 class WeightedEdgeSampler:
-    """Edge sampler that builds tensors on demand and favours high‑loss edges."""
-
     def __init__(
         self,
         db_path: str,
@@ -57,8 +52,8 @@ class WeightedEdgeSampler:
         self.movie_tensors = [None] * len(self.edges)
         self.person_tensors = [None] * len(self.edges)
 
-        self.mov_cache: Dict[str, Tuple] = {}
-        self.per_cache: Dict[str, Tuple] = {}
+        self.mov_cache: Dict[str, Dict] = {}
+        self.per_cache: Dict[str, Dict] = {}
 
         self.movie_cur = self.conn.cursor()
         self.person_cur = self.conn.cursor()
@@ -78,20 +73,17 @@ class WeightedEdgeSampler:
         self.alias = AliasSampler(self.weights / self.weights.sum())
         self.seen = 0
 
-    # ----------------------------------------------------------- iterator
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.seen % self.refresh_edges == 0:
             self._refresh_weights()
-
         idx = self.alias.draw(1)[0]
         self.seen += 1
         movie_t, person_t = self._get_tensors(idx)
         return movie_t, person_t, self.edges[idx][0]
 
-    # -------------------------------------------------------- tensor cache
     def _get_tensors(self, idx: int):
         if self.movie_tensors[idx] is None:
             eid, tconst, nconst = self.edges[idx]
@@ -101,7 +93,6 @@ class WeightedEdgeSampler:
             self.person_tensors[idx] = tuple(f.transform(pr.get(f.name)) for f in self.per.fields)
         return self.movie_tensors[idx], self.person_tensors[idx]
 
-    # ----------------------------------------------------------- preload
     def _load_edges(self) -> List[Tuple[int, str, str]]:
         cur = self.conn.cursor()
         cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
@@ -137,7 +128,6 @@ class WeightedEdgeSampler:
         self.per_cache[nconst] = row
         return row
 
-    # ------------------------------------------------------------ weights
     def _refresh_weights(self):
         cur = self.conn.cursor()
         try:

@@ -9,7 +9,7 @@ project_config = {
     'docker_data_dir_mount': '/app/imdb',
 
     'latent_dim': 256,
-    'batch_size': 4096,
+    'batch_size': 512,
     'learning_rate': 0.0005,
     'epochs': 20,
     'reconstruction_interval': 100,
