@@ -1,1 +1,1 @@
-from .row_autoencoder import RowAutoencoder
+from .core import RowAutoencoder
