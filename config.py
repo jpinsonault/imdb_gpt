@@ -1,5 +1,3 @@
-# config.py
-
 project_config = {
     'project_name': 'imdb_gpt',
     'data_dir': "./data/",
@@ -11,18 +9,29 @@ project_config = {
     'latent_dim': 256,
     'batch_size': 512,
     'learning_rate': 0.0005,
-    'epochs': 20,
+    'weight_decay': 1e-4,
+
     'reconstruction_interval': 100,
     'callback_interval': 100,
     'people_sequence_length': 1,
-    'weight_decay': 1e-4,
-    'early_stopping_patience': 10,
     'movie_limit': 1000000000,
     'db_path': './data/imdb.db',
     'nce_temp': 0.03,
-    'weak_sample_boost': 0.01,
+
     'edge_sampler': {
         'refresh_batches': 100,
         'weak_edge_boost': 0.10,
     },
+
+    'tensorboard_dir': 'runs',
+
+    'log_interval': 20,
+    'recon_log_interval': 20,
+    'row_recon_interval': 28,
+    'row_recon_samples': 3,
+    'save_interval': 10000,
+    'flush_interval': 2000,
+
+    'num_workers': 6,
+    'prefetch_factor': 6,
 }

@@ -4,12 +4,12 @@ import logging
 from pathlib import Path
 import random
 import sqlite3
-import numpy as np
-from prettytable import PrettyTable, TableStyle
-from typing import Any, Counter, List, Dict, Optional
-import tensorflow as tf
-from .fields import BaseField, SPECIAL_PAD, SPECIAL_START, SPECIAL_END, NumericDigitCategoryField, TextField  # Import special tokens here
 import os
+import numpy as np
+import torch
+from prettytable import PrettyTable
+from typing import Any, List, Dict, Optional
+from .fields import NumericDigitCategoryField, TextField
 
 def _sample_random_person(conn, tconst):
     q = """
@@ -37,40 +37,51 @@ def _sample_random_person(conn, tconst):
         "professions": r[3].split(',') if r[3] else None,
     }
 
-
 def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
 
-
-class JointReconstructionCallback(tf.keras.callbacks.Callback):
-    def __init__(self, movie_ae, person_ae, db_path,
-                 interval_batches=200, num_samples=4, table_width=38):
-        super().__init__()
+class JointReconstructionLogger:
+    """Periodically prints movie↔person reconstructions and embedding similarity."""
+    def __init__(
+        self,
+        movie_ae,
+        person_ae,
+        db_path,
+        interval_steps: int = 200,
+        num_samples: int = 4,
+        table_width: int = 38,
+        max_movie_scan: int = 50000,
+        neg_pool: int = 256,
+    ):
         self.m_ae = movie_ae
         self.p_ae = person_ae
-        self.every = interval_batches
+        self.every = max(1, int(interval_steps))
         self.w = table_width
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
 
-        movies = list(islice(movie_ae.row_generator(), 50000))
+        movies = list(islice(movie_ae.row_generator(), max_movie_scan))
         self.pairs = []
-        for m in random.sample(movies, min(num_samples * 3, len(movies))):
-            p = self._sample_person(m["tconst"])
+        rng = random.Random(1337)
+        candidates = rng.sample(movies, min(num_samples * 3, len(movies)))
+        for m in candidates:
+            p = self._sample_person(m.get("tconst"))
             if p:
                 self.pairs.append((m, p))
             if len(self.pairs) == num_samples:
                 break
 
-        neg_movies = random.sample(movies, min(256, len(movies)))
+        neg_movies = rng.sample(movies, min(neg_pool, len(movies)))
         self.neg_people_latents = []
         for m in neg_movies:
-            p = self._sample_person(m["tconst"])
+            p = self._sample_person(m.get("tconst"))
             if p:
                 z = self._encode(self.p_ae, p)
                 self.neg_people_latents.append(z)
-        self.neg_people_latents = np.stack(self.neg_people_latents)
+        if self.neg_people_latents:
+            self.neg_people_latents = np.stack(self.neg_people_latents)
+        else:
+            self.neg_people_latents = np.zeros((1, self.m_ae.latent_dim), dtype=np.float32)
 
-    # ------------------------------------------------------------------- helpers
     def _sample_person(self, tconst):
         q = """
         SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
@@ -92,78 +103,41 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
             "professions":  r[3].split(',') if r[3] else None,
         }
 
+    @torch.no_grad()
     def _encode(self, ae, row):
-        xs = [tf.expand_dims(f.transform(row.get(f.name)), 0) for f in ae.fields]
-        return ae.encoder(xs, training=False).numpy()[0]
+        xs = [f.transform(row.get(f.name)) for f in ae.fields]
+        xs = [x.unsqueeze(0).to(ae.device) for x in xs]
+        z = ae.encoder(xs)
+        if isinstance(z, torch.Tensor):
+            z = z.detach().cpu().numpy()[0]
+        return z
 
     def _recon(self, ae, z):
         return ae.reconstruct_row(z)
-
-    def _cos(self, a, b):
-        a = a / (np.linalg.norm(a) + 1e-9)
-        b = b / (np.linalg.norm(b) + 1e-9)
-        return float(np.dot(a, b))
 
     def _rank(self, z_m, z_p):
         sims = np.dot(self.neg_people_latents, z_m) / (
             (np.linalg.norm(self.neg_people_latents, axis=1) + 1e-9) * (np.linalg.norm(z_m) + 1e-9)
         )
-        sims = np.append(sims, self._cos(z_m, z_p))
+        sims = np.append(sims, _cos(z_m, z_p))
         return int((-sims).argsort().tolist().index(len(sims) - 1)) + 1
 
     def _tensor_to_string(self, field, main_tensor, flag_tensor=None):
         try:
-            if hasattr(field, "tokenizer"):
-                print(f"TextField {field.name}:")
-                print(f"  Raw tensor shape: {main_tensor.shape}")
-                print(f"  Raw tensor dtype: {main_tensor.dtype}")
-                print(f"  Expected vocab size: {field.tokenizer.get_vocab_size()}")
-                
-                # Convert TF tensor to numpy first
-                if hasattr(main_tensor, 'numpy'):
-                    main_tensor_np = main_tensor.numpy()
-                else:
-                    main_tensor_np = np.array(main_tensor)
-                
-                print(f"  Raw values sample: {main_tensor_np.flat[:10]}")
-                
-                if main_tensor_np.ndim >= 2 and main_tensor_np.shape[-1] == field.tokenizer.get_vocab_size():
-                    print(f"  Detected logits - taking argmax")
-                    argmaxed = np.argmax(main_tensor_np, axis=-1)
-                    print(f"  After argmax: {argmaxed[:10]}")
-                else:
-                    print(f"  Not taking argmax - passing raw tokens")
-                    print(f"  Token IDs: {main_tensor_np[:10]}")
-        except Exception as e:
-            print(f"  Error during debug: {e}")
-
-        try:
-            # Convert TF tensor to numpy if needed
-            if hasattr(main_tensor, 'numpy'):
-                main_tensor = main_tensor.numpy()
-            if flag_tensor is not None and hasattr(flag_tensor, 'numpy'):
-                flag_tensor = flag_tensor.numpy()
-                
             if isinstance(field, NumericDigitCategoryField):
-                # Handle numeric fields
                 arr = np.array(main_tensor)
                 if arr.ndim == 3:
                     return field.to_string(arr)
                 return field.to_string(arr.flatten())
-            
-            # For text fields, pass raw tensor directly to field.to_string()
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
                 return field.to_string(main_tensor, flag_tensor)
-            
-            # For other fields, do the standard processing
             arr = np.array(main_tensor)
             if arr.ndim > 1:
                 arr = arr.flatten()
             return field.to_string(arr, flag_tensor)
-        except Exception as e:
-            print(f"  Conversion error for field {field.name}: {e}")
+        except Exception:
             return "[Conversion Error]"
-        
+
     def _roundtrip_string(self, field, raw_value):
         try:
             t = field.transform(raw_value)
@@ -173,16 +147,17 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
         except Exception:
             return "[RT Error]"
 
-    # ------------------------------------------------------------------- callback
-    def on_train_batch_end(self, batch, logs=None):
-        if (batch + 1) % self.every:
+    def on_batch_end(self, global_step: int):
+        if self.every <= 0:
+            return
+        if (global_step + 1) % self.every != 0:
             return
 
         for m_row, p_row in self.pairs:
             z_m = self._encode(self.m_ae, m_row)
             z_p = self._encode(self.p_ae, p_row)
 
-            cos = self._cos(z_m, z_p)
+            cos = _cos(z_m, z_p)
             l2 = float(np.linalg.norm(z_m - z_p))
             ang = float(np.degrees(np.arccos(max(min(cos, 1.0), -1.0))))
             rank = self._rank(z_m, z_p)
@@ -194,310 +169,139 @@ class JointReconstructionCallback(tf.keras.callbacks.Callback):
             for f in self.m_ae.fields:
                 o = m_row.get(f.name, "")
                 rt = self._roundtrip_string(f, o)
-                r_raw = m_rec.get(f.name, "")
-                r = self._tensor_to_string(f, r_raw) if isinstance(r_raw, np.ndarray) else r_raw
+                r = m_rec.get(f.name, "")
                 tm.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
 
             tp = PrettyTable(["Person field", "orig", "round", "recon"])
             for f in self.p_ae.fields:
                 o = p_row.get(f.name, "")
                 rt = self._roundtrip_string(f, o)
-                r_raw = p_rec.get(f.name, "")
-                r = self._tensor_to_string(f, r_raw) if isinstance(r_raw, np.ndarray) else r_raw
+                r = p_rec.get(f.name, "")
                 tp.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
 
             bar_len = 20
-            bar = "#" * int(cos * bar_len) + "-" * (bar_len - int(cos * bar_len))
+            filled = max(0, min(bar_len, int(round(cos * bar_len))))
+            bar = "#" * filled + "-" * (bar_len - filled)
             print(
-                f"\n--- joint recon ---\n"
+                f"\n--- joint recon @ step {global_step+1} ---\n"
                 f"cos={cos:.3f}  angle={ang:5.1f}°  l2={l2:.3f}  rank@neg={rank}\n"
                 f"[{bar}]\n"
                 f"{tm}\n{tp}"
             )
 
+class TensorBoardPerBatchLogger:
+    """Writes basic scalars to a unique TensorBoard run directory."""
+    def __init__(self, log_dir: str, run_prefix: str = "run"):
+        from torch.utils.tensorboard import SummaryWriter
+        root = Path(log_dir)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        base = f"{run_prefix}_{ts}"
+        run_dir = root / base
+        if run_dir.exists():
+            i = 1
+            while True:
+                cand = root / f"{base}_{i}"
+                if not cand.exists():
+                    run_dir = cand
+                    break
+                i += 1
+        run_dir.parent.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(run_dir))
+        self.run_dir = str(run_dir)
 
-class TensorBoardPerBatchLoggingCallback(tf.keras.callbacks.Callback):
-    def __init__(self, log_dir, log_interval: int = 1):
-        super().__init__()
-        self.log_interval = log_interval
-        log_root = Path(log_dir)
-        run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.file_writer = tf.summary.create_file_writer(str(log_root / run_id))
+    def log_scalars(self, step: int, scalars: Dict[str, float]):
+        for k, v in scalars.items():
+            self.writer.add_scalar(k, float(v), step)
 
-    def on_train_batch_end(self, batch, logs=None):
-        logs = logs or {}
-        step = int(self.model.optimizer.iterations.numpy())
-        lr = self.model.optimizer.learning_rate
-        lr_val = float(lr(step)) if callable(lr) else float(tf.keras.backend.get_value(lr))
-        total_loss = float(logs.get("loss", 0.0))
-        with self.file_writer.as_default():
-            tf.summary.scalar("loss/total", total_loss, step=step)
-            tf.summary.scalar("learning_rate", lr_val, step=step)
-            if "rec_loss" in logs:
-                tf.summary.scalar("loss/rec", float(logs["rec_loss"]), step=step)
-            for key, value in logs.items():
-                if key not in ("loss", "rec_loss"):
-                    tf.summary.scalar(f"loss/{key}", float(value), step=step)
-            self.file_writer.flush()
+    def flush(self):
+        self.writer.flush()
 
+    def close(self):
+        self.writer.flush()
+        self.writer.close()
 
-
-class ModelSaveCallback(tf.keras.callbacks.Callback):
-    def __init__(self, row_autoencoder, output_dir):
-        super().__init__()
+class ModelSaveHook:
+    """Calls row_autoencoder.save_model() on epoch end."""
+    def __init__(self, row_autoencoder, output_dir: str):
         self.row_autoencoder = row_autoencoder
         self.output_dir = output_dir
 
-    def on_epoch_end(self, epoch, logs=None):
+    def on_epoch_end(self, epoch: int):
         self.row_autoencoder.save_model()
         print(f"Model saved to {self.output_dir} at the end of epoch {epoch + 1}")
 
-
-class ReconstructionCallback(tf.keras.callbacks.Callback):
-    def __init__(self, interval_batches, row_autoencoder, db_path, num_samples=5):
-        super().__init__()
-        self.interval_batches = interval_batches
+class RowReconstructionLogger:
+    """Prints reconstructions for a single RowAutoencoder at intervals."""
+    def __init__(
+        self,
+        interval_steps: int,
+        row_autoencoder,
+        db_path: str,
+        num_samples: int = 5,
+        table_width: int = 40,
+    ):
+        self.interval_steps = max(1, int(interval_steps))
         self.row_autoencoder = row_autoencoder
         self.db_path = db_path
         self.num_samples = num_samples
+        self.w = table_width
 
         if not self.row_autoencoder.stats_accumulated:
             self.row_autoencoder.accumulate_stats()
 
-        all_rows = list(row_autoencoder.row_generator())
-        actual_num_samples = min(num_samples, len(all_rows))
-        if actual_num_samples > 0:
-            self.samples = random.sample(all_rows, actual_num_samples)
-        else:
-            self.samples = []
+        all_rows = list(self.row_autoencoder.row_generator())
+        n = min(num_samples, len(all_rows))
+        self.samples = random.sample(all_rows, n) if n > 0 else []
 
-    def _tensor_to_string(self, field, main_tensor: np.ndarray, flag_tensor: np.ndarray = None) -> str:
+    @torch.no_grad()
+    def _encode(self, row):
+        xs = [f.transform(row.get(f.name)) for f in self.row_autoencoder.fields]
+        xs = [x.unsqueeze(0).to(self.row_autoencoder.device) for x in xs]
+        z = self.row_autoencoder.encoder(xs)
+        return z.detach()
+
+    @torch.no_grad()
+    def _decode(self, z_tensor):
+        outs = self.row_autoencoder.decoder(z_tensor)
+        return [o.detach().cpu().numpy()[0] for o in outs]
+
+    def _tensor_to_string(self, field, main_tensor: np.ndarray) -> str:
         try:
             if isinstance(field, NumericDigitCategoryField):
-                if main_tensor.ndim == 3:
-                    return field.to_string(main_tensor)
                 arr = np.array(main_tensor)
-                return field.to_string(arr)
+                return field.to_string(arr if arr.ndim == 2 else arr.flatten())
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                if main_tensor.ndim >= 2 and main_tensor.shape[-1] == field.tokenizer.get_vocab_size():
-                    main_tensor = np.argmax(main_tensor, axis=-1)
-            if main_tensor.ndim > 1:
-                main_tensor = main_tensor.flatten()
-            if flag_tensor is not None:
-                if flag_tensor.ndim > 1:
-                    flag_tensor = flag_tensor.flatten()
-                if flag_tensor.size > 1:
-                    flag_tensor = flag_tensor[0:1]
-                elif flag_tensor.size == 0:
-                    flag_tensor = None
-            return field.to_string(main_tensor, flag_tensor)
+                return field.to_string(np.array(main_tensor))
+            arr = np.array(main_tensor)
+            if arr.ndim > 1:
+                arr = arr.flatten()
+            return field.to_string(arr)
         except Exception:
             return "[Conversion Error]"
 
-    def _top5_predictions(self, field, pred_vector: np.ndarray) -> str:
-        if not np.isclose(np.sum(pred_vector), 1.0, atol=1e-3):
-            exp_vec = np.exp(pred_vector - np.max(pred_vector))
-            probs = exp_vec / exp_vec.sum()
-        else:
-            probs = pred_vector
-        top_indices = np.argsort(probs)[::-1][:5]
-        top5_list = []
-        for i in top_indices:
-            if i < len(field.category_list):
-                cat = field.category_list[i]
-                top5_list.append(f"{cat}:{probs[i]:.2f}")
-        return ", ".join(top5_list)
-
-    def _digits_to_base_str(self, digits, base):
-        return "".join(str(int(d)) for d in digits)
-
-    def on_train_batch_end(self, batch, logs=None):
-        if not self.samples or (batch + 1) % self.interval_batches != 0:
+    def on_batch_end(self, global_step: int):
+        if not self.samples:
+            return
+        if (global_step + 1) % self.interval_steps != 0:
             return
 
-        print(f"\nBatch {batch + 1}: Reconstruction and Tokenization Demo Results")
+        print(f"\nBatch {global_step + 1}: Reconstruction Demo")
         for i, row_dict in enumerate(self.samples):
             print(f"\nSample {i + 1}:")
             table = PrettyTable()
             table.field_names = ["Field", "Original Value", "Reconstructed"]
             table.align = "l"
             for col in ["Original Value", "Reconstructed"]:
-                table.max_width[col] = 40
+                table.max_width[col] = self.w
 
-            input_tensors = {}
-            valid_field_indices = []
-            for field_idx, field in enumerate(self.row_autoencoder.fields):
-                try:
-                    input_tensors[field.name] = field.transform(row_dict.get(field.name))
-                    valid_field_indices.append(field_idx)
-                except Exception:
-                    input_tensors[field.name] = None
+            z = self._encode(row_dict)
+            preds = self._decode(z)
 
-            valid_fields = [self.row_autoencoder.fields[idx] for idx in valid_field_indices]
-            if not valid_fields:
-                print(f"Skipping sample {i+1} due to transformation errors for all fields.")
-                continue
-
-            inputs = [np.expand_dims(input_tensors[field.name], axis=0) for field in valid_fields]
-            try:
-                predictions = self.model.predict(inputs, verbose=0)
-                if not isinstance(predictions, list):
-                    predictions = [predictions]
-                if len(predictions) != len(valid_fields):
-                    print(f"Warning: Mismatch between number of predictions ({len(predictions)}) and valid input fields ({len(valid_fields)}) for sample {i+1}.")
-                    continue
-            except Exception as e:
-                print(f"Error during model prediction for sample {i+1}: {e}")
-                continue
-
-            prediction_map = {field.name: predictions[idx] for idx, field in enumerate(valid_fields)}
-
-            for field in self.row_autoencoder.fields:
+            for field, pred in zip(self.row_autoencoder.fields, preds):
                 field_name = field.name
                 original_raw = row_dict.get(field_name, "N/A")
                 original_str = ", ".join(map(str, original_raw)) if isinstance(original_raw, list) else str(original_raw)
-
-                reconstructed_str = "N/A"
-                if field_name in prediction_map:
-                    main_tensor = np.array(prediction_map[field_name][0])
-                    flag_tensor = None
-                    if field.optional:
-                        flag_tensor = np.array(prediction_map.get(f"{field.name}_flag_out", [np.array([])])[0])
-                    reconstructed_str = self._tensor_to_string(field, main_tensor, flag_tensor)
-                    if hasattr(field, "category_list") and field.category_list and not isinstance(field, NumericDigitCategoryField):
-                        top5_str = self._top5_predictions(field, main_tensor.flatten())
-                        reconstructed_str += f" ({top5_str})"
-                elif input_tensors[field_name] is None:
-                    reconstructed_str = "N/A (transform failed)"
-
+                reconstructed_str = self._tensor_to_string(field, pred)
                 table.add_row([field_name, original_str, reconstructed_str])
 
             print(table)
-
-
-
-class SequenceReconstructionCallback(tf.keras.callbacks.Callback):
-    """
-    Displays sequence reconstruction examples during training of MoviesToPeopleSequenceAutoencoder.
-    Samples a fixed set of movie→people sequences at init, then every `interval_batches` it runs
-    a single predict_on_batch and prints ground truth vs. reconstruction for each person.
-    """
-    def __init__(
-        self,
-        sequence_model_instance: 'MoviesToPeopleSequenceAutoencoder',
-        num_samples: int = 3,
-        interval_batches: int = 500
-    ):
-        super().__init__()
-        self.seq_model = sequence_model_instance
-        self.interval = interval_batches
-
-        # sample a few full rows
-        all_rows = list(islice(self.seq_model.row_generator(), 50000))
-        self.samples = random.sample(all_rows, min(num_samples, len(all_rows)))
-
-        self.movie_fields = self.seq_model.movie_autoencoder_instance.fields
-        self.people_fields = self.seq_model.people_autoencoder_instance.fields
-        self.seq_len = self.seq_model.people_sequence_length
-        self.batch_counter = 0
-
-    def _tensor_to_string(self, field, tensor: np.ndarray, flag: np.ndarray = None) -> str:
-        """
-        Convert raw model output for a single field at one time‐step into a string.
-        Special‐case numeric‐digit fields by argmaxing over the base dimension.
-        """
-        try:
-            arr = np.array(tensor)
-            # NumericDigitCategoryField outputs shape (positions, base)
-            if isinstance(field, NumericDigitCategoryField):
-                if arr.ndim == 2:
-                    # pick the most likely digit at each position
-                    arr = np.argmax(arr, axis=-1)
-                # now arr should be shape (positions,)
-                return field.to_string(arr)
-            
-            # TextField or one‐hot‐style: argmax over last dim if it matches vocab
-            if hasattr(field, "tokenizer") and field.tokenizer:
-                if arr.ndim >= 2 and arr.shape[-1] == field.tokenizer.get_vocab_size():
-                    arr = np.argmax(arr, axis=-1)
-            
-            # flatten anything left
-            if arr.ndim > 1:
-                arr = arr.flatten()
-            
-            return field.to_string(arr, flag)
-        except Exception as e:
-            logging.warning(f"Tensor→string error for {field.name}: {e}")
-            return "[Conversion Error]"
-
-    def on_train_batch_end(self, batch, logs=None):
-        self.batch_counter += 1
-        if self.batch_counter % self.interval != 0:
-            return
-
-        # fetch LR value
-        lr_tensor = self.model.optimizer.learning_rate
-        try:
-            lr_val = tf.keras.backend.get_value(lr_tensor)
-        except Exception:
-            lr_val = lr_tensor.numpy() if hasattr(lr_tensor, "numpy") else float(lr_tensor)
-        print(f"\n--- Sequence Reconstruction (batch {self.batch_counter}) LR={lr_val:.2e} ---")
-
-        # prepare one batch of movie inputs
-        batch_inputs = []
-        for f in self.movie_fields:
-            vals = [f.transform(row[f.name]) for row in self.samples]
-            batch_inputs.append(tf.stack(vals, axis=0))
-
-        # run predict_on_batch
-        try:
-            raw_preds = self.model.predict_on_batch(batch_inputs)
-        except Exception as e:
-            logging.error(f"Predict‐on‐batch failed: {e}", exc_info=True)
-            return
-
-        # map output names → numpy arrays
-        preds = {}
-        for name, arr in zip(self.model.output_names, raw_preds):
-            if tf.is_tensor(arr):
-                arr = arr.numpy()
-            preds[name] = np.array(arr)
-
-        # display each sample
-        for i, row in enumerate(self.samples):
-            # movie info
-            movie_tbl = PrettyTable(["Movie Field", "Value"])
-            for f in self.movie_fields:
-                v = row.get(f.name, "")
-                movie_tbl.add_row([f.name, ", ".join(v) if isinstance(v, list) else str(v)])
-            print(f"\nSample {i+1} Movie:")
-            print(movie_tbl)
-
-            # people reconstruction
-            people_tbl = PrettyTable(["Person #", "Field", "Ground Truth", "Reconstruction"])
-            for t in range(self.seq_len):
-                person = row["people"][t] if t < len(row["people"]) else {}
-                for f in self.people_fields:
-                    # ground truth
-                    gt = person.get(f.name, None)
-                    gt_str = ", ".join(gt) if isinstance(gt, list) else str(gt)
-
-                    # choose output keys
-                    main_key = f"{f.name}_main_out" if f.optional else f"{f.name}_out"
-                    flag_key = f"{f.name}_flag_out" if f.optional else None
-
-                    pm = preds.get(main_key)
-                    pf = preds.get(flag_key) if flag_key else None
-
-                    if pm is not None:
-                        pred_tensor = pm[i, t]
-                        flag_tensor = pf[i, t] if pf is not None else None
-                        rec_str = self._tensor_to_string(f, pred_tensor, flag_tensor)
-                    else:
-                        rec_str = "[no pred]"
-
-                    people_tbl.add_row([t+1, f.name, gt_str, rec_str])
-
-            print(people_tbl)
-
-        print("-" * 80)

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import sqlite3
 import numpy as np
 from typing import List, Tuple, Dict
@@ -40,7 +41,7 @@ class WeightedEdgeSampler:
         refresh_batches: int = 1_000,
         boost: float = 0.10,
     ):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.db_path = db_path
         self.mov = movie_ae
         self.per = person_ae
         self.bs = batch_size
@@ -55,8 +56,10 @@ class WeightedEdgeSampler:
         self.mov_cache: Dict[str, Dict] = {}
         self.per_cache: Dict[str, Dict] = {}
 
-        self.movie_cur = self.conn.cursor()
-        self.person_cur = self.conn.cursor()
+        self.conn = None
+        self.movie_cur = None
+        self.person_cur = None
+
         self.movie_sql = """
         SELECT primaryTitle,startYear,endYear,runtimeMinutes,
                averageRating,numVotes,
@@ -72,8 +75,23 @@ class WeightedEdgeSampler:
         self.weights = np.ones(len(self.edges), dtype=np.float32)
         self.alias = AliasSampler(self.weights / self.weights.sum())
         self.seen = 0
+        self._cache_misses = 0
+
+    def _ensure_conn(self):
+        if self.conn is not None:
+            return
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
+        self.conn.execute("PRAGMA journal_mode = WAL;")
+        self.conn.execute("PRAGMA synchronous = NORMAL;")
+        self.conn.execute("PRAGMA temp_store = MEMORY;")
+        self.conn.execute("PRAGMA cache_size = -200000;")
+        self.conn.execute("PRAGMA mmap_size = 268435456;")
+        self.conn.execute("PRAGMA busy_timeout = 5000;")
+        self.movie_cur = self.conn.cursor()
+        self.person_cur = self.conn.cursor()
 
     def __iter__(self):
+        self._ensure_conn()
         return self
 
     def __next__(self):
@@ -86,6 +104,7 @@ class WeightedEdgeSampler:
 
     def _get_tensors(self, idx: int):
         if self.movie_tensors[idx] is None:
+            self._cache_misses += 1
             eid, tconst, nconst = self.edges[idx]
             mr = self._movie_row(tconst)
             pr = self._person_row(nconst)
@@ -94,9 +113,10 @@ class WeightedEdgeSampler:
         return self.movie_tensors[idx], self.person_tensors[idx]
 
     def _load_edges(self) -> List[Tuple[int, str, str]]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
-        return cur.fetchall()
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT edgeId,tconst,nconst FROM edges;")
+            return cur.fetchall()
 
     def _movie_row(self, tconst: str):
         if tconst in self.mov_cache:

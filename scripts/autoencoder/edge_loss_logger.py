@@ -9,7 +9,8 @@ class EdgeLossLogger:
     _BULK_SIZE = 10_000
 
     def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
+        self._set_pragmas()
         self.cur = self.conn.cursor()
         self.cur.execute("DROP TABLE IF EXISTS edge_losses;")
         self.cur.execute(
@@ -23,6 +24,14 @@ class EdgeLossLogger:
         )
         self.conn.commit()
         self._cache: List[Tuple[int, float]] = []
+
+    def _set_pragmas(self):
+        self.conn.execute("PRAGMA journal_mode = WAL;")
+        self.conn.execute("PRAGMA synchronous = NORMAL;")
+        self.conn.execute("PRAGMA temp_store = MEMORY;")
+        self.conn.execute("PRAGMA cache_size = -200000;")
+        self.conn.execute("PRAGMA mmap_size = 268435456;")
+        self.conn.execute("PRAGMA busy_timeout = 5000;")
 
     def add(
         self,
