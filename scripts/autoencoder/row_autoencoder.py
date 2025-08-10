@@ -182,7 +182,6 @@ class RowAutoencoder:
             raise RuntimeError("Decoder not built")
         if not self.stats_accumulated:
             raise RuntimeError("Field stats must be finalized")
-
         z = torch.tensor(latent_vector, dtype=torch.float32, device=self.device)
         if z.dim() == 1:
             z = z.unsqueeze(0)
@@ -203,7 +202,6 @@ class RowAutoencoder:
     def build_autoencoder(self):
         if not self.stats_accumulated:
             raise RuntimeError("Call accumulate_stats()/finalize_stats() first")
-
         self.encoder = _FieldEncoders(self.fields, self.latent_dim).to(self.device)
         self.decoder = _FieldDecoders(self.fields, self.latent_dim).to(self.device)
 
@@ -212,7 +210,6 @@ class RowAutoencoder:
                 super().__init__()
                 self.enc = enc
                 self.dec = dec
-
             def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
                 z = self.enc(xs)
                 outs = self.dec(z)
@@ -234,6 +231,24 @@ class RowAutoencoder:
         torch.save(self.encoder.state_dict(), out / f"{name}_encoder.pt")
         torch.save(self.decoder.state_dict(), out / f"{name}_decoder.pt")
 
+    def load_model(self):
+        if not self.stats_accumulated:
+            self.accumulate_stats()
+            self.finalize_stats()
+        if self.model is None:
+            self.build_autoencoder()
+        name = self.__class__.__name__
+        enc_p = Path(self.model_dir) / f"{name}_encoder.pt"
+        dec_p = Path(self.model_dir) / f"{name}_decoder.pt"
+        if enc_p.exists():
+            self.encoder.load_state_dict(torch.load(enc_p, map_location=self.device))
+        if dec_p.exists():
+            self.decoder.load_state_dict(torch.load(dec_p, map_location=self.device))
+        self.model.eval()
+        self.encoder.eval()
+        self.decoder.eval()
+        return self
+
     def fit(self):
         if not self.stats_accumulated:
             self.accumulate_stats()
@@ -246,7 +261,6 @@ class RowAutoencoder:
         wd = float(self.config.get("weight_decay", 1e-4))
 
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-
         loader = self._make_loader()
 
         self.model.train()
@@ -256,20 +270,15 @@ class RowAutoencoder:
             for xs, ys in pbar:
                 xs = [x.to(self.device) for x in xs]
                 ys = [y.to(self.device) for y in ys]
-
                 outs = self.model(xs)
-
                 total = 0.0
                 for f, pred, tgt in zip(self.fields, outs, ys):
                     loss = f.compute_loss(pred, tgt) * float(f.weight)
                     total = total + loss
-
                 opt.zero_grad()
                 total.backward()
                 opt.step()
-
                 global_step += 1
                 pbar.set_postfix(loss=float(total.detach().cpu().item()))
-
             self.save_model()
         return None
