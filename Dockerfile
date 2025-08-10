@@ -25,4 +25,4 @@ WORKDIR /workspace
 COPY . .
 ENV PYTHONPATH=/workspace:/workspace/scripts
 
-ENTRYPOINT ["python","-m","scripts.train_imdb_sequence_decoder"]
+ENTRYPOINT ["python","-m","scripts.train_joint_autoencoder"]

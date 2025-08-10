@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
 from config import project_config
-from scripts.autoencoder.joint.loss_logger import EdgeLossLogger
+from scripts.autoencoder.joint.loss_loggers import EdgeLossLogger
 from scripts.autoencoder.row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint.dataset import make_edge_sampler
-from scripts.autoencoder.joint.logging import (
+from scripts.autoencoder.joint.loggin import (
     JointReconstructionLogger,
     RowReconstructionLogger,
 )
@@ -153,13 +153,14 @@ def main():
         weight_decay=float(project_config["weight_decay"]),
     )
     temperature = float(project_config.get("nce_temp", 0.07))
+    nce_w = float(project_config.get("nce_weight", 0.0))
     log_interval = int(project_config.get("log_interval", 20))
     save_interval = int(project_config.get("save_interval", 10000))
     flush_interval = int(project_config.get("flush_interval", 2000))
 
     writer = None
     if SummaryWriter is not None:
-        tb_root = project_config.get("tensorboard_dir", "runs")
+        tb_root = project_config.get("tensorboard_dir", "logs")
         run_dir = _unique_log_dir(tb_root, "joint_autoencoder")
         writer = SummaryWriter(log_dir=run_dir)
         logging.info(f"tensorboard logdir: {run_dir}")
@@ -228,7 +229,7 @@ def main():
             rec_loss = rec_loss + f.compute_loss(pred, tgt) * float(f.weight)
 
         nce = info_nce_loss(m_z, p_z, temperature=temperature)
-        total = rec_loss + 0.0 * nce
+        total = rec_loss + nce_w * nce
 
         opt.zero_grad()
         total.backward()

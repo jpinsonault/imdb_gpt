@@ -35,6 +35,34 @@ class _SeqResidual(nn.Module):
         x = F.gelu(x + r)
         return x
 
+def _reshape_seq(t: torch.Tensor, B: int, T: int) -> torch.Tensor:
+    if t.dim() == 2:
+        return t.view(B, T, -1)
+    if t.dim() == 3:
+        C = t.size(1)
+        return t.view(B, T, C, -1)
+    if t.dim() == 4:
+        return t.view(B, T, t.size(1), t.size(2), t.size(3))
+    return t
+
+def _merge_bt(x: torch.Tensor, B: int, T: int) -> torch.Tensor:
+    s = list(x.shape)
+    s[0] = B * T
+    s.pop(1)
+    return x.contiguous().view(*s)
+
+def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = F.normalize(a, dim=-1)
+    b = F.normalize(b, dim=-1)
+    return a @ b.t()
+
+def _info_nce(a: torch.Tensor, b: torch.Tensor, temperature: float) -> torch.Tensor:
+    logits = _cosine_sim(a, b) / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
+    la = F.cross_entropy(logits, labels)
+    lb = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (la + lb)
+
 class MoviesToPeopleSequenceDecoder(nn.Module):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
@@ -61,6 +89,8 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
             p.requires_grad = False
         for p in self.people_ae.decoder.parameters():
             p.requires_grad = False
+        for p in self.people_ae.encoder.parameters():
+            p.requires_grad = False
 
         width = self.latent_dim * 2
         self.project_up = nn.Conv1d(self.latent_dim, width, 1)
@@ -77,7 +107,7 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
         self.to(self.device)
         self.train()
 
-    def forward(self, movie_inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, movie_inputs: List[torch.Tensor]):
         z = self.movie_ae.encoder([x for x in movie_inputs])
         z = z.unsqueeze(1).expand(-1, self.seq_len, -1)
         x = z.transpose(1, 2)
@@ -92,9 +122,30 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
         for i in self.active_idx:
             o = self.people_ae.decoder.decs[i](flat)
             outs.append(_reshape_seq(o, B, T))
-        return outs
+        return outs, z_seq
 
-    def compute_loss(self, preds: List[torch.Tensor], targets: List[torch.Tensor]) -> torch.Tensor:
+    def _encode_people_targets(self, targets: List[torch.Tensor], B: int, T: int) -> torch.Tensor:
+        full = []
+        idx_map = {i: k for k, i in enumerate(self.active_idx)}
+        for i, f in enumerate(self.people_ae.fields):
+            if i in idx_map:
+                k = idx_map[i]
+                t = targets[k]
+                x = _merge_bt(t, B, T)
+                full.append(x.to(self.device, non_blocking=True))
+            else:
+                base = f.get_base_padding_value().to(self.device)
+                if base.dim() == 0:
+                    base = base.view(1, 1)
+                if base.dim() == 1:
+                    base = base.unsqueeze(0)
+                rep = base.expand(B * T, *base.shape[1:])
+                full.append(rep)
+        with torch.no_grad():
+            z_true = self.people_ae.encoder(full)
+        return z_true.view(B, T, -1)
+
+    def compute_loss(self, preds: List[torch.Tensor], targets: List[torch.Tensor], z_seq: torch.Tensor) -> torch.Tensor:
         total = 0.0
         for idx, pred in zip(self.active_idx, preds):
             f = self.people_ae.fields[idx]
@@ -103,6 +154,15 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
             p = _merge_bt(pred, B, T)
             y = _merge_bt(tgt, B, T)
             total = total + f.compute_loss(p, y) * float(f.weight)
+        B, T, D = z_seq.shape
+        z_true = self._encode_people_targets(targets, B, T)
+        llw = float(self.config.get("latent_loss_weight", 0.0))
+        clw = float(self.config.get("contrastive_loss_weight", 0.0))
+        if llw > 0.0:
+            total = total + llw * F.mse_loss(z_seq.view(B * T, D), z_true.view(B * T, D))
+        if clw > 0.0:
+            temp = float(self.config.get("nce_temp", 0.07))
+            total = total + clw * _info_nce(z_seq.view(B * T, D), z_true.view(B * T, D), temperature=temp)
         return total
 
     def _row_gen(self):
@@ -140,11 +200,11 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
             weight_decay=float(self.config.get("weight_decay", 1e-4)),
         )
         epochs = int(self.config.get("epochs", 10))
-        scaler = GradScaler('cuda', enabled=(self.device.type == "cuda"))
+        scaler = GradScaler(enabled=(self.device.type == "cuda"))
 
         writer = None
         if SummaryWriter is not None:
-            root = self.config.get("tensorboard_dir", "runs")
+            root = self.config["tensorboard_dir"]
             ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
             logdir = Path(root) / f"seq_decoder_{ts}"
             writer = SummaryWriter(log_dir=str(logdir))
@@ -166,8 +226,8 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
                 M = [m.to(self.device, non_blocking=True) for m in M]
                 P = [p.to(self.device, non_blocking=True) for p in P]
                 with autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
-                    preds = self.forward(M)
-                    loss = self.compute_loss(preds, P)
+                    preds, z_seq = self.forward(M)
+                    loss = self.compute_loss(preds, P, z_seq)
                 opt.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(opt)
@@ -195,19 +255,3 @@ class MoviesToPeopleSequenceDecoder(nn.Module):
             self.load_state_dict(torch.load(p, map_location=self.device))
             self.eval()
         return self
-
-def _reshape_seq(t: torch.Tensor, B: int, T: int) -> torch.Tensor:
-    if t.dim() == 2:
-        return t.view(B, T, -1)
-    if t.dim() == 3:
-        C = t.size(1)
-        return t.view(B, T, C, -1)
-    if t.dim() == 4:
-        return t.view(B, T, t.size(1), t.size(2), t.size(3))
-    return t
-
-def _merge_bt(x: torch.Tensor, B: int, T: int) -> torch.Tensor:
-    s = list(x.shape)
-    s[0] = B * T
-    s.pop(1)
-    return x.contiguous().view(*s)
