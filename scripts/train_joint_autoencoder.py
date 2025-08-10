@@ -9,15 +9,14 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
 from config import project_config
-from scripts.autoencoder.edge_loss_logger import EdgeLossLogger
-from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
-from scripts.autoencoder.training_callbacks import (
+from scripts.autoencoder.joint.loss_logger import EdgeLossLogger
+from scripts.autoencoder.row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
+from scripts.autoencoder.joint.dataset import make_edge_sampler
+from scripts.autoencoder.joint.logging import (
     JointReconstructionLogger,
     RowReconstructionLogger,
 )
@@ -29,12 +28,10 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     a = F.normalize(a, dim=-1)
     b = F.normalize(b, dim=-1)
     return a @ b.t()
-
 
 def info_nce_loss(movie_z: torch.Tensor, person_z: torch.Tensor, temperature: float) -> torch.Tensor:
     logits = cosine_similarity(movie_z, person_z) / temperature
@@ -43,9 +40,8 @@ def info_nce_loss(movie_z: torch.Tensor, person_z: torch.Tensor, temperature: fl
     lb = F.cross_entropy(logits.t(), labels)
     return 0.5 * (la + lb)
 
-
 class _EdgeIterable(IterableDataset):
-    def __init__(self, sampler, mov_ae: TitlesAutoencoder, per_ae: PeopleAutoencoder):
+    def __init__(self, sampler, mov_ae, per_ae):
         super().__init__()
         self.sampler = sampler
         self.mov_fields = mov_ae.fields
@@ -54,7 +50,6 @@ class _EdgeIterable(IterableDataset):
     def __iter__(self):
         for m_t, p_t, eid in self.sampler:
             yield m_t, p_t, eid
-
 
 def _collate_edge(batch):
     ms, ps, eids = zip(*batch)
@@ -65,30 +60,32 @@ def _collate_edge(batch):
     e = torch.tensor(eids, dtype=torch.long)
     return M, P, e
 
+def _fmt(x: float) -> str:
+    if x >= 1e6:
+        return f"{x/1e6:.2f}M"
+    if x >= 1e3:
+        return f"{x/1e3:.2f}k"
+    return f"{x:.2f}"
 
-class JointAutoencoder(nn.Module):
-    def __init__(self, movie_ae: TitlesAutoencoder, person_ae: PeopleAutoencoder):
-        super().__init__()
-        self.movie_ae = movie_ae
-        self.person_ae = person_ae
-        self.mov_enc = movie_ae.encoder
-        self.per_enc = person_ae.encoder
-        self.mov_dec = movie_ae.decoder
-        self.per_dec = person_ae.decoder
-
-    def forward(self, movie_in: List[torch.Tensor], person_in: List[torch.Tensor]):
-        m_z = self.mov_enc(movie_in)
-        p_z = self.per_enc(person_in)
-        m_rec = self.mov_dec(m_z)
-        p_rec = self.per_dec(p_z)
-        return m_z, p_z, m_rec, p_rec
-
+def _unique_log_dir(root: str, base: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    name = f"{base}_{ts}"
+    path = os.path.join(root, name)
+    if not os.path.exists(path):
+        return path
+    i = 1
+    while True:
+        cand = f"{path}_{i}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
 
 def build_joint_trainer(
     config: Dict[str, Any],
     warm: bool,
     db_path: Path,
-) -> Tuple[JointAutoencoder, DataLoader, EdgeLossLogger, TitlesAutoencoder, PeopleAutoencoder, int]:
+):
+    from scripts.autoencoder.joint.model import JointAutoencoder
 
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
@@ -138,29 +135,6 @@ def build_joint_trainer(
     total_edges = len(edge_gen.edges)
     logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config['batch_size']} workers={num_workers}")
     return joint, loader, loss_logger, movie_ae, people_ae, total_edges
-
-
-def _fmt(x: float) -> str:
-    if x >= 1e6:
-        return f"{x/1e6:.2f}M"
-    if x >= 1e3:
-        return f"{x/1e3:.2f}k"
-    return f"{x:.2f}"
-
-
-def _unique_log_dir(root: str, base: str) -> str:
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-    name = f"{base}_{ts}"
-    path = os.path.join(root, name)
-    if not os.path.exists(path):
-        return path
-    i = 1
-    while True:
-        cand = f"{path}_{i}"
-        if not os.path.exists(cand):
-            return cand
-        i += 1
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train movie↔people joint embedding autoencoder")
@@ -294,10 +268,10 @@ def main():
         RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
         RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
 
-        if (global_step + 1) % flush_interval == 0:
+        if (global_step + 1) % int(project_config.get("flush_interval", 2000)) == 0:
             logger.flush()
 
-        if (global_step + 1) % save_interval == 0:
+        if (global_step + 1) % int(project_config.get("save_interval", 10000)) == 0:
             mov_ae.save_model()
             per_ae.save_model()
             logging.info(f"checkpoint saved at step {global_step+1}")
@@ -316,7 +290,6 @@ def main():
     if writer is not None:
         writer.flush()
         writer.close()
-
 
 if __name__ == "__main__":
     main()
