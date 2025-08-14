@@ -24,6 +24,11 @@ from scripts.autoencoder.joint.reconstruction_logger import JointReconstructionL
 from scripts.autoencoder.row_ae.reconstruction_logger import RowReconstructionLogger
 
 try:
+    from scripts.autoencoder.joint.memstore_backend import make_memmap_edge_sampler
+except Exception:
+    make_memmap_edge_sampler = None
+
+try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
@@ -77,7 +82,7 @@ class _AliasUpdater(threading.Thread):
         super().__init__(daemon=True)
         self.shared_state = shared_state
         self.q: "queue.Queue[np.ndarray]" = queue.Queue()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def submit(self, weights: np.ndarray):
         try:
@@ -88,10 +93,10 @@ class _AliasUpdater(threading.Thread):
         self.q.put(weights, block=False)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 w = self.q.get(timeout=0.1)
             except queue.Empty:
@@ -100,6 +105,7 @@ class _AliasUpdater(threading.Thread):
                 self.shared_state.update_alias(w)
             except Exception:
                 pass
+
 
 
 class JointTrainer:
@@ -224,6 +230,8 @@ class JointTrainer:
         logging.info("interrupt received; will finish current step and save")
 
     def _build_eid_to_idx(self) -> np.ndarray:
+        if not hasattr(self.edge_sampler, "edges"):
+            return np.arange(self.total_edges, dtype=np.int64)
         if not self.edge_sampler.edges:
             return np.zeros((0,), dtype=np.int64)
         max_eid = max(e for e, _, _ in self.edge_sampler.edges)
@@ -259,17 +267,36 @@ class JointTrainer:
 
         s2 = time.perf_counter()
         logging.info("init: creating edge sampler…")
+
+        backend = str(self.config.get("dataset_backend", "memmap"))
+        data_root = Path(self.config.get("data_dir", "./data"))
+        memstore_dir = Path(self.config.get("memstore_dir", str(data_root / "memstore")))
+
         self.shared_state = None
-        tmp_sampler = make_edge_sampler(
-            db_path=str(self.db_path),
-            movie_ae=self.movie_ae,
-            person_ae=self.people_ae,
-            batch_size=int(self.config["batch_size"]),
-            boost=float(self.config["edge_sampler"]["weak_edge_boost"]),
-            shared_state=self.shared_state,
-        )
-        self.shared_state = tmp_sampler.state
-        self.edge_sampler = tmp_sampler
+        sampler = None
+        if backend == "memmap" and make_memmap_edge_sampler is not None and (memstore_dir / "manifest.json").exists():
+            sampler = make_memmap_edge_sampler(
+                memstore_dir=str(memstore_dir),
+                movie_ae=self.movie_ae,
+                person_ae=self.people_ae,
+                batch_size=int(self.config["batch_size"]),
+                boost=float(self.config["edge_sampler"]["weak_edge_boost"]),
+                shared_state=self.shared_state,
+            )
+            logging.info(f"init: using memmap backend at {memstore_dir}")
+        else:
+            sampler = make_edge_sampler(
+                db_path=str(self.db_path),
+                movie_ae=self.movie_ae,
+                person_ae=self.people_ae,
+                batch_size=int(self.config["batch_size"]),
+                boost=float(self.config["edge_sampler"]["weak_edge_boost"]),
+                shared_state=self.shared_state,
+            )
+            logging.info("init: using sqlite backend")
+
+        self.shared_state = sampler.state
+        self.edge_sampler = sampler
         logging.info(f"init: edge sampler ready in {time.perf_counter() - s2:.2f}s")
 
         num_workers = int(self.config.get("num_workers", 4))
@@ -290,9 +317,18 @@ class JointTrainer:
         logging.info(f"init: DataLoader ready in {time.perf_counter() - s3:.2f}s")
 
         self.joint_model = JointAutoencoder(self.movie_ae, self.people_ae).to(self.device)
-        self.total_edges = len(self.edge_sampler.edges)
+
+        if hasattr(self.edge_sampler, "num_edges"):
+            self.total_edges = int(self.edge_sampler.num_edges)
+        else:
+            self.total_edges = len(self.edge_sampler.edges)
+
         self.edge_stats = _InMemoryEdgeStats(self.total_edges)
-        self._eid_to_idx = self._build_eid_to_idx()
+
+        if hasattr(self.edge_sampler, "eids_are_contiguous") and getattr(self.edge_sampler, "eids_are_contiguous"):
+            self._eid_to_idx = np.arange(self.total_edges, dtype=np.int64)
+        else:
+            self._eid_to_idx = self._build_eid_to_idx()
 
         self._alias_updater = _AliasUpdater(self.shared_state)
         self._alias_updater.start()

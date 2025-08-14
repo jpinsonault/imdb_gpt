@@ -2,7 +2,7 @@ from itertools import islice
 import numpy as np
 import torch
 from prettytable import PrettyTable
-from autoencoder.fields import NumericDigitCategoryField
+from ..fields import NumericDigitCategoryField
 
 def _to_str(field, arr):
     a = np.asarray(arr)

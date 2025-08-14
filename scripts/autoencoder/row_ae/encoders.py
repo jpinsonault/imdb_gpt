@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
-from autoencoder.fields import BaseField
+from ..fields import BaseField
 
 def _out_dim(m: nn.Module) -> int:
     for p in reversed(list(m.parameters())):

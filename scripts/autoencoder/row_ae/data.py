@@ -2,7 +2,7 @@ from typing import List, Tuple, Iterator, Dict
 import torch
 from torch.utils.data import IterableDataset
 
-from autoencoder.fields import BaseField
+from ..fields import BaseField
 
 class _RowDataset(IterableDataset):
     def __init__(self, row_gen_fn, fields: List[BaseField]):

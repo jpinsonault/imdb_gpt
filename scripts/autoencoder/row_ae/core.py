@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from autoencoder.fields import BaseField
+from ..fields import BaseField
 from .encoders import _FieldEncoders, _FieldDecoders
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
