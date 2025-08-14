@@ -1,3 +1,5 @@
+# scripts/autoencoder/joint/memstore_backend.py
+
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -36,6 +38,8 @@ class MemStore:
 
         self.movie_specs = list(movies_meta["fields"])
         self.person_specs = list(people_meta["fields"])
+        self.movie_names = [spec["name"] for spec in self.movie_specs]
+        self.person_names = [spec["name"] for spec in self.person_specs]
 
         self._movie_mm: Dict[str, np.memmap] = {}
         self._person_mm: Dict[str, np.memmap] = {}
@@ -81,10 +85,18 @@ class MemStore:
             out.append(_to_tensor(arr))
         return out
 
+    def get_movie_names(self) -> List[str]:
+        return list(self.movie_names)
+
+    def get_person_names(self) -> List[str]:
+        return list(self.person_names)
+
 class MemmapEdgeSampler:
     def __init__(
         self,
         store: MemStore,
+        movie_ae,
+        person_ae,
         batch_size: int,
         boost: float = 0.10,
         shared_state: Optional[SharedSamplerState] = None,
@@ -98,6 +110,25 @@ class MemmapEdgeSampler:
             self.state = SharedSamplerState(self.num_edges, init)
         else:
             self.state = shared_state
+
+        self._movie_order = None
+        self._person_order = None
+
+        try:
+            store_m = self.store.get_movie_names()
+            want_m = [f.name for f in getattr(movie_ae, "fields", [])]
+            m_pos = {n: i for i, n in enumerate(store_m)}
+            self._movie_order = [m_pos[n] for n in want_m]
+        except Exception as e:
+            self._movie_order = None
+
+        try:
+            store_p = self.store.get_person_names()
+            want_p = [f.name for f in getattr(person_ae, "fields", [])]
+            p_pos = {n: i for i, n in enumerate(store_p)}
+            self._person_order = [p_pos[n] for n in want_p]
+        except Exception as e:
+            self._person_order = None
 
     def sample_indices(self, k: int) -> np.ndarray:
         p, a = self.state.arrays()
@@ -118,6 +149,12 @@ class MemmapEdgeSampler:
         pi = self.store.edges_person_idx[idxs].astype(np.int64, copy=False)
         M = self.store.gather_movies(mi)
         P = self.store.gather_people(pi)
+
+        if self._movie_order is not None:
+            M = [M[i] for i in self._movie_order]
+        if self._person_order is not None:
+            P = [P[i] for i in self._person_order]
+
         e = torch.from_numpy(idxs.astype(np.int64, copy=False))
         return M, P, e
 
@@ -133,6 +170,8 @@ def make_memmap_edge_sampler(
     store = MemStore(memstore_dir, device)
     return MemmapEdgeSampler(
         store=store,
+        movie_ae=movie_ae,
+        person_ae=person_ae,
         batch_size=batch_size,
         boost=boost,
         shared_state=shared_state,

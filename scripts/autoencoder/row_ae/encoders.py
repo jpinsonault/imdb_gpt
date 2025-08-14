@@ -22,6 +22,8 @@ class _FieldEncoders(nn.Module):
     def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
         outs = []
         for x, enc, proj in zip(xs, self.encs, self.proj):
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
             y = enc(x)
             if y.dim() > 2:
                 y = y.flatten(1)
@@ -31,6 +33,7 @@ class _FieldEncoders(nn.Module):
         attn_out, _ = self.fuse(tokens, tokens, tokens)
         z = self.norm(attn_out.mean(dim=1))
         return z
+
 
 class _FieldDecoders(nn.Module):
     def __init__(self, fields: List[BaseField], latent_dim: int):

@@ -812,9 +812,11 @@ class _TextEncoder(nn.Module):
         self.out = nn.Linear((max_len // 2) * (ch * 2), latent_dim)
 
     def forward(self, x):
-        x = self.emb(x)          # B,L,C
-        x = x.transpose(1, 2)    # B,C,L
-        x = F.gelu(self.conv(x)) # B,2C,L/2
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        x = self.emb(x)
+        x = x.transpose(1, 2)
+        x = F.gelu(self.conv(x))
         x = x.flatten(1)
         return self.out(x)
 

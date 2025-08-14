@@ -34,6 +34,76 @@ except Exception:
     SummaryWriter = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+import json, os, shutil, time
+from pathlib import Path
+
+def _field_specs_from_ae(ae):
+    # name -> shape (list)
+    return {f.name: list(getattr(f, "input_shape", ())) for f in ae.fields}
+
+def _memmap_is_compatible(manifest_path: Path, movie_ae, people_ae) -> bool:
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+        m_specs = {s["name"]: list(s["shape"]) for s in man["movies"]["fields"]}
+        p_specs = {s["name"]: list(s["shape"]) for s in man["people"]["fields"]}
+        m_need = _field_specs_from_ae(movie_ae)
+        p_need = _field_specs_from_ae(people_ae)
+        return m_specs == m_need and p_specs == p_need
+    except Exception:
+        return False
+
+def _autobuild_memstore(db_path: Path, memstore_dir: Path, cfg: dict, lock_timeout_sec: int = 600):
+    """
+    Build memstore into a temp dir and atomically swap it in.
+    Uses a simple lock dir to avoid concurrent rebuilds.
+    """
+    from scripts.autoencoder.joint.build_memstore import build_memstore  # your existing builder
+
+    memstore_dir = Path(memstore_dir)
+    memstore_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir = memstore_dir.parent / (memstore_dir.name + ".lock")
+    tmp_dir  = memstore_dir.parent / (memstore_dir.name + ".new")
+
+    # Acquire lock (atomic mkdir)
+    t0 = time.time()
+    while True:
+        try:
+            os.makedirs(lock_dir, exist_ok=False)
+            break
+        except FileExistsError:
+            if time.time() - t0 > lock_timeout_sec:
+                raise RuntimeError(f"memstore rebuild lock held too long: {lock_dir}")
+            time.sleep(1.0)
+
+    try:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Important: builder must use same AE config so shapes match
+        build_memstore(db_path=str(db_path), out_dir=str(tmp_dir))
+
+        # Sanity check: ensure manifest exists
+        man = tmp_dir / "manifest.json"
+        if not man.exists():
+            raise RuntimeError("memstore builder did not create manifest.json")
+
+        # Atomic swap
+        backup = memstore_dir.parent / (memstore_dir.name + ".bak")
+        if backup.exists():
+            shutil.rmtree(backup)
+        if memstore_dir.exists():
+            memstore_dir.rename(backup)
+        tmp_dir.rename(memstore_dir)
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        # Release lock
+        try:
+            shutil.rmtree(lock_dir)
+        except Exception:
+            pass
 
 
 class _BatchEdgeIterable(IterableDataset):
@@ -271,10 +341,32 @@ class JointTrainer:
         backend = str(self.config.get("dataset_backend", "memmap"))
         data_root = Path(self.config.get("data_dir", "./data"))
         memstore_dir = Path(self.config.get("memstore_dir", str(data_root / "memstore")))
+        policy = str(self.config.get("memstore_policy", "rebuild")).lower()
 
-        self.shared_state = None
-        sampler = None
-        if backend == "memmap" and make_memmap_edge_sampler is not None and (memstore_dir / "manifest.json").exists():
+        use_memmap = backend == "memmap"
+        man_path = memstore_dir / "manifest.json"
+
+        if use_memmap:
+            ok = man_path.exists() and _memmap_is_compatible(man_path, self.movie_ae, self.people_ae)
+            if not ok:
+                if policy == "rebuild":
+                    logging.info("memstore mismatch → rebuilding…")
+                    _autobuild_memstore(self.db_path, memstore_dir, self.config)
+                    ok = (memstore_dir / "manifest.json").exists() and _memmap_is_compatible(
+                        memstore_dir / "manifest.json", self.movie_ae, self.people_ae
+                    )
+                    if not ok:
+                        raise RuntimeError("memstore rebuild completed but manifest still incompatible")
+                elif policy == "sqlite":
+                    logging.info("memstore mismatch → falling back to sqlite backend")
+                    use_memmap = False
+                else:  # "error"
+                    raise RuntimeError(
+                        "Memstore manifest does not match current autoencoder field specs. "
+                        "Set memstore_policy to 'rebuild' to auto-regenerate, or 'sqlite' to fall back."
+                    )
+
+        if use_memmap:
             sampler = make_memmap_edge_sampler(
                 memstore_dir=str(memstore_dir),
                 movie_ae=self.movie_ae,
@@ -294,6 +386,7 @@ class JointTrainer:
                 shared_state=self.shared_state,
             )
             logging.info("init: using sqlite backend")
+
 
         self.shared_state = sampler.state
         self.edge_sampler = sampler
@@ -340,13 +433,15 @@ class JointTrainer:
         t0 = time.perf_counter()
         data_iter = iter(self.loader)
         try:
-            warm_M, warm_P, warm_eids = next(data_iter)
+            warm_batch = next(data_iter)
+            warm_M, warm_P, warm_eids = self._ensure_triplet(warm_batch)
             dt = time.perf_counter() - t0
             logging.info(f"init: first batch fetched in {dt:.2f}s (batch_size={self.config['batch_size']})")
             return data_iter, (warm_M, warm_P, warm_eids)
         except StopIteration:
             logging.error("init: DataLoader produced no data")
             return iter([]), None
+
 
     def _train_one_step(
         self,
@@ -412,15 +507,16 @@ class JointTrainer:
         while global_step < max_steps:
             t_fetch0 = time.perf_counter()
             if pending_batch is not None:
-                M, P, eids = pending_batch
+                M, P, eids = self._ensure_triplet(pending_batch)
                 pending_batch = None
                 data_time = time.perf_counter() - t_fetch0
             else:
                 try:
-                    M, P, eids = next(data_iter)
+                    b = next(data_iter)
                 except StopIteration:
                     data_iter = iter(self.loader)
-                    M, P, eids = next(data_iter)
+                    b = next(data_iter)
+                M, P, eids = self._ensure_triplet(b)
                 data_time = time.perf_counter() - t_fetch0
 
             M = [m.to(self.device, non_blocking=True) for m in M]
@@ -502,6 +598,22 @@ class JointTrainer:
         if self.writer is not None:
             self.writer.flush()
             self.writer.close()
+
+    def _ensure_triplet(self, batch):
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 3:
+                return batch[0], batch[1], batch[2]
+            if len(batch) == 2:
+                M, P = batch
+                bsz = 0
+                if isinstance(M, (list, tuple)) and len(M) > 0:
+                    x0 = M[0]
+                    if hasattr(x0, "size"):
+                        bsz = int(x0.size(0))
+                eids = torch.arange(bsz, dtype=torch.long)
+                return M, P, eids
+        raise ValueError("unexpected batch format from DataLoader")
+
 
 
 def build_joint_trainer(config: Dict[str, Any], warm: bool, db_path: Path):

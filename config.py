@@ -38,4 +38,10 @@ project_config = {
 
     'num_workers': 8,
     'prefetch_factor': 1,
+
+    "dataset_backend": "memmap",
+    "data_dir": "data",
+    "memstore_dir": "data/memstore",
+    "memstore_policy": "rebuild"
+
 }
