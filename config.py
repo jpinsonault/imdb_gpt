@@ -7,7 +7,7 @@ project_config = {
     'docker_data_dir_mount': '/app/imdb',
 
     'latent_dim': 256,
-    'batch_size': 64,
+    'batch_size': 512,
     'learning_rate': 0.0005,
     'weight_decay': 1e-4,
 
@@ -31,12 +31,12 @@ project_config = {
     'tensorboard_dir': 'logs',
 
     'log_interval': 20,
-    'recon_log_interval': 20,
-    'row_recon_interval': 28,
+    'recon_log_interval': 100,
+    'row_recon_interval': 100,
     'row_recon_samples': 3,
     'save_interval': 10000,
     'flush_interval': 2000,
 
-    'num_workers': 6,
-    'prefetch_factor': 6,
+    'num_workers': 12,
+    'prefetch_factor': 2,
 }

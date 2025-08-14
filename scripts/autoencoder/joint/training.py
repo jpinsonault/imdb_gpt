@@ -1,5 +1,3 @@
-# scripts/autoencoder/joint/training.py
-
 from __future__ import annotations
 import argparse
 import logging
@@ -7,6 +5,7 @@ import os
 import signal
 import time
 import datetime
+import sqlite3
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -51,6 +50,44 @@ def _collate_edge(batch):
     P = [torch.stack(col, dim=0) for col in p_cols]
     e = torch.tensor(eids, dtype=torch.long)
     return M, P, e
+
+
+def _ensure_meta_table(db_path: Path):
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS edge_sampler_meta (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            version INTEGER NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO edge_sampler_meta(id,version,updated_at)
+        VALUES(1,0,strftime('%s','now'))
+        ON CONFLICT(id) DO NOTHING;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _bump_sampler_version(db_path: Path):
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE edge_sampler_meta
+        SET version = version + 1,
+            updated_at = strftime('%s','now')
+        WHERE id = 1;
+        """
+    )
+    conn.commit()
+    conn.close()
 
 
 class JointTrainer:
@@ -228,6 +265,9 @@ class JointTrainer:
 
         self.joint_model = JointAutoencoder(self.movie_ae, self.people_ae).to(self.device)
         self.total_edges = len(self.edge_sampler.edges)
+
+        _ensure_meta_table(self.db_path)
+
         logging.info(f"init: joint trainer ready device={self.device} edges={self.total_edges} bs={self.config['batch_size']} workers={num_workers} in {time.perf_counter() - t0:.2f}s")
 
     def _warm_first_batch(self):
@@ -362,6 +402,7 @@ class JointTrainer:
 
             if (global_step + 1) % flush_interval == 0:
                 self.loss_logger.flush()
+                _bump_sampler_version(self.db_path)
 
             if (global_step + 1) % save_interval == 0:
                 self.movie_ae.save_model()
@@ -378,6 +419,8 @@ class JointTrainer:
                 break
 
         self.loss_logger.flush()
+        _bump_sampler_version(self.db_path)
+
         self.movie_ae.save_model()
         self.people_ae.save_model()
         out = Path(self.config["model_dir"])

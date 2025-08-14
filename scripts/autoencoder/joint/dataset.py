@@ -44,7 +44,6 @@ class WeightedEdgeSampler:
         self.mov = movie_ae
         self.per = person_ae
         self.bs = batch_size
-        self.refresh_edges = max(1, refresh_batches) * batch_size
         self.boost = boost
 
         self.edges = self._load_edges()
@@ -58,6 +57,7 @@ class WeightedEdgeSampler:
         self.conn = None
         self.movie_cur = None
         self.person_cur = None
+        self.meta_cur = None
 
         self.movie_sql = """
         SELECT primaryTitle,startYear,endYear,runtimeMinutes,
@@ -73,9 +73,9 @@ class WeightedEdgeSampler:
 
         self.weights = np.ones(len(self.edges), dtype=np.float32)
         self.alias = AliasSampler(self.weights / self.weights.sum())
-        self.seen = 0
-        self._cache_misses = 0
         self._first_refresh_logged = False
+
+        self._last_version = -1
 
     def _ensure_conn(self):
         if self.conn is not None:
@@ -90,19 +90,49 @@ class WeightedEdgeSampler:
         self.conn.execute("PRAGMA busy_timeout = 5000;")
         self.movie_cur = self.conn.cursor()
         self.person_cur = self.conn.cursor()
+        self.meta_cur = self.conn.cursor()
+        self._ensure_meta_table()
         logging.info(f"edge sampler: DB connection ready in {time.perf_counter() - t0:.2f}s")
+
+    def _ensure_meta_table(self):
+        self.meta_cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS edge_sampler_meta (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                version INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            """
+        )
+        self.meta_cur.execute(
+            """
+            INSERT INTO edge_sampler_meta(id,version,updated_at)
+            VALUES(1,0,strftime('%s','now'))
+            ON CONFLICT(id) DO NOTHING;
+            """
+        )
+        self.conn.commit()
+
+    def _read_meta_version(self) -> int:
+        r = self.meta_cur.execute("SELECT version FROM edge_sampler_meta WHERE id=1;").fetchone()
+        return int(r[0]) if r else 0
 
     def __iter__(self):
         self._ensure_conn()
+        self._maybe_refresh(initial=True)
         return self
 
     def __next__(self):
-        if self.seen % self.refresh_edges == 0:
-            self._refresh_weights()
+        self._maybe_refresh(initial=False)
         idx = self.alias.draw(1)[0]
-        self.seen += 1
         movie_t, person_t = self._get_tensors(idx)
         return movie_t, person_t, self.edges[idx][0]
+
+    def _maybe_refresh(self, initial: bool):
+        v = self._read_meta_version()
+        if initial or v != self._last_version:
+            self._refresh_weights()
+            self._last_version = v
 
     def _get_tensors(self, idx: int):
         if self.movie_tensors[idx] is None:
@@ -186,7 +216,7 @@ class WeightedEdgeSampler:
         dt = time.perf_counter() - t0
         if not self._first_refresh_logged:
             self._first_refresh_logged = True
-            logging.info(f"edge sampler: initial weight refresh using {len(recorded)} records in {dt:.2f}s")
+            logging.info(f"edge sampler: initial/global weight refresh using {len(recorded)} records in {dt:.2f}s")
 
 def make_edge_sampler(
     db_path: str,
