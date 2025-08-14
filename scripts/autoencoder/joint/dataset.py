@@ -5,6 +5,7 @@ import logging
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from multiprocessing import shared_memory
+import torch
 
 class _Alias:
     @staticmethod
@@ -201,6 +202,109 @@ class WeightedEdgeSampler:
         }
         self.per_cache[nconst] = row
         return row
+
+    def _fetch_movies_bulk(self, ids: List[str]):
+        if not ids:
+            return
+        ph = ",".join(["?"] * len(ids))
+        sql = f"""
+        SELECT
+            t.tconst,
+            t.primaryTitle,
+            t.startYear,
+            t.endYear,
+            t.runtimeMinutes,
+            t.averageRating,
+            t.numVotes,
+            (SELECT GROUP_CONCAT(genre, ',') FROM title_genres WHERE tconst = t.tconst)
+        FROM titles t
+        WHERE t.tconst IN ({ph})
+        """
+        cur = self.movie_cur
+        cur.execute(sql, ids)
+        for r in cur.fetchall():
+            tconst = r[0]
+            self.mov_cache[tconst] = {
+                "tconst": tconst,
+                "primaryTitle": r[1],
+                "startYear": r[2],
+                "endYear": r[3],
+                "runtimeMinutes": r[4],
+                "averageRating": r[5],
+                "numVotes": r[6],
+                "genres": r[7].split(",") if r[7] else [],
+            }
+
+    def _fetch_people_bulk(self, ids: List[str]):
+        if not ids:
+            return
+        ph = ",".join(["?"] * len(ids))
+        sql = f"""
+        SELECT
+            p.nconst,
+            p.primaryName,
+            p.birthYear,
+            p.deathYear,
+            (SELECT GROUP_CONCAT(profession, ',') FROM people_professions WHERE nconst = p.nconst)
+        FROM people p
+        WHERE p.nconst IN ({ph})
+        """
+        cur = self.person_cur
+        cur.execute(sql, ids)
+        for r in cur.fetchall():
+            nconst = r[0]
+            self.per_cache[nconst] = {
+                "primaryName": r[1],
+                "birthYear": r[2],
+                "deathYear": r[3],
+                "professions": r[4].split(",") if r[4] else None,
+            }
+
+    def sample_indices(self, k: int) -> np.ndarray:
+        p, a = self.state.arrays()
+        n = int(p.size)
+        if n == 0 or k <= 0:
+            return np.empty((0,), dtype=np.int64)
+        i = np.random.randint(0, n, size=k, dtype=np.int64)
+        acc = np.random.random(size=k) < p[i]
+        out = i.copy()
+        out[~acc] = a[i[~acc]]
+        return out.astype(np.int64, copy=False)
+
+    def sample_batch(self):
+        self._ensure_conn()
+        idxs = self.sample_indices(self.bs)
+        if idxs.size == 0:
+            return [], [], torch.zeros((0,), dtype=torch.long)
+
+        esel = [self.edges[int(j)] for j in idxs.tolist()]
+        want_t = [t for _, t, _ in esel if t not in self.mov_cache]
+        want_p = [n for _, _, n in esel if n not in self.per_cache]
+        if want_t:
+            self._fetch_movies_bulk(list(set(want_t)))
+        if want_p:
+            self._fetch_people_bulk(list(set(want_p)))
+
+        Ms = []
+        Ps = []
+        eids = []
+        for j in idxs.tolist():
+            eid, tconst, nconst = self.edges[int(j)]
+            if self.movie_tensors[int(j)] is None:
+                mr = self.mov_cache[tconst]
+                pr = self.per_cache[nconst]
+                self.movie_tensors[int(j)] = tuple(f.transform(mr.get(f.name)) for f in self.mov.fields)
+                self.person_tensors[int(j)] = tuple(f.transform(pr.get(f.name)) for f in self.per.fields)
+            Ms.append(self.movie_tensors[int(j)])
+            Ps.append(self.person_tensors[int(j)])
+            eids.append(eid)
+
+        m_cols = list(zip(*Ms))
+        p_cols = list(zip(*Ps))
+        M = [torch.stack(col, dim=0) for col in m_cols]
+        P = [torch.stack(col, dim=0) for col in p_cols]
+        e = torch.tensor(eids, dtype=torch.long)
+        return M, P, e
 
 def make_edge_sampler(
     db_path: str,

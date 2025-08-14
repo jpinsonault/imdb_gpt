@@ -5,6 +5,8 @@ import os
 import signal
 import time
 import datetime
+import threading
+import queue
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -29,26 +31,21 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-class _EdgeIterable(IterableDataset):
-    def __init__(self, sampler, mov_ae, per_ae):
+class _BatchEdgeIterable(IterableDataset):
+    def __init__(self, sampler):
         super().__init__()
         self.sampler = sampler
-        self.mov_fields = mov_ae.fields
-        self.per_fields = per_ae.fields
 
     def __iter__(self):
-        for m_t, p_t, eid in self.sampler:
-            yield m_t, p_t, eid
+        while True:
+            M, P, eids = self.sampler.sample_batch()
+            if eids.numel() == 0:
+                break
+            yield M, P, eids
 
 
-def _collate_edge(batch):
-    ms, ps, eids = zip(*batch)
-    m_cols = list(zip(*ms))
-    p_cols = list(zip(*ps))
-    M = [torch.stack(col, dim=0) for col in m_cols]
-    P = [torch.stack(col, dim=0) for col in p_cols]
-    e = torch.tensor(eids, dtype=torch.long)
-    return M, P, e
+def _identity_collate(batch):
+    return batch[0]
 
 
 class _InMemoryEdgeStats:
@@ -73,6 +70,36 @@ class _InMemoryEdgeStats:
         if s <= 0.0:
             w[:] = 1.0 / max(1, w.size)
         return w
+
+
+class _AliasUpdater(threading.Thread):
+    def __init__(self, shared_state: SharedSamplerState):
+        super().__init__(daemon=True)
+        self.shared_state = shared_state
+        self.q: "queue.Queue[np.ndarray]" = queue.Queue()
+        self._stop = threading.Event()
+
+    def submit(self, weights: np.ndarray):
+        try:
+            while not self.q.empty():
+                self.q.get_nowait()
+        except Exception:
+            pass
+        self.q.put(weights, block=False)
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                w = self.q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self.shared_state.update_alias(w)
+            except Exception:
+                pass
 
 
 class JointTrainer:
@@ -104,6 +131,8 @@ class JointTrainer:
         self.edge_stats: Optional[_InMemoryEdgeStats] = None
         self.shared_state: Optional[SharedSamplerState] = None
         self._eid_to_idx: Optional[np.ndarray] = None
+
+        self._alias_updater: Optional[_AliasUpdater] = None
 
     @staticmethod
     def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -236,7 +265,6 @@ class JointTrainer:
             movie_ae=self.movie_ae,
             person_ae=self.people_ae,
             batch_size=int(self.config["batch_size"]),
-            refresh_batches=int(self.config["edge_sampler"]["refresh_batches"]),
             boost=float(self.config["edge_sampler"]["weak_edge_boost"]),
             shared_state=self.shared_state,
         )
@@ -244,20 +272,18 @@ class JointTrainer:
         self.edge_sampler = tmp_sampler
         logging.info(f"init: edge sampler ready in {time.perf_counter() - s2:.2f}s")
 
-        ds = _EdgeIterable(self.edge_sampler, self.movie_ae, self.people_ae)
-
-        num_workers = int(self.config.get("num_workers", 2))
+        num_workers = int(self.config.get("num_workers", 4))
         prefetch_factor = int(self.config.get("prefetch_factor", 2))
         pin = bool(torch.cuda.is_available())
 
         s3 = time.perf_counter()
-        logging.info(f"init: constructing DataLoader workers={num_workers} prefetch={prefetch_factor if num_workers>0 else None} pin_memory={pin}")
+        ds = _BatchEdgeIterable(self.edge_sampler)
         self.loader = DataLoader(
             ds,
-            batch_size=int(self.config["batch_size"]),
-            collate_fn=_collate_edge,
+            batch_size=None,
+            collate_fn=_identity_collate,
             num_workers=num_workers,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            prefetch_factor=prefetch_factor,
             persistent_workers=True if num_workers > 0 else False,
             pin_memory=pin,
         )
@@ -267,6 +293,9 @@ class JointTrainer:
         self.total_edges = len(self.edge_sampler.edges)
         self.edge_stats = _InMemoryEdgeStats(self.total_edges)
         self._eid_to_idx = self._build_eid_to_idx()
+
+        self._alias_updater = _AliasUpdater(self.shared_state)
+        self._alias_updater.start()
 
         logging.info(f"init: joint trainer ready device={self.device} edges={self.total_edges} bs={self.config['batch_size']} workers={num_workers} in {time.perf_counter() - t0:.2f}s")
 
@@ -407,7 +436,8 @@ class JointTrainer:
 
             if (global_step + 1) % flush_interval == 0:
                 w = self.edge_stats.make_weights(boost)
-                self.shared_state.update_alias(w)
+                if self._alias_updater is not None:
+                    self._alias_updater.submit(w)
 
             if (global_step + 1) % save_interval == 0:
                 self.movie_ae.save_model()
@@ -424,7 +454,9 @@ class JointTrainer:
                 break
 
         w = self.edge_stats.make_weights(boost)
-        self.shared_state.update_alias(w)
+        if self._alias_updater is not None:
+            self._alias_updater.submit(w)
+            self._alias_updater.stop()
 
         self.movie_ae.save_model()
         self.people_ae.save_model()
