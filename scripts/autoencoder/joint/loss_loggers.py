@@ -3,7 +3,7 @@ import sqlite3
 from typing import List, Tuple
 
 class EdgeLossLogger:
-    _BULK_SIZE = 10_000
+    _BULK_SIZE = 2048
 
     def __init__(self, db_path: str):
         self.conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
@@ -24,7 +24,7 @@ class EdgeLossLogger:
 
     def _set_pragmas(self):
         self.conn.execute("PRAGMA journal_mode = WAL;")
-        self.conn.execute("PRAGMA synchronous = NORMAL;")
+        self.conn.execute("PRAGMA synchronous = OFF;")
         self.conn.execute("PRAGMA temp_store = MEMORY;")
         self.conn.execute("PRAGMA cache_size = -200000;")
         self.conn.execute("PRAGMA mmap_size = 268435456;")

@@ -3,32 +3,71 @@ import sqlite3
 import time
 import logging
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from multiprocessing import shared_memory
 
-class AliasSampler:
-    def __init__(self, probs: np.ndarray):
-        n = len(probs)
-        self.n = n
-        self.p = np.zeros(n, dtype=np.float32)
-        self.a = np.zeros(n, dtype=np.int32)
+class _Alias:
+    @staticmethod
+    def build_from_probs(probs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        n = int(probs.size)
+        p = np.zeros(n, dtype=np.float32)
+        a = np.zeros(n, dtype=np.int32)
         scaled = probs * n
         small, large = [], []
         for i, v in enumerate(scaled):
             (small if v < 1.0 else large).append(i)
         while small and large:
-            s, l = small.pop(), large.pop()
-            self.p[s] = scaled[s]
-            self.a[s] = l
-            scaled[l] = (scaled[l] - 1) + scaled[s]
+            s = small.pop()
+            l = large.pop()
+            p[s] = scaled[s]
+            a[s] = l
+            scaled[l] = (scaled[l] - 1.0) + scaled[s]
             (small if scaled[l] < 1.0 else large).append(l)
         for i in large + small:
-            self.p[i] = 1.0
-            self.a[i] = i
+            p[i] = 1.0
+            a[i] = i
+        return p, a
 
-    def draw(self, k: int) -> np.ndarray:
-        i = np.random.randint(0, self.n, size=k)
-        accept = np.random.random(size=k) < self.p[i]
-        return np.where(accept, i, self.a[i])
+class SharedSamplerState:
+    def __init__(self, n: int, init_probs: Optional[np.ndarray] = None):
+        self.n = int(n)
+        self._p_shm = shared_memory.SharedMemory(create=True, size=self.n * 4)
+        self._a_shm = shared_memory.SharedMemory(create=True, size=self.n * 4)
+        self._p = np.ndarray((self.n,), dtype=np.float32, buffer=self._p_shm.buf)
+        self._a = np.ndarray((self.n,), dtype=np.int32, buffer=self._a_shm.buf)
+        if init_probs is None:
+            init_probs = np.ones(self.n, dtype=np.float32) / max(1, self.n)
+        p, a = _Alias.build_from_probs(init_probs.astype(np.float32, copy=False))
+        self._p[:] = p
+        self._a[:] = a
+
+    def __getstate__(self):
+        return {
+            "n": self.n,
+            "p_name": self._p_shm.name,
+            "a_name": self._a_shm.name,
+        }
+
+    def __setstate__(self, state):
+        self.n = int(state["n"])
+        self._p_shm = shared_memory.SharedMemory(name=state["p_name"])
+        self._a_shm = shared_memory.SharedMemory(name=state["a_name"])
+        self._p = np.ndarray((self.n,), dtype=np.float32, buffer=self._p_shm.buf)
+        self._a = np.ndarray((self.n,), dtype=np.int32, buffer=self._a_shm.buf)
+
+    def arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._p, self._a
+
+    def update_alias(self, probs: np.ndarray):
+        probs = probs.astype(np.float32, copy=False)
+        probs_sum = float(probs.sum())
+        if probs_sum <= 0.0:
+            probs = np.ones_like(probs, dtype=np.float32) / max(1, probs.size)
+        else:
+            probs = probs / probs_sum
+        p, a = _Alias.build_from_probs(probs)
+        self._p[:] = p
+        self._a[:] = a
 
 class WeightedEdgeSampler:
     def __init__(
@@ -37,8 +76,8 @@ class WeightedEdgeSampler:
         movie_ae,
         person_ae,
         batch_size: int,
-        refresh_batches: int = 1_000,
         boost: float = 0.10,
+        shared_state: Optional[SharedSamplerState] = None,
     ):
         self.db_path = db_path
         self.mov = movie_ae
@@ -57,7 +96,6 @@ class WeightedEdgeSampler:
         self.conn = None
         self.movie_cur = None
         self.person_cur = None
-        self.meta_cur = None
 
         self.movie_sql = """
         SELECT primaryTitle,startYear,endYear,runtimeMinutes,
@@ -71,11 +109,11 @@ class WeightedEdgeSampler:
         FROM people WHERE nconst = ? LIMIT 1
         """
 
-        self.weights = np.ones(len(self.edges), dtype=np.float32)
-        self.alias = AliasSampler(self.weights / self.weights.sum())
-        self._first_refresh_logged = False
-
-        self._last_version = -1
+        if shared_state is None:
+            init_probs = np.ones(len(self.edges), dtype=np.float32) / max(1, len(self.edges))
+            self.state = SharedSamplerState(len(self.edges), init_probs)
+        else:
+            self.state = shared_state
 
     def _ensure_conn(self):
         if self.conn is not None:
@@ -90,49 +128,22 @@ class WeightedEdgeSampler:
         self.conn.execute("PRAGMA busy_timeout = 5000;")
         self.movie_cur = self.conn.cursor()
         self.person_cur = self.conn.cursor()
-        self.meta_cur = self.conn.cursor()
-        self._ensure_meta_table()
         logging.info(f"edge sampler: DB connection ready in {time.perf_counter() - t0:.2f}s")
-
-    def _ensure_meta_table(self):
-        self.meta_cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS edge_sampler_meta (
-                id INTEGER PRIMARY KEY CHECK(id=1),
-                version INTEGER NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            """
-        )
-        self.meta_cur.execute(
-            """
-            INSERT INTO edge_sampler_meta(id,version,updated_at)
-            VALUES(1,0,strftime('%s','now'))
-            ON CONFLICT(id) DO NOTHING;
-            """
-        )
-        self.conn.commit()
-
-    def _read_meta_version(self) -> int:
-        r = self.meta_cur.execute("SELECT version FROM edge_sampler_meta WHERE id=1;").fetchone()
-        return int(r[0]) if r else 0
 
     def __iter__(self):
         self._ensure_conn()
-        self._maybe_refresh(initial=True)
         return self
 
     def __next__(self):
-        self._maybe_refresh(initial=False)
-        idx = self.alias.draw(1)[0]
+        p, a = self.state.arrays()
+        n = int(p.size)
+        if n == 0:
+            raise StopIteration
+        i = np.random.randint(0, n, size=1)[0]
+        accept = float(np.random.random(1)[0]) < float(p[i])
+        idx = int(i) if accept else int(a[i])
         movie_t, person_t = self._get_tensors(idx)
         return movie_t, person_t, self.edges[idx][0]
-
-    def _maybe_refresh(self, initial: bool):
-        v = self._read_meta_version()
-        if initial or v != self._last_version:
-            self._refresh_weights()
-            self._last_version = v
 
     def _get_tensors(self, idx: int):
         if self.movie_tensors[idx] is None:
@@ -191,46 +202,19 @@ class WeightedEdgeSampler:
         self.per_cache[nconst] = row
         return row
 
-    def _refresh_weights(self):
-        t0 = time.perf_counter()
-        cur = self.conn.cursor()
-        try:
-            cur.execute("SELECT edgeId,total_loss FROM edge_losses;")
-            recorded = {eid: loss for eid, loss in cur.fetchall()}
-            loss_vec = np.full(len(self.edges), 1000.0, dtype=np.float32)
-            for eid, loss in recorded.items():
-                idx = self.edge_to_idx.get(eid)
-                if idx is not None:
-                    loss_vec[idx] = loss
-            lo, hi = loss_vec.min(), loss_vec.max()
-            if hi > lo:
-                norm = (loss_vec - lo) / (hi - lo)
-                self.weights = 1.0 + self.boost * norm
-            else:
-                self.weights.fill(1.0)
-        except sqlite3.Error:
-            self.weights.fill(1.0)
-            recorded = {}
-        probs = self.weights / self.weights.sum()
-        self.alias = AliasSampler(probs)
-        dt = time.perf_counter() - t0
-        if not self._first_refresh_logged:
-            self._first_refresh_logged = True
-            logging.info(f"edge sampler: initial/global weight refresh using {len(recorded)} records in {dt:.2f}s")
-
 def make_edge_sampler(
     db_path: str,
     movie_ae,
     person_ae,
     batch_size: int,
-    refresh_batches: int = 1_000,
     boost: float = 0.10,
+    shared_state: Optional[SharedSamplerState] = None,
 ):
     return WeightedEdgeSampler(
         db_path,
         movie_ae,
         person_ae,
         batch_size=batch_size,
-        refresh_batches=refresh_batches,
         boost=boost,
+        shared_state=shared_state,
     )

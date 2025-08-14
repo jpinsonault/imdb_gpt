@@ -5,19 +5,18 @@ import os
 import signal
 import time
 import datetime
-import sqlite3
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from scripts.autoencoder.joint.loss_loggers import EdgeLossLogger
 from scripts.autoencoder.row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.joint.dataset import make_edge_sampler
+from scripts.autoencoder.joint.dataset import make_edge_sampler, SharedSamplerState
 from scripts.autoencoder.joint.model import JointAutoencoder
 from scripts.autoencoder.joint.reconstruction_logger import JointReconstructionLogger
 from scripts.autoencoder.row_ae.reconstruction_logger import RowReconstructionLogger
@@ -52,42 +51,28 @@ def _collate_edge(batch):
     return M, P, e
 
 
-def _ensure_meta_table(db_path: Path):
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS edge_sampler_meta (
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            version INTEGER NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        """
-    )
-    cur.execute(
-        """
-        INSERT INTO edge_sampler_meta(id,version,updated_at)
-        VALUES(1,0,strftime('%s','now'))
-        ON CONFLICT(id) DO NOTHING;
-        """
-    )
-    conn.commit()
-    conn.close()
+class _InMemoryEdgeStats:
+    def __init__(self, num_edges: int):
+        self.max_loss = np.zeros((num_edges,), dtype=np.float32)
 
+    def update(self, idxs: np.ndarray, total_loss: float):
+        if idxs.size == 0:
+            return
+        self.max_loss[idxs] = np.maximum(self.max_loss[idxs], float(total_loss))
 
-def _bump_sampler_version(db_path: Path):
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE edge_sampler_meta
-        SET version = version + 1,
-            updated_at = strftime('%s','now')
-        WHERE id = 1;
-        """
-    )
-    conn.commit()
-    conn.close()
+    def make_weights(self, boost: float) -> np.ndarray:
+        v = self.max_loss
+        lo = float(v.min())
+        hi = float(v.max())
+        if hi > lo:
+            norm = (v - lo) / (hi - lo)
+            w = 1.0 + float(boost) * norm.astype(np.float32)
+        else:
+            w = np.ones_like(v, dtype=np.float32)
+        s = float(w.sum())
+        if s <= 0.0:
+            w[:] = 1.0 / max(1, w.size)
+        return w
 
 
 class JointTrainer:
@@ -105,7 +90,6 @@ class JointTrainer:
 
         self.edge_sampler = None
         self.loader: Optional[DataLoader] = None
-        self.loss_logger: Optional[EdgeLossLogger] = None
 
         self.joint_recon: Optional[JointReconstructionLogger] = None
         self.row_recon_movies: Optional[RowReconstructionLogger] = None
@@ -116,6 +100,10 @@ class JointTrainer:
 
         self.stop_flag = {"stop": False}
         self.total_edges: int = 0
+
+        self.edge_stats: Optional[_InMemoryEdgeStats] = None
+        self.shared_state: Optional[SharedSamplerState] = None
+        self._eid_to_idx: Optional[np.ndarray] = None
 
     @staticmethod
     def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -206,6 +194,16 @@ class JointTrainer:
         self.stop_flag["stop"] = True
         logging.info("interrupt received; will finish current step and save")
 
+    def _build_eid_to_idx(self) -> np.ndarray:
+        if not self.edge_sampler.edges:
+            return np.zeros((0,), dtype=np.int64)
+        max_eid = max(e for e, _, _ in self.edge_sampler.edges)
+        arr = np.full((max_eid + 1,), -1, dtype=np.int64)
+        for i, (eid, _, _) in enumerate(self.edge_sampler.edges):
+            if eid >= 0:
+                arr[eid] = i
+        return arr
+
     def build(self):
         t0 = time.perf_counter()
         logging.info("init: building row autoencoders (movies, people)…")
@@ -232,14 +230,18 @@ class JointTrainer:
 
         s2 = time.perf_counter()
         logging.info("init: creating edge sampler…")
-        self.edge_sampler = make_edge_sampler(
+        self.shared_state = None
+        tmp_sampler = make_edge_sampler(
             db_path=str(self.db_path),
             movie_ae=self.movie_ae,
             person_ae=self.people_ae,
             batch_size=int(self.config["batch_size"]),
             refresh_batches=int(self.config["edge_sampler"]["refresh_batches"]),
             boost=float(self.config["edge_sampler"]["weak_edge_boost"]),
+            shared_state=self.shared_state,
         )
+        self.shared_state = tmp_sampler.state
+        self.edge_sampler = tmp_sampler
         logging.info(f"init: edge sampler ready in {time.perf_counter() - s2:.2f}s")
 
         ds = _EdgeIterable(self.edge_sampler, self.movie_ae, self.people_ae)
@@ -261,12 +263,10 @@ class JointTrainer:
         )
         logging.info(f"init: DataLoader ready in {time.perf_counter() - s3:.2f}s")
 
-        self.loss_logger = EdgeLossLogger(str(self.db_path))
-
         self.joint_model = JointAutoencoder(self.movie_ae, self.people_ae).to(self.device)
         self.total_edges = len(self.edge_sampler.edges)
-
-        _ensure_meta_table(self.db_path)
+        self.edge_stats = _InMemoryEdgeStats(self.total_edges)
+        self._eid_to_idx = self._build_eid_to_idx()
 
         logging.info(f"init: joint trainer ready device={self.device} edges={self.total_edges} bs={self.config['batch_size']} workers={num_workers} in {time.perf_counter() - t0:.2f}s")
 
@@ -332,6 +332,7 @@ class JointTrainer:
         flush_interval = int(self.config.get("flush_interval", 2000))
         save_interval = int(self.config.get("save_interval", 10000))
         max_steps = int(self.config.get("max_steps", max(1, self.total_edges)))
+        boost = float(self.config["edge_sampler"]["weak_edge_boost"])
 
         data_iter, warm = self._warm_first_batch()
         if warm is None:
@@ -373,8 +374,12 @@ class JointTrainer:
             batch_time = time.perf_counter() - t_step0
             iter_time = data_time + batch_time
 
-            for eid in eids.detach().cpu().tolist():
-                self.loss_logger.add(int(eid), 0, global_step, total_val, field_losses)
+            eids_np = np.asarray(eids.detach().cpu().numpy(), dtype=np.int64)
+            idxs = self._eid_to_idx[eids_np] if self._eid_to_idx.size > 0 else np.empty((0,), dtype=np.int64)
+            if idxs.size:
+                idxs = idxs[idxs >= 0]
+                if idxs.size:
+                    self.edge_stats.update(idxs, total_val)
 
             if self.writer is not None:
                 self.writer.add_scalar("loss/total", total_val, global_step)
@@ -401,8 +406,8 @@ class JointTrainer:
             RowReconstructionLogger.on_batch_end(self.row_recon_people, global_step)
 
             if (global_step + 1) % flush_interval == 0:
-                self.loss_logger.flush()
-                _bump_sampler_version(self.db_path)
+                w = self.edge_stats.make_weights(boost)
+                self.shared_state.update_alias(w)
 
             if (global_step + 1) % save_interval == 0:
                 self.movie_ae.save_model()
@@ -418,8 +423,8 @@ class JointTrainer:
             if self.stop_flag["stop"]:
                 break
 
-        self.loss_logger.flush()
-        _bump_sampler_version(self.db_path)
+        w = self.edge_stats.make_weights(boost)
+        self.shared_state.update_alias(w)
 
         self.movie_ae.save_model()
         self.people_ae.save_model()
