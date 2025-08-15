@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -9,8 +10,15 @@ import numpy as np
 import sqlite3
 from tqdm import tqdm
 import torch
+import logging
 
 from scripts.autoencoder.row_ae.imdb import TitlesAutoencoder, PeopleAutoencoder
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 MOVIE_SQL_BULK = """
 SELECT
@@ -47,14 +55,6 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
-def _dtype_for_field_tensor(t: torch.Tensor) -> np.dtype:
-    if t.dtype in (torch.long, torch.int64, torch.int32, torch.int16, torch.int8):
-        return np.int32
-    return np.float32
-
-def _shape_for_field_tensor(t: torch.Tensor) -> Tuple[int, ...]:
-    return tuple(int(x) for x in t.shape)
-
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +66,7 @@ def _write_ids_txt(path: Path, ids: List[str]):
 def _bulk_fetch(conn: sqlite3.Connection, sql_tmpl: str, ids: List[str], chunk: int) -> Dict[str, tuple]:
     out: Dict[str, tuple] = {}
     cur = conn.cursor()
-    for i in range(0, len(ids), chunk):
+    for i in tqdm(range(0, len(ids), chunk), desc="bulk fetch", unit="chunk", dynamic_ncols=True):
         batch = ids[i : i + chunk]
         ph = ",".join(["?"] * len(batch))
         sql = sql_tmpl.format(ph=ph)
@@ -104,6 +104,7 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
     _ensure_dir(people_dir)
     _ensure_dir(edges_dir)
 
+    logging.info("initializing AEs and stats")
     mov_ae = TitlesAutoencoder({"db_path": db_path, "model_dir": ".", "latent_dim": 1, "movie_limit": 1})
     per_ae = PeopleAutoencoder({"db_path": db_path, "model_dir": ".", "latent_dim": 1})
     mov_ae.accumulate_stats()
@@ -113,10 +114,13 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
 
     with _connect(db_path) as conn:
         cur = conn.cursor()
+
+        logging.info("loading distinct ids from edges")
         cur.execute("SELECT DISTINCT tconst FROM edges;")
         movie_ids = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT DISTINCT nconst FROM edges;")
         person_ids = [r[0] for r in cur.fetchall()]
+        logging.info(f"counts: movies={len(movie_ids):,} people={len(person_ids):,}")
 
         movie_idx = {t: i for i, t in enumerate(movie_ids)}
         person_idx = {n: i for i, n in enumerate(person_ids)}
@@ -143,20 +147,39 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
                 "path": f"{f.name}.mm",
             })
 
-        for spec in movie_field_specs:
+        logging.info("creating memmap files for movie fields")
+        for spec in tqdm(movie_field_specs, desc="alloc movies", unit="field", dynamic_ncols=True):
             shape = (len(movie_ids),) + tuple(spec["shape"])
             np.memmap(movies_dir / spec["path"], dtype=spec["dtype"], mode="w+", shape=shape)[:] = 0
-        for spec in person_field_specs:
+
+        logging.info("creating memmap files for person fields")
+        for spec in tqdm(person_field_specs, desc="alloc people", unit="field", dynamic_ncols=True):
             shape = (len(person_ids),) + tuple(spec["shape"])
             np.memmap(people_dir / spec["path"], dtype=spec["dtype"], mode="w+", shape=shape)[:] = 0
 
+        logging.info("bulk fetching rows into RAM caches")
         m_rows = _bulk_fetch(conn, MOVIE_SQL_BULK, movie_ids, chunk)
         p_rows = _bulk_fetch(conn, PEOPLE_SQL_BULK, person_ids, chunk)
 
-        movie_mm = {spec["name"]: np.memmap(movies_dir / spec["path"], dtype=spec["dtype"], mode="r+", shape=(len(movie_ids),) + tuple(spec["shape"])) for spec in movie_field_specs}
-        person_mm = {spec["name"]: np.memmap(people_dir / spec["path"], dtype=spec["dtype"], mode="r+", shape=(len(person_ids),) + tuple(spec["shape"])) for spec in person_field_specs}
+        movie_mm = {
+            spec["name"]: np.memmap(
+                movies_dir / spec["path"],
+                dtype=spec["dtype"],
+                mode="r+",
+                shape=(len(movie_ids),) + tuple(spec["shape"]),
+            ) for spec in movie_field_specs
+        }
+        person_mm = {
+            spec["name"]: np.memmap(
+                people_dir / spec["path"],
+                dtype=spec["dtype"],
+                mode="r+",
+                shape=(len(person_ids),) + tuple(spec["shape"]),
+            ) for spec in person_field_specs
+        }
 
-        for tconst in tqdm(movie_ids, desc="movies", unit="row"):
+        logging.info("encoding movie fields → memmaps")
+        for tconst in tqdm(movie_ids, desc="movies", unit="row", dynamic_ncols=True):
             r = m_rows.get(tconst)
             if r is None:
                 continue
@@ -171,7 +194,8 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
                 else:
                     movie_mm[name][i] = x.astype(np.float32, copy=False)
 
-        for nconst in tqdm(person_ids, desc="people", unit="row"):
+        logging.info("encoding person fields → memmaps")
+        for nconst in tqdm(person_ids, desc="people", unit="row", dynamic_ncols=True):
             r = p_rows.get(nconst)
             if r is None:
                 continue
@@ -186,12 +210,13 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
                 else:
                     person_mm[name][i] = x.astype(np.float32, copy=False)
 
+        logging.info("writing edge index arrays")
         cur.execute("SELECT tconst,nconst FROM edges ORDER BY edgeId;")
         pairs = cur.fetchall()
         E = len(pairs)
         movie_idx_mm = np.memmap(edges_dir / "movie_idx.int32.mm", dtype=np.int32, mode="w+", shape=(E,))
         person_idx_mm = np.memmap(edges_dir / "person_idx.int32.mm", dtype=np.int32, mode="w+", shape=(E,))
-        for k, (t, n) in enumerate(tqdm(pairs, desc="edges", unit="edge")):
+        for k, (t, n) in enumerate(tqdm(pairs, desc="edges", unit="edge", dynamic_ncols=True)):
             movie_idx_mm[k] = movie_idx.get(t, -1)
             person_idx_mm[k] = person_idx.get(n, -1)
 
@@ -204,6 +229,7 @@ def build_memstore(db_path: str, out_dir: str, chunk: int = 10000):
     }
     with open(out_root / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+    logging.info(f"memstore built at {out_root}")
 
 def main():
     p = argparse.ArgumentParser()
@@ -211,7 +237,11 @@ def main():
     p.add_argument("--out", type=str, required=True)
     p.add_argument("--chunk", type=int, default=10000)
     args = p.parse_args()
-    build_memstore(args.db, args.out, chunk=args.chunk)
+    build_memstore(
+        args.db,
+        args.out,
+        chunk=args.chunk,
+    )
 
 if __name__ == "__main__":
     main()

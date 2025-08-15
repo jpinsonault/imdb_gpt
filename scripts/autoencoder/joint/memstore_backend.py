@@ -1,5 +1,3 @@
-# scripts/autoencoder/joint/memstore_backend.py
-
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -7,6 +5,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+import logging
 
 from .dataset import SharedSamplerState
 
@@ -69,6 +68,8 @@ class MemStore:
             edges_dir / Path(p_idx_path).name, dtype=np.int32, mode="r", shape=(self.num_edges,)
         )
 
+        self._log_specs()
+
     def gather_movies(self, idxs: np.ndarray) -> List[torch.Tensor]:
         out: List[torch.Tensor] = []
         for spec in self.movie_specs:
@@ -90,6 +91,18 @@ class MemStore:
 
     def get_person_names(self) -> List[str]:
         return list(self.person_names)
+
+    def get_movie_specs(self) -> List[dict]:
+        return list(self.movie_specs)
+
+    def get_person_specs(self) -> List[dict]:
+        return list(self.person_specs)
+
+    def _log_specs(self):
+        ms = ", ".join(f"{s['name']}{tuple(s['shape'])}/{s.get('dtype','')}" for s in self.movie_specs)
+        ps = ", ".join(f"{s['name']}{tuple(s['shape'])}/{s.get('dtype','')}" for s in self.person_specs)
+        logging.info(f"memmap specs (movies): {ms}")
+        logging.info(f"memmap specs (people): {ps}")
 
 class MemmapEdgeSampler:
     def __init__(
@@ -119,7 +132,7 @@ class MemmapEdgeSampler:
             want_m = [f.name for f in getattr(movie_ae, "fields", [])]
             m_pos = {n: i for i, n in enumerate(store_m)}
             self._movie_order = [m_pos[n] for n in want_m]
-        except Exception as e:
+        except Exception:
             self._movie_order = None
 
         try:
@@ -127,8 +140,12 @@ class MemmapEdgeSampler:
             want_p = [f.name for f in getattr(person_ae, "fields", [])]
             p_pos = {n: i for i, n in enumerate(store_p)}
             self._person_order = [p_pos[n] for n in want_p]
-        except Exception as e:
+        except Exception:
             self._person_order = None
+
+        self._log_mapping(movie_ae, person_ae)
+
+        self._printed_batch_shapes = False
 
     def sample_indices(self, k: int) -> np.ndarray:
         p, a = self.state.arrays()
@@ -155,8 +172,43 @@ class MemmapEdgeSampler:
         if self._person_order is not None:
             P = [P[i] for i in self._person_order]
 
+        if not self._printed_batch_shapes:
+            mspecs = self.store.get_movie_specs()
+            pspecs = self.store.get_person_specs()
+            m_lines = []
+            for f, t, spec_idx in zip(getattr(self, "_ae_movie_names", []), M, (self._movie_order or range(len(M)))):
+                shape = tuple(mspecs[spec_idx]["shape"])
+                m_lines.append(f"{f}: ae_in{tuple(t.shape[1:])} store{shape}")
+            p_lines = []
+            for f, t, spec_idx in zip(getattr(self, "_ae_person_names", []), P, (self._person_order or range(len(P)))):
+                shape = tuple(pspecs[spec_idx]["shape"])
+                p_lines.append(f"{f}: ae_in{tuple(t.shape[1:])} store{shape}")
+            if m_lines:
+                logging.info("batch shapes (movies): " + " | ".join(m_lines))
+            if p_lines:
+                logging.info("batch shapes (people): " + " | ".join(p_lines))
+            self._printed_batch_shapes = True
+
         e = torch.from_numpy(idxs.astype(np.int64, copy=False))
         return M, P, e
+
+    def _log_mapping(self, movie_ae, person_ae):
+        ae_m = [f.name for f in getattr(movie_ae, "fields", [])]
+        ae_p = [f.name for f in getattr(person_ae, "fields", [])]
+        self._ae_movie_names = ae_m
+        self._ae_person_names = ae_p
+        ms = self.store.get_movie_specs()
+        ps = self.store.get_person_specs()
+        ms_line = ", ".join(f"{i}:{s['name']}{tuple(s['shape'])}" for i, s in enumerate(ms))
+        ps_line = ", ".join(f"{i}:{s['name']}{tuple(s['shape'])}" for i, s in enumerate(ps))
+        logging.info(f"memmap order (movies): {ms_line}")
+        logging.info(f"memmap order (people): {ps_line}")
+        logging.info(f"ae order (movies): {ae_m}")
+        logging.info(f"ae order (people): {ae_p}")
+        if self._movie_order is not None:
+            logging.info(f"mapping (movies) store_idx->ae_order: {self._movie_order}")
+        if self._person_order is not None:
+            logging.info(f"mapping (people) store_idx->ae_order: {self._person_order}")
 
 def make_memmap_edge_sampler(
     memstore_dir: str,

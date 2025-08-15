@@ -54,18 +54,11 @@ def _memmap_is_compatible(manifest_path: Path, movie_ae, people_ae) -> bool:
         return False
 
 def _autobuild_memstore(db_path: Path, memstore_dir: Path, cfg: dict, lock_timeout_sec: int = 600):
-    """
-    Build memstore into a temp dir and atomically swap it in.
-    Uses a simple lock dir to avoid concurrent rebuilds.
-    """
-    from scripts.autoencoder.joint.build_memstore import build_memstore  # your existing builder
-
+    from scripts.autoencoder.joint.build_memstore import build_memstore
     memstore_dir = Path(memstore_dir)
     memstore_dir.mkdir(parents=True, exist_ok=True)
     lock_dir = memstore_dir.parent / (memstore_dir.name + ".lock")
     tmp_dir  = memstore_dir.parent / (memstore_dir.name + ".new")
-
-    # Acquire lock (atomic mkdir)
     t0 = time.time()
     while True:
         try:
@@ -75,21 +68,19 @@ def _autobuild_memstore(db_path: Path, memstore_dir: Path, cfg: dict, lock_timeo
             if time.time() - t0 > lock_timeout_sec:
                 raise RuntimeError(f"memstore rebuild lock held too long: {lock_dir}")
             time.sleep(1.0)
-
     try:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        # Important: builder must use same AE config so shapes match
-        build_memstore(db_path=str(db_path), out_dir=str(tmp_dir))
-
-        # Sanity check: ensure manifest exists
+        build_memstore(
+            db_path=str(db_path),
+            out_dir=str(tmp_dir),
+            chunk=int(cfg.get("memstore_chunk", 10000)),
+            ae_cfg=cfg,
+        )
         man = tmp_dir / "manifest.json"
         if not man.exists():
             raise RuntimeError("memstore builder did not create manifest.json")
-
-        # Atomic swap
         backup = memstore_dir.parent / (memstore_dir.name + ".bak")
         if backup.exists():
             shutil.rmtree(backup)
@@ -99,11 +90,11 @@ def _autobuild_memstore(db_path: Path, memstore_dir: Path, cfg: dict, lock_timeo
         if backup.exists():
             shutil.rmtree(backup)
     finally:
-        # Release lock
         try:
             shutil.rmtree(lock_dir)
         except Exception:
             pass
+
 
 
 class _BatchEdgeIterable(IterableDataset):
@@ -335,6 +326,23 @@ class JointTrainer:
             self.people_ae.load_model()
             logging.info(f"init: people AE ready in {time.perf_counter() - s1:.2f}s")
 
+        def _fmt_fields(tag, ae):
+            names = [f.name for f in ae.fields]
+            ins = [tuple(getattr(f, "input_shape", ())) for f in ae.fields]
+            raw_outs = []
+            for enc in ae.encoder.encs:
+                od = None
+                for p in reversed(list(enc.parameters())):
+                    if p.dim() == 2:
+                        od = p.size(0)
+                        break
+                raw_outs.append(od)
+            pairs = [f"{n} in{i} enc_out{r}" for n, i, r in zip(names, ins, raw_outs)]
+            logging.info(f"{tag}: " + " | ".join(pairs))
+
+        _fmt_fields("ae fields (movies)", self.movie_ae)
+        _fmt_fields("ae fields (people)", self.people_ae)
+
         s2 = time.perf_counter()
         logging.info("init: creating edge sampler…")
 
@@ -360,11 +368,8 @@ class JointTrainer:
                 elif policy == "sqlite":
                     logging.info("memstore mismatch → falling back to sqlite backend")
                     use_memmap = False
-                else:  # "error"
-                    raise RuntimeError(
-                        "Memstore manifest does not match current autoencoder field specs. "
-                        "Set memstore_policy to 'rebuild' to auto-regenerate, or 'sqlite' to fall back."
-                    )
+                else:
+                    raise RuntimeError("Memstore manifest does not match current autoencoder field specs.")
 
         if use_memmap:
             sampler = make_memmap_edge_sampler(
@@ -386,7 +391,6 @@ class JointTrainer:
                 shared_state=self.shared_state,
             )
             logging.info("init: using sqlite backend")
-
 
         self.shared_state = sampler.state
         self.edge_sampler = sampler
@@ -427,6 +431,7 @@ class JointTrainer:
         self._alias_updater.start()
 
         logging.info(f"init: joint trainer ready device={self.device} edges={self.total_edges} bs={self.config['batch_size']} workers={num_workers} in {time.perf_counter() - t0:.2f}s")
+
 
     def _warm_first_batch(self):
         logging.info("init: warming up DataLoader by prefetching first batch…")

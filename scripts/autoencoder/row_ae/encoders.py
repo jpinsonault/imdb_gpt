@@ -3,12 +3,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
 from ..fields import BaseField
+import logging
 
 def _out_dim(m: nn.Module) -> int:
     for p in reversed(list(m.parameters())):
         if p.dim() == 2:
             return p.size(0)
     return None
+
+class RowEncoder(nn.Module):
+    def __init__(self, encs, field_names=None):
+        super().__init__()
+        self.encs = nn.ModuleList(encs)
+        self.field_names = list(field_names) if field_names is not None else [f"field{i}" for i in range(len(encs))]
+        self._logged_once = False
+
+    def forward(self, xs):
+        outs = []
+        for i, (enc, x) in enumerate(zip(self.encs, xs)):
+            if not self._logged_once:
+                n = self.field_names[i] if i < len(self.field_names) else f"field{i}"
+                logging.info(f"RowEncoder.bind: {n} -> {type(enc).__name__} ; x.shape={tuple(x.shape)} dtype={x.dtype}")
+            y = enc(x)
+            outs.append(y)
+        self._logged_once = True
+        return torch.cat(outs, dim=-1)
+
 
 class _FieldEncoders(nn.Module):
     def __init__(self, fields: List[BaseField], latent_dim: int):

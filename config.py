@@ -1,10 +1,12 @@
 project_config = {
     'project_name': 'imdb_gpt',
-    'data_dir': "./data/",
+    'data_dir': 'data',
     'log_dir': 'logs',
     'model_dir': 'models',
-    'corpus_dir': "./data/corpus/",
+    'corpus_dir': 'data/corpus',
     'docker_data_dir_mount': '/app/imdb',
+
+    'db_path': 'data/imdb.db',
 
     'latent_dim': 256,
     'batch_size': 5000,
@@ -15,7 +17,6 @@ project_config = {
     'callback_interval': 100,
     'people_sequence_length': 1,
     'movie_limit': 1000000000,
-    'db_path': './data/imdb.db',
 
     'nce_temp': 0.03,
     'nce_weight': 1.0,
@@ -24,7 +25,7 @@ project_config = {
     'contrastive_loss_weight': 0.5,
 
     'edge_sampler': {
-        'weak_edge_boost': 0.10,
+        'weak_edge_boost': 0.10
     },
 
     'tensorboard_dir': 'logs',
@@ -39,9 +40,8 @@ project_config = {
     'num_workers': 8,
     'prefetch_factor': 1,
 
-    "dataset_backend": "memmap",
-    "data_dir": "data",
-    "memstore_dir": "data/memstore",
-    "memstore_policy": "rebuild"
-
+    'dataset_backend': 'memmap',
+    'memstore_dir': 'data/memstore',
+    'memstore_policy': 'rebuild',
+    'memstore_chunk': 10000
 }
