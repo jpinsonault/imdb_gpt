@@ -1,9 +1,10 @@
+# scripts/autoencoder/edge_loss_logger.py
 from __future__ import annotations
 from typing import List, Tuple, Dict
 
 
 class EdgeLossLogger:
-    """Tracks worst loss per edge in memory."""
+    """Tracks latest loss per edge in memory."""
 
     _BULK_SIZE = 10_000
 
@@ -27,15 +28,13 @@ class EdgeLossLogger:
         if not self._cache:
             return
         for eid, loss in self._cache:
-            count, worst = self._loss_map.get(eid, (0, float("-inf")))
-            if loss > worst:
-                worst = loss
-            self._loss_map[eid] = (count + 1, worst)
+            count, _ = self._loss_map.get(eid, (0, float("-inf")))
+            self._loss_map[eid] = (count + 1, loss)
         self._cache.clear()
 
     def snapshot(self) -> Dict[int, float]:
         self.flush()
-        return {eid: worst for eid, (_, worst) in self._loss_map.items()}
+        return {eid: last for eid, (_, last) in self._loss_map.items()}
 
     def close(self):
         self.flush()
