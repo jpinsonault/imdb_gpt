@@ -305,3 +305,93 @@ class RowReconstructionLogger:
                 table.add_row([field_name, original_str, reconstructed_str])
 
             print(table)
+class SequenceReconstructionLogger:
+    def __init__(self, movie_ae, people_ae, predictor, db_path: str, seq_len: int, interval_steps: int = 200, num_samples: int = 2, table_width: int = 38):
+        import sqlite3, random
+        from itertools import islice
+        self.m_ae = movie_ae
+        self.p_ae = people_ae
+        self.pred = predictor
+        self.seq_len = seq_len
+        self.every = max(1, int(interval_steps))
+        self.w = table_width
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        movies = list(islice(self.m_ae.row_generator(), 50000))
+        rng = random.Random(7331)
+        rng.shuffle(movies)
+        self.samples = []
+        for m in movies:
+            ppl = self._people_for(m.get("tconst"))
+            if ppl:
+                if len(ppl) < self.seq_len:
+                    ppl = ppl + [ppl[-1]] * (self.seq_len - len(ppl))
+                else:
+                    ppl = ppl[: self.seq_len]
+                self.samples.append((m, ppl))
+            if len(self.samples) == num_samples:
+                break
+
+    def _people_for(self, tconst: str):
+        q = """
+        SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
+        FROM people p
+        LEFT JOIN people_professions pp ON pp.nconst = p.nconst
+        INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
+        GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+        ORDER BY pr.ordering
+        LIMIT ?
+        """
+        r = self.conn.execute(q, (tconst, self.seq_len)).fetchall()
+        out = []
+        for row in r:
+            out.append({
+                "primaryName": row[0],
+                "birthYear": row[1],
+                "deathYear": row[2],
+                "professions": row[3].split(",") if row[3] else None,
+            })
+        return out
+
+    def _tensor_to_string(self, field, arr):
+        import numpy as np
+        try:
+            a = np.array(arr)
+            if hasattr(field, "tokenizer") and field.tokenizer is not None:
+                return field.to_string(a)
+            return field.to_string(a.flatten() if a.ndim > 1 else a)
+        except Exception:
+            return "[conv_err]"
+
+    @torch.no_grad()
+    def _predict_seq(self, movie_row):
+        device = next(self.pred.parameters()).device
+        xs = [f.transform(movie_row.get(f.name)) for f in self.m_ae.fields]
+        xs = [x.unsqueeze(0).to(device) for x in xs]
+        outs = self.pred(xs)
+        return [o.detach().cpu().numpy()[0] for o in outs]
+
+    def on_batch_end(self, global_step: int):
+        if not self.samples:
+            return
+        if (global_step + 1) % self.every != 0:
+            return
+        from prettytable import PrettyTable
+        for m_row, ppl in self.samples:
+            preds = self._predict_seq(m_row)
+            print("\nSequence reconstruction")
+            print(f"movie: {m_row.get('primaryTitle', '')}")
+            for t in range(self.seq_len):
+                tab = PrettyTable(["field", "orig", "recon"])
+                tab.align = "l"
+                for f, pred in zip(self.p_ae.fields, preds):
+                    y = pred[t]
+                    orig_raw = ppl[t].get(f.name, "")
+                    if isinstance(orig_raw, list):
+                        orig_str = ", ".join(map(str, orig_raw))
+                    else:
+                        orig_str = str(orig_raw)
+                    recon_str = self._tensor_to_string(f, y)
+                    tab.add_row([f.name, orig_str[: self.w], recon_str[: self.w]])
+                print(f"\ntimestep {t+1}/{self.seq_len}\n{tab}")

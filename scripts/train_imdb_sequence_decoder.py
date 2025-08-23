@@ -1,478 +1,309 @@
-import logging
+import argparse
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
+
 import sqlite3
-import os
-from contextlib import redirect_stdout
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.layers import (
-    LayerNormalization,
-    Conv1D,
-    RepeatVector,
-    Lambda,
-    Activation,
-    Add,
-)
-from tensorflow.keras import ops
+import torch
+import torch.nn as nn
+from torch.utils.data import IterableDataset, DataLoader
+from tqdm import tqdm
 
-from autoencoder.training_callbacks import ModelSaveCallback, TensorBoardPerBatchLoggingCallback, ReconstructionCallback, SequenceReconstructionCallback
-from autoencoder.fields import (
-    MaskedSparseCategoricalCrossentropy,
-    TextField,
-    ScalarField,
-    MultiCategoryField,
-    Scaling,
-    BaseField
-)
-from scripts.autoencoder.imdb_row_autoencoders import PeopleAutoencoder, TitlesAutoencoder
-
-@tf.keras.utils.register_keras_serializable()
-def add_positional_encoding(input_sequence):
-    seq_len = tf.shape(input_sequence)[1]
-    model_dim = tf.shape(input_sequence)[2]
-
-    positions = tf.cast(tf.range(seq_len)[:, tf.newaxis], tf.float32)
-    dims = tf.range(model_dim)
-    angle_rates = 1 / tf.pow(10000.0, (2 * tf.cast(tf.math.floordiv(dims, 2), tf.float32)) / tf.cast(model_dim, tf.float32))
-    angles = positions * angle_rates
-
-    pos_encoding = tf.where(tf.math.floormod(dims, 2) == 0, tf.sin(angles), tf.cos(angles))
-    pos_encoding = pos_encoding[tf.newaxis, ...]  # Expand batch dimension
-
-    return input_sequence + pos_encoding
+from config import project_config
+from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+from scripts.autoencoder.fields import BaseField
+from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
+from scripts.autoencoder.run_logger import build_run_logger
 
 
-# -----------------------------------------------------------------------------
-# Reusable 1×1 residual block
-# -----------------------------------------------------------------------------
-
-def residual_block(width: int, name: str | None = None):
-    """Pre‑norm GELU residual block with kernel_size = 1.
-
-    Args:
-        width:     Number of channels for both conv layers and the residual add.
-        name:      Optional base string for layer naming.
-    Returns:
-        A function mapping a tensor of shape (B, T, width) to the same shape.
-    """
-    def inner(x):
-        res = x
-        x = LayerNormalization(name=f"{name}_ln" if name else None)(x)
-        x = Conv1D(width, 1, activation="gelu", name=f"{name}_conv1" if name else None)(x)
-        x = Conv1D(width, 1, name=f"{name}_conv2" if name else None)(x)
-        x = Add(name=f"{name}_add" if name else None)([x, res])
-        x = Activation("gelu", name=f"{name}_act" if name else None)(x)
-        return x
-
-    return inner
-
-class MoviesToPeopleSequenceAutoencoder:
-    def __init__(self, config: Dict[str, Any], db_path: Path, model_dir: Path):
-        self.config = config
+class MoviesPeopleSequenceDataset(IterableDataset):
+    def __init__(
+        self,
+        db_path: str,
+        movie_fields: List[BaseField],
+        people_fields: List[BaseField],
+        seq_len: int,
+        movie_limit: int | None = None,
+    ):
+        super().__init__()
         self.db_path = db_path
-        self.model_dir = model_dir
-        self.model = None
-        self.stats_accumulated = False
-        self.latent_dim = config["latent_dim"]
-        self.people_sequence_length = config["people_sequence_length"]
+        self.movie_fields = movie_fields
+        self.people_fields = people_fields
+        self.seq_len = seq_len
+        self.movie_limit = movie_limit
+        self.movie_sql = """
+        SELECT
+            t.tconst,
+            t.primaryTitle,
+            t.startYear,
+            t.endYear,
+            t.runtimeMinutes,
+            t.averageRating,
+            t.numVotes,
+            GROUP_CONCAT(g.genre, ',')
+        FROM titles t
+        INNER JOIN title_genres g ON g.tconst = t.tconst
+        WHERE
+            t.startYear IS NOT NULL
+            AND t.averageRating IS NOT NULL
+            AND t.runtimeMinutes IS NOT NULL
+            AND t.runtimeMinutes >= 5
+            AND t.startYear >= 1850
+            AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
+            AND t.numVotes >= 10
+        GROUP BY t.tconst
+        """
+        self.people_sql = """
+        SELECT
+            p.primaryName,
+            p.birthYear,
+            p.deathYear,
+            GROUP_CONCAT(pp.profession, ',')
+        FROM people p
+        LEFT JOIN people_professions pp ON p.nconst = pp.nconst
+        INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
+        GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+        ORDER BY pr.ordering
+        LIMIT ?
+        """
 
-        # instantiate and immediately load & freeze the pretrained row autoencoders
-        self.movie_autoencoder_instance = TitlesAutoencoder(config, db_path, model_dir / "TitlesAutoencoder")
-        # self.movie_autoencoder_instance.load_model()
-        self.movie_encoder = self.movie_autoencoder_instance.encoder
-        self.movie_encoder.trainable = False
-
-        self.people_autoencoder_instance = PeopleAutoencoder(config, db_path, model_dir / "PeopleAutoencoder")
-        # self.people_autoencoder_instance.load_model()
-        self.people_decoder = self.people_autoencoder_instance.decoder
-        self.people_decoder.trainable = False
-
-
-    def accumulate_stats(self):
-        # Accumulate stats using the instances.
-        if not self.stats_accumulated:
-            print("Accumulating stats for Movie fields...")
-            self.movie_autoencoder_instance.accumulate_stats()
-            print("Accumulating stats for People fields...")
-            self.people_autoencoder_instance.accumulate_stats()
-            self.stats_accumulated = True
-            print("Stats accumulation complete for sequence model.")
-        else:
-            print("Stats already accumulated.")
-
-    def row_generator(self):
-        # (Keep existing generator - fetches movie and associated people)
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            conn.row_factory = sqlite3.Row
-            movie_cursor = conn.cursor()
-            # Use the same query as before (ensure title_genres join is correct)
-            movie_cursor.execute("""
-                SELECT
-                    t.tconst, t.titleType, t.primaryTitle, t.startYear, t.endYear,
-                    t.runtimeMinutes, t.averageRating, t.numVotes,
-                    GROUP_CONCAT(g.genre, ',') AS genres
-                FROM titles t
-                INNER JOIN title_genres g ON t.tconst = g.tconst -- Use INNER JOIN
-                WHERE t.startYear IS NOT NULL
-                    AND t.averageRating IS NOT NULL AND t.runtimeMinutes IS NOT NULL
-                    AND t.runtimeMinutes >= 5 AND t.startYear >= 1850
-                    AND t.titleType IN ('movie', 'tvSeries', 'tvMovie', 'tvMiniSeries')
-                    AND t.numVotes >= 10
-                GROUP BY t.tconst
-                -- LIMIT 100000 -- Consider removing limit
-            """)
-
-            people_query = """
-                SELECT
-                    p.primaryName, p.birthYear, p.deathYear,
-                    GROUP_CONCAT(pp.profession, ',') AS professions
-                FROM people p
-                LEFT JOIN people_professions pp ON p.nconst = pp.nconst
-                INNER JOIN principals pr ON pr.nconst = p.nconst
-                WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
-                GROUP BY p.nconst
-                HAVING COUNT(pp.profession) > 0
-                ORDER BY pr.ordering -- Keep ordering
-                LIMIT ?
-            """
-
-            for movie_row in movie_cursor:
-                # Extract movie data relevant to movie fields
-                movie_data = {
-                    field.name: movie_row[field.name]
-                    for field in self.movie_autoencoder_instance.fields
-                    if field.name in movie_row.keys() # Ensure key exists
-                }
-                # Handle list field specifically
-                if "genres" in movie_data and movie_data["genres"]:
-                     movie_data["genres"] = movie_data["genres"].split(',')
-                elif "genres" in movie_data:
-                     movie_data["genres"] = [] # Handle case where genres might be NULL/empty string
-
-
-                movie_tconst = movie_row["tconst"]
-                people_cursor = conn.cursor()
-                people_cursor.execute(people_query, (movie_tconst, self.people_sequence_length))
-
-                people_list = []
-                for people_row in people_cursor.fetchall():
-                    # Extract people data relevant to people fields
-                    person_data = {
-                        field.name: people_row[field.name]
-                        for field in self.people_autoencoder_instance.fields
-                        if field.name in people_row.keys() # Ensure key exists
+    def __iter__(self):
+        con = sqlite3.connect(self.db_path, check_same_thread=False)
+        cur = con.cursor()
+        lim = "" if self.movie_limit is None else f" LIMIT {int(self.movie_limit)}"
+        cur.execute(self.movie_sql + lim)
+        for tconst, title, startYear, endYear, runtime, rating, votes, genres in cur:
+            movie_row = {
+                "tconst": tconst,
+                "primaryTitle": title,
+                "startYear": startYear,
+                "endYear": endYear,
+                "runtimeMinutes": runtime,
+                "averageRating": rating,
+                "numVotes": votes,
+                "genres": genres.split(",") if genres else [],
+            }
+            ppl = []
+            for r in con.execute(self.people_sql, (tconst, self.seq_len)):
+                ppl.append(
+                    {
+                        "primaryName": r[0],
+                        "birthYear": r[1],
+                        "deathYear": r[2],
+                        "professions": r[3].split(",") if r[3] else None,
                     }
-                    # Handle list field specifically
-                    if "professions" in person_data and person_data["professions"]:
-                         person_data["professions"] = person_data["professions"].split(',')
-                    elif "professions" in person_data:
-                         person_data["professions"] = None # Pass None if empty
-
-                    people_list.append(person_data)
-
-                # Yield combined data
-                yield {**movie_data, "people": people_list}
-
-    def build_autoencoder(self) -> tf.keras.Model:
-        if not self.stats_accumulated:
-            raise RuntimeError("Stats must be accumulated before building the model.")
-
-        movie_fields  = self.movie_autoencoder_instance.fields
-        people_fields = self.people_autoencoder_instance.fields
-        latent_dim    = self.latent_dim
-        seq_len       = self.people_sequence_length
-
-        # movie inputs & frozen encoder
-        movie_inputs = {
-            f.name: tf.keras.Input(
-                shape=f.input_shape,
-                name=f"{f.name}_input",
-                dtype=f.input_dtype,
-            )
-            for f in movie_fields
-        }
-        movie_latent = self.movie_encoder([movie_inputs[f.name] for f in movie_fields])
-
-        trunk_width = latent_dim * 2
-        x = RepeatVector(seq_len, name="repeat_latent")(movie_latent)  # (B, T, D)
-        x = Conv1D(trunk_width, 1, activation="gelu", name="project_up")(x)
-
-        for i in range(4):
-            x = residual_block(trunk_width, name=f"resblock_{i}")(x)
-
-        # final projection back to latent_dim
-        x = Conv1D(latent_dim, 1, activation="gelu", name="project_down")(x)
-
-        # ------------------------------------------------------------------
-        # decode each timestep with the frozen people decoder
-        # ------------------------------------------------------------------
-        def _decode_and_reshape(z):
-            b = tf.shape(z)[0]
-            T = seq_len
-            D = tf.shape(z)[2]
-            flat = tf.reshape(z, (b * T, D))
-            decoded = self.people_decoder(flat)
-
-            def _reshape_tensor(t):
-                tail = tf.shape(t)[1:]
-                return tf.reshape(t, tf.concat([[b, T], tail], axis=0))
-
-            return tf.nest.map_structure(_reshape_tensor, decoded)
-
-        decoded_seq = Lambda(_decode_and_reshape, name="SequenceDecode")(x)
-
-        # 4) collect and name outputs
-        outputs = []
-        for field in people_fields:
-            rec = decoded_seq[f"{field.name}_decoder"]
-            if isinstance(rec, (list, tuple)):
-                main_seq, flag_seq = rec
-                outputs.append(
-                    Activation("linear", name=f"{field.name}_main_out")(main_seq)
                 )
-                outputs.append(
-                    Activation("linear", name=f"{field.name}_flag_out")(flag_seq)
-                )
+            if not ppl:
+                continue
+            if len(ppl) < self.seq_len:
+                ppl = ppl + [ppl[-1]] * (self.seq_len - len(ppl))
             else:
-                outputs.append(
-                    Activation("linear", name=f"{field.name}_out")(rec)
-                )
-
-        # 5) build, assign, and return
-        model = tf.keras.Model(
-            inputs=list(movie_inputs.values()),
-            outputs=outputs,
-            name="MovieToPeopleSequencePredictor"
-        )
-        self.model = model
-        return model
+                ppl = ppl[: self.seq_len]
+            x_movie = [f.transform(movie_row.get(f.name)) for f in self.movie_fields]
+            y_people = []
+            for f in self.people_fields:
+                seq = [f.transform_target(pr.get(f.name)) for pr in ppl]
+                y_people.append(torch.stack(seq, dim=0))
+            yield x_movie, y_people
+        con.close()
 
 
-    
-    def get_loss_dict(self) -> Dict[str, Any]:
-        """
-        Returns a dict mapping each sequence‐output layer name to its loss function,
-        based on self.people_autoencoder_instance.fields and the naming convention
-        in build_autoencoder().
-        """
-        loss_dict = {}
-        for field in self.people_autoencoder_instance.fields:
-            # your new model names each non-optional head as "<field>_out"
-            # and each optional one as "<field>_main_out" + "<field>_flag_out"
-            if field.optional:
-                # main head uses the field’s base loss
-                loss_dict[f"{field.name}_main_out"] = field._get_loss()
-                # flag head always BinaryCrossentropy
-                loss_dict[f"{field.name}_flag_out"] = tf.keras.losses.BinaryCrossentropy()
-            else:
-                loss_dict[f"{field.name}_out"] = field._get_loss()
-        return loss_dict
-
-    def get_loss_weights_dict(self) -> Dict[str, float]:
-        """
-        Returns a dict mapping each sequence‐output layer name to its weight,
-        mirroring get_loss_dict but pulling `field.weight`.
-        """
-        weights = {}
-        for field in self.people_autoencoder_instance.fields:
-            if field.optional:
-                weights[f"{field.name}_main_out"] = field.weight
-                weights[f"{field.name}_flag_out"] = field.weight * 0.5
-            else:
-                weights[f"{field.name}_out"] = field.weight
-        return weights
-
-    def _print_model_architecture(self):
-        """Prints summaries relevant to the sequence prediction model."""
-        if not self.model:
-            print("Sequence prediction model not built yet.")
-            return
-
-        print("\n--- Movie Encoder Summary (Used as Input Processor) ---")
-        if self.movie_encoder:
-            self.movie_encoder.summary()
-        else:
-            print("Movie encoder part not available.")
-
-        # Don't print movie field decoders - they aren't used
+def _collate(batch):
+    xm_cols = list(zip(*[b[0] for b in batch]))
+    yp_cols = list(zip(*[b[1] for b in batch]))
+    Xm = [torch.stack(col, dim=0) for col in xm_cols]
+    Yp = [torch.stack(col, dim=0) for col in yp_cols]
+    return Xm, Yp
 
 
-        print("\n--- Main Sequence Prediction Model Summary ---")
-        self.model.summary() # Summary of the Movie->People model
-        print("\n--- Model Output Names ---")
-        print(self.model.output_names)
-        print("\n--- Loss Dictionary (Sequence Model) ---")
-        print(self.get_loss_dict())
-        print("\n--- Loss Weights Dictionary (Sequence Model) ---")
-        print(self.get_loss_weights_dict())
+class MovieToPeopleSequencePredictor(nn.Module):
+    def __init__(
+        self,
+        movie_encoder: nn.Module,
+        people_decoder: nn.Module,
+        latent_dim: int,
+        seq_len: int,
+        width: int | None = None,
+        depth: int = 3,
+    ):
+        super().__init__()
+        self.movie_encoder = movie_encoder
+        self.people_decoder = people_decoder
+        self.latent_dim = latent_dim
+        self.seq_len = seq_len
+        w = width or latent_dim * 2
+        layers = []
+        layers.append(nn.Linear(latent_dim, w))
+        layers.append(nn.GELU())
+        for _ in range(max(0, depth - 1)):
+            layers.append(nn.Linear(w, w))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(w, latent_dim * seq_len))
+        self.trunk = nn.Sequential(*layers)
 
-    def _build_dataset(self) -> tf.data.Dataset:
-        seq_len = self.people_sequence_length
-        movie_fields = self.movie_autoencoder_instance.fields
-        people_fields = self.people_autoencoder_instance.fields
-        batch_size = self.config["batch_size"]
-
-        def gen():
-            for row in self.row_generator():
-                # 1) grab & fix-length your people list
-                ppl = row["people"]
-                # if too short, repeat the last person; if empty, skip
-                if len(ppl) < seq_len:
-                    if not ppl:
-                        continue
-                    ppl = ppl + [ppl[-1]] * (seq_len - len(ppl))
-                else:
-                    ppl = ppl[:seq_len]
-
-                # 2) movie inputs
-                x_inputs = [ f.transform(row[f.name]) for f in movie_fields ]
-
-                # 3) people-sequence targets
-                y_targets = []
-                for f in people_fields:
-                    # for each field, collect one tensor per person, then stack
-                    seq = [ f.transform_target(person.get(f.name)) for person in ppl ]
-                    y_targets.append(tf.stack(seq))
-
-                yield tuple(x_inputs), tuple(y_targets)
-
-        # build your TensorSpecs just like before…
-        input_specs = [
-            tf.TensorSpec(shape=f.input_shape, dtype=f.input_dtype)
-            for f in movie_fields
-        ]
-        output_specs = []
-        for f in people_fields:
-            shape = (seq_len,) + f.output_shape
-            output_specs.append(tf.TensorSpec(shape=shape, dtype=f.output_dtype))
-
-        ds = tf.data.Dataset.from_generator(
-            gen,
-            output_signature=(tuple(input_specs), tuple(output_specs))
-        )
-        return ds.batch(batch_size)
+    def forward(self, movie_inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        z_m = self.movie_encoder(movie_inputs)
+        b = z_m.size(0)
+        z_seq = self.trunk(z_m).view(b, self.seq_len, self.latent_dim)
+        flat = z_seq.reshape(b * self.seq_len, self.latent_dim)
+        outs = self.people_decoder(flat)
+        seq_outs = []
+        for y in outs:
+            seq_outs.append(y.view(b, self.seq_len, *y.shape[1:]))
+        return seq_outs
 
 
-    def fit(self):
-        """ Accumulates stats, builds, compiles, and fits the sequence prediction model. """
-        if not self.stats_accumulated:
-            self.accumulate_stats()
-        if self.model is None:
-            self.build_autoencoder() # Builds the Movie->People model
-
-        self._print_model_architecture()
-
-        initial_lr = self.config['learning_rate']
-
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=initial_lr, # Initial LR
-            # weight_decay=self.config["weight_decay"],
-        )
-
-        # Compile the model
-        print("Compiling sequence prediction model...")
-        loss_dict = self.get_loss_dict()
-        loss_weights_dict = self.get_loss_weights_dict()
-
-        # Check consistency between loss keys and model output names
-        model_output_keys = set(self.model.output_names)
-        loss_keys = set(loss_dict.keys())
-        if loss_keys != model_output_keys:
-            print("WARNING: Loss dictionary keys do not perfectly match model output names!")
-            print("Model Outputs:", sorted(list(model_output_keys)))
-            print("Loss Dict Keys:", sorted(list(loss_keys)))
-            print("Missing in Losses:", sorted(list(model_output_keys - loss_keys)))
-            print("Extra in Losses:", sorted(list(loss_keys - model_output_keys)))
-            # Raise error or proceed with caution
-            # raise ValueError("Mismatch between model outputs and loss dictionary keys.")
-
-        self.model.compile(
-            optimizer=optimizer,
-            loss=loss_dict,
-            loss_weights=loss_weights_dict
-
-            # Add metrics if needed
-        )
-        
-        print("Model compiled.")
-
-        # Prepare dataset
-        print("Preparing dataset...")
-        ds = self._build_dataset() # Gets (inputs_tuple, people_targets_dict, people_weights_dict)
-        print("Dataset prepared.")
-
-        # Callbacks
-        # Use a specific log dir for the sequence model
-        log_dir = os.path.join(self.model_dir, "logs", f"{self.__class__.__name__}_fit", str(int(tf.timestamp().numpy())))
-        os.makedirs(log_dir, exist_ok=True)
-
-        # Checkpoint callback for the sequence model
-        checkpoint_path = os.path.join(self.model_dir, f"{self.__class__.__name__}_epoch_{{epoch:02d}}.keras")
-        model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            save_weights_only=False,
-            monitor='loss',
-            mode='min',
-            save_best_only=False, # Save every epoch or best
-            save_freq='epoch'
-        )
-
-        early_stopping_callback = tf.keras.callbacks.EarlyStopping(
-            monitor='loss', # Monitor training loss
-            patience=self.config.get("early_stopping_patience", 10),
-            restore_best_weights=True,
-            verbose=1
-        )
-
-        sequence_recon_callback = SequenceReconstructionCallback(
-            sequence_model_instance=self, 
-            num_samples=5,
-            interval_batches=self.config["callback_interval"],
-        )
-        log_root = Path(self.config["log_dir"])
-        log_dir  = log_root / f"{self.__class__.__name__}_fit"
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        tensorboard_callback = TensorBoardPerBatchLoggingCallback(
-            log_dir=log_dir,
-            log_interval=20,
-        )
-
-        print("Starting sequence prediction model training...")
-        self.model.fit(
-            ds,
-            epochs=self.config["epochs"],
-            callbacks=[
-                tensorboard_callback,
-                model_checkpoint_callback,
-                early_stopping_callback,
-                sequence_recon_callback,
-            ]
-            # Add validation_data if available
-        )
-        print("\nTraining complete.")
-        self.save_model() # Save the sequence model
+def _sequence_loss_and_breakdown(
+    fields: List[BaseField],
+    preds_seq: List[torch.Tensor],
+    targets_seq: List[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    total = 0.0
+    field_losses: dict[str, float] = {}
+    for f, pred, tgt in zip(fields, preds_seq, targets_seq):
+        b, t = pred.shape[0], pred.shape[1]
+        pm = pred.reshape(b * t, *pred.shape[2:])
+        tm = tgt.reshape(b * t, *tgt.shape[2:])
+        l = f.compute_loss(pm, tm)
+        total = total + l * float(f.weight)
+        field_losses[f.name] = float(l.detach().cpu().item())
+    return total, field_losses
 
 
-##############################################################################
-# Example Usage (Modified to use the sequence model)
-##############################################################################
+def _load_frozen_autoencoders(config: Dict[str, Any]) -> Tuple[TitlesAutoencoder, PeopleAutoencoder]:
+    mov = TitlesAutoencoder(config)
+    per = PeopleAutoencoder(config)
+    mov.accumulate_stats()
+    mov.finalize_stats()
+    per.accumulate_stats()
+    per.finalize_stats()
+    mov.build_autoencoder()
+    per.build_autoencoder()
+    model_dir = Path(config["model_dir"])
+    mov.encoder.load_state_dict(torch.load(model_dir / "TitlesAutoencoder_encoder.pt", map_location="cpu"))
+    per.decoder.load_state_dict(torch.load(model_dir / "PeopleAutoencoder_decoder.pt", map_location="cpu"))
+    for p in mov.encoder.parameters():
+        p.requires_grad = False
+    for p in per.decoder.parameters():
+        p.requires_grad = False
+    mov.encoder.eval()
+    per.decoder.eval()
+    return mov, per
+
+
+def train_sequence_predictor(
+    config: Dict[str, Any],
+    steps: int,
+    save_every: int,
+    movie_limit: int | None = None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mov, per = _load_frozen_autoencoders(config)
+    latent_dim = int(config["latent_dim"])
+    seq_len = int(config["people_sequence_length"])
+    batch_size = int(config["batch_size"])
+    lr = float(config.get("learning_rate", 2e-4))
+    wd = float(config.get("weight_decay", 1e-4))
+
+    model = MovieToPeopleSequencePredictor(mov.encoder, per.decoder, latent_dim, seq_len).to(device)
+
+    ds = MoviesPeopleSequenceDataset(
+        db_path=str(Path(config["db_path"])),
+        movie_fields=mov.fields,
+        people_fields=per.fields,
+        seq_len=seq_len,
+        movie_limit=movie_limit,
+    )
+    num_workers = int(config.get("num_workers", 2))
+    prefetch_factor = int(config.get("prefetch_factor", 2))
+    pin = bool(torch.cuda.is_available())
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        collate_fn=_collate,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+        persistent_workers=True if num_workers > 0 else False,
+        pin_memory=pin,
+    )
+
+    opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    run_logger = build_run_logger(config)
+
+    seq_logger = SequenceReconstructionLogger(
+        movie_ae=mov,
+        people_ae=per,
+        predictor=model,
+        db_path=str(Path(config["db_path"])),
+        seq_len=seq_len,
+        interval_steps=int(config.get("callback_interval", 100)),
+        num_samples=2,
+        table_width=38,
+    )
+
+    step = 0
+    it = iter(loader)
+    model.train()
+
+    with tqdm(total=steps, desc="sequence", dynamic_ncols=True) as pbar:
+        while step < steps:
+            t_fetch0 = time.perf_counter()
+            try:
+                xm, yp = next(it)
+            except StopIteration:
+                it = iter(loader)
+                xm, yp = next(it)
+            data_time = time.perf_counter() - t_fetch0
+
+            xm = [x.to(device, non_blocking=True) for x in xm]
+            yp = [y.to(device, non_blocking=True) for y in yp]
+
+            t_step0 = time.perf_counter()
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                preds = model(xm)
+                loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp)
+
+            opt.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            batch_time = time.perf_counter() - t_step0
+            iter_time = data_time + batch_time
+
+            step += 1
+            pbar.update(1)
+            pbar.set_postfix(loss=float(loss.detach().cpu().item()))
+
+            run_logger.add_scalars(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0, iter_time, opt)
+            run_logger.add_field_losses("loss/sequence_people", field_breakdown)
+            run_logger.tick(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0)
+
+            seq_logger.on_batch_end(step)
+
+            if save_every and step % save_every == 0:
+                out = Path(config["model_dir"])
+                out.mkdir(parents=True, exist_ok=True)
+                torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
+
+    out = Path(config["model_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
+    run_logger.close()
+
 
 def main():
-    # Assume project_config is imported
-    from config import project_config
-    # Use the 'autoencoder' sub-config for the sequence model too
-    db_path = Path(project_config["data_dir"]) / "imdb.db"
-    # Main directory for saving the sequence model and its components
-    sequence_model_dir = Path(project_config["model_dir"]) / "SequencePredictor"
-
-    print("\n--- Training Movie-to-People Sequence Predictor ---")
-    sequence_predictor = MoviesToPeopleSequenceAutoencoder(project_config, db_path, sequence_model_dir)
-    sequence_predictor.fit()
+    parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder using frozen row autoencoders")
+    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--save-every", type=int, default=2000)
+    parser.add_argument("--movie-limit", type=int, default=0)
+    args = parser.parse_args()
+    ml = args.movie_limit if args.movie_limit > 0 else None
+    train_sequence_predictor(project_config, steps=args.steps, save_every=args.save_every, movie_limit=ml)
 
 
 if __name__ == "__main__":
-    # Basic logging setup
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     main()
