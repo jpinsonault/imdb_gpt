@@ -1,3 +1,5 @@
+# scripts/train_imdb_sequence_decoder.py
+
 import argparse
 import time
 from pathlib import Path
@@ -6,12 +8,14 @@ from typing import Any, Dict, List, Tuple
 import sqlite3
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
 from config import project_config
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.fields import BaseField
+from scripts.autoencoder.fields import TextField, MultiCategoryField, BooleanField, ScalarField, SingleCategoryField, NumericDigitCategoryField
 from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
 
@@ -97,16 +101,24 @@ class MoviesPeopleSequenceDataset(IterableDataset):
                 )
             if not ppl:
                 continue
-            if len(ppl) < self.seq_len:
-                ppl = ppl + [ppl[-1]] * (self.seq_len - len(ppl))
+            orig_len = min(len(ppl), self.seq_len)
+            if orig_len < self.seq_len:
+                ppl = ppl + [{} for _ in range(self.seq_len - orig_len)]
             else:
                 ppl = ppl[: self.seq_len]
             x_movie = [f.transform(movie_row.get(f.name)) for f in self.movie_fields]
             y_people = []
             for f in self.people_fields:
-                seq = [f.transform_target(pr.get(f.name)) for pr in ppl]
-                y_people.append(torch.stack(seq, dim=0))
-            yield x_movie, y_people
+                steps = []
+                for t in range(self.seq_len):
+                    if t < orig_len:
+                        steps.append(f.transform_target(ppl[t].get(f.name)))
+                    else:
+                        steps.append(f.get_base_padding_value())
+                y_people.append(torch.stack(steps, dim=0))
+            mask = torch.zeros(self.seq_len, dtype=torch.float32)
+            mask[:orig_len] = 1.0
+            yield x_movie, y_people, mask
         con.close()
 
 
@@ -115,7 +127,8 @@ def _collate(batch):
     yp_cols = list(zip(*[b[1] for b in batch]))
     Xm = [torch.stack(col, dim=0) for col in xm_cols]
     Yp = [torch.stack(col, dim=0) for col in yp_cols]
-    return Xm, Yp
+    M = torch.stack([b[2] for b in batch], dim=0)
+    return Xm, Yp, M
 
 
 class MovieToPeopleSequencePredictor(nn.Module):
@@ -155,20 +168,73 @@ class MovieToPeopleSequencePredictor(nn.Module):
         return seq_outs
 
 
+def _per_sample_field_loss_seq(field: BaseField, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    if isinstance(field, ScalarField):
+        diff = pred - tgt
+        if diff.dim() > 2:
+            diff = diff.flatten(2)
+            loss = diff.pow(2).mean(dim=2)
+        else:
+            loss = diff.pow(2)
+        return loss
+    if isinstance(field, BooleanField):
+        if getattr(field, "use_bce_loss", True):
+            loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
+            if loss.dim() > 2:
+                loss = loss.flatten(2).mean(dim=2)
+            return loss
+        diff = torch.tanh(pred) - tgt
+        if diff.dim() > 2:
+            diff = diff.flatten(2).mean(dim=2)
+        else:
+            diff = diff
+        return diff.pow(2)
+    if isinstance(field, MultiCategoryField):
+        loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
+        if loss.dim() > 2:
+            loss = loss.flatten(2).mean(dim=2)
+        return loss
+    if isinstance(field, SingleCategoryField):
+        B, T = pred.shape[0], pred.shape[1]
+        C = pred.shape[-1]
+        t = tgt.long().squeeze(-1)
+        loss = F.cross_entropy(pred.view(B * T, C), t.view(B * T), reduction="none")
+        return loss.view(B, T)
+    if isinstance(field, TextField):
+        B, T, L, V = pred.shape
+        pad_id = int(field.pad_token_id)
+        loss_flat = F.cross_entropy(pred.view(B * T, L, V).reshape(B * T * L, V), tgt.view(B * T, L).reshape(B * T * L), ignore_index=pad_id, reduction="none")
+        loss_flat = loss_flat.view(B * T, L)
+        mask_tok = (tgt.view(B * T, L) != pad_id).float()
+        denom = mask_tok.sum(dim=1).clamp_min(1.0)
+        loss_bt = (loss_flat * mask_tok).sum(dim=1) / denom
+        return loss_bt.view(B, T)
+    if isinstance(field, NumericDigitCategoryField):
+        B, T, P, V = pred.shape
+        loss_flat = F.cross_entropy(pred.view(B * T * P, V), tgt.view(B * T * P).long(), reduction="none")
+        loss_bt = loss_flat.view(B * T, P).mean(dim=1)
+        return loss_bt.view(B, T)
+    diff = pred - tgt
+    if diff.dim() > 2:
+        diff = diff.flatten(2).mean(dim=2)
+    return diff.pow(2)
+
+
 def _sequence_loss_and_breakdown(
     fields: List[BaseField],
     preds_seq: List[torch.Tensor],
     targets_seq: List[torch.Tensor],
+    mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     total = 0.0
     field_losses: dict[str, float] = {}
+    denom = mask.sum().clamp_min(1.0)
     for f, pred, tgt in zip(fields, preds_seq, targets_seq):
-        b, t = pred.shape[0], pred.shape[1]
-        pm = pred.reshape(b * t, *pred.shape[2:])
-        tm = tgt.reshape(b * t, *tgt.shape[2:])
-        l = f.compute_loss(pm, tm)
-        total = total + l * float(f.weight)
-        field_losses[f.name] = float(l.detach().cpu().item())
+        per_bt = _per_sample_field_loss_seq(f, pred, tgt)
+        wsum = (per_bt * mask).sum()
+        val = wsum / denom
+        total = total + val * float(f.weight)
+        field_losses[f.name] = float(val.detach().cpu().item())
     return total, field_losses
 
 
@@ -206,9 +272,7 @@ def train_sequence_predictor(
     batch_size = int(config["batch_size"])
     lr = float(config.get("learning_rate", 2e-4))
     wd = float(config.get("weight_decay", 1e-4))
-
     model = MovieToPeopleSequencePredictor(mov.encoder, per.decoder, latent_dim, seq_len).to(device)
-
     ds = MoviesPeopleSequenceDataset(
         db_path=str(Path(config["db_path"])),
         movie_fields=mov.fields,
@@ -228,11 +292,9 @@ def train_sequence_predictor(
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
-
     opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     run_logger = build_run_logger(config)
-
     seq_logger = SequenceReconstructionLogger(
         movie_ae=mov,
         people_ae=per,
@@ -243,52 +305,42 @@ def train_sequence_predictor(
         num_samples=2,
         table_width=38,
     )
-
     step = 0
     it = iter(loader)
     model.train()
-
     with tqdm(total=steps, desc="sequence", dynamic_ncols=True) as pbar:
         while step < steps:
             t_fetch0 = time.perf_counter()
             try:
-                xm, yp = next(it)
+                xm, yp, m = next(it)
             except StopIteration:
                 it = iter(loader)
-                xm, yp = next(it)
+                xm, yp, m = next(it)
             data_time = time.perf_counter() - t_fetch0
-
             xm = [x.to(device, non_blocking=True) for x in xm]
             yp = [y.to(device, non_blocking=True) for y in yp]
-
+            m = m.to(device, non_blocking=True)
             t_step0 = time.perf_counter()
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 preds = model(xm)
-                loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp)
-
+                loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-
             batch_time = time.perf_counter() - t_step0
             iter_time = data_time + batch_time
-
             step += 1
             pbar.update(1)
             pbar.set_postfix(loss=float(loss.detach().cpu().item()))
-
             run_logger.add_scalars(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0, iter_time, opt)
             run_logger.add_field_losses("loss/sequence_people", field_breakdown)
             run_logger.tick(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0)
-
             seq_logger.on_batch_end(step)
-
             if save_every and step % save_every == 0:
                 out = Path(config["model_dir"])
                 out.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
-
     out = Path(config["model_dir"])
     out.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
