@@ -743,7 +743,7 @@ class NumericDigitCategoryField(BaseField):
         if self.total_positions is None or self.base is None or self.integer_digits is None:
             self._finalize_stats()
         arr = np.asarray(predicted_tensor)
-        if arr.ndim == 3:
+        if arr.ndim >= 2 and arr.shape[-1] == self.base:
             arr = np.argmax(arr, axis=-1)
         digits = arr.flatten().astype(int).tolist()
         idx = 0

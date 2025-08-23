@@ -23,7 +23,7 @@ project_config = {
         'weak_edge_boost': 0.10,
     },
 
-    'tensorboard_dir': 'runs',
+    'tensorboard_dir': 'logs',
 
     'log_interval': 20,
     'recon_log_interval': 20,
