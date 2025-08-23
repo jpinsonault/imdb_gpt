@@ -1,37 +1,15 @@
 from __future__ import annotations
-import sqlite3
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 
 class EdgeLossLogger:
-    """Stores the worst loss seen per edge and how many times that edge has been trained."""
+    """Tracks worst loss per edge in memory."""
 
     _BULK_SIZE = 10_000
 
     def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
-        self._set_pragmas()
-        self.cur = self.conn.cursor()
-        self.cur.execute("DROP TABLE IF EXISTS edge_losses;")
-        self.cur.execute(
-            """
-            CREATE TABLE edge_losses (
-                edgeId      INTEGER PRIMARY KEY,
-                num_trained INTEGER NOT NULL,
-                total_loss  REAL     NOT NULL
-            );
-            """
-        )
-        self.conn.commit()
         self._cache: List[Tuple[int, float]] = []
-
-    def _set_pragmas(self):
-        self.conn.execute("PRAGMA journal_mode = WAL;")
-        self.conn.execute("PRAGMA synchronous = NORMAL;")
-        self.conn.execute("PRAGMA temp_store = MEMORY;")
-        self.conn.execute("PRAGMA cache_size = -200000;")
-        self.conn.execute("PRAGMA mmap_size = 268435456;")
-        self.conn.execute("PRAGMA busy_timeout = 5000;")
+        self._loss_map: Dict[int, Tuple[int, float]] = {}
 
     def add(
         self,
@@ -48,23 +26,17 @@ class EdgeLossLogger:
     def flush(self):
         if not self._cache:
             return
-        self.cur.executemany(
-            """
-            INSERT INTO edge_losses (edgeId, num_trained, total_loss)
-            VALUES (?, 1, ?)
-            ON CONFLICT(edgeId) DO UPDATE SET
-                num_trained = edge_losses.num_trained + 1,
-                total_loss  = CASE
-                                  WHEN excluded.total_loss > edge_losses.total_loss
-                                  THEN excluded.total_loss
-                                  ELSE edge_losses.total_loss
-                              END;
-            """,
-            self._cache,
-        )
-        self.conn.commit()
+        for eid, loss in self._cache:
+            count, worst = self._loss_map.get(eid, (0, float("-inf")))
+            if loss > worst:
+                worst = loss
+            self._loss_map[eid] = (count + 1, worst)
         self._cache.clear()
+
+    def snapshot(self) -> Dict[int, float]:
+        self.flush()
+        return {eid: worst for eid, (_, worst) in self._loss_map.items()}
 
     def close(self):
         self.flush()
-        self.conn.close()
+        self._loss_map.clear()

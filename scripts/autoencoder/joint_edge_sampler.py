@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 
 class AliasSampler:
@@ -40,6 +40,7 @@ class WeightedEdgeSampler:
         batch_size: int,
         refresh_batches: int = 1_000,
         boost: float = 0.10,
+        loss_logger=None,
     ):
         self.db_path = db_path
         self.mov = movie_ae
@@ -47,6 +48,7 @@ class WeightedEdgeSampler:
         self.bs = batch_size
         self.refresh_edges = max(1, refresh_batches) * batch_size
         self.boost = boost
+        self.loss_logger = loss_logger
 
         self.edges = self._load_edges()
         self.edge_to_idx = {eid: i for i, (eid, _, _) in enumerate(self.edges)}
@@ -149,22 +151,23 @@ class WeightedEdgeSampler:
         return row
 
     def _refresh_weights(self):
-        cur = self.conn.cursor()
-        try:
-            cur.execute("SELECT edgeId,total_loss FROM edge_losses;")
-            recorded = {eid: loss for eid, loss in cur.fetchall()}
-            loss_vec = np.full(len(self.edges), 1000.0, dtype=np.float32)
-            for eid, loss in recorded.items():
-                idx = self.edge_to_idx.get(eid)
-                if idx is not None:
-                    loss_vec[idx] = loss
-            lo, hi = loss_vec.min(), loss_vec.max()
-            if hi > lo:
-                norm = (loss_vec - lo) / (hi - lo)
-                self.weights = 1.0 + self.boost * norm
-            else:
-                self.weights.fill(1.0)
-        except sqlite3.Error:
+        if self.loss_logger is None:
+            self.weights.fill(1.0)
+            self.alias = AliasSampler(self.weights / self.weights.sum())
+            return
+
+        recorded = self.loss_logger.snapshot()
+        loss_vec = np.full(len(self.edges), 1000.0, dtype=np.float32)
+        for eid, loss in recorded.items():
+            idx = self.edge_to_idx.get(eid)
+            if idx is not None:
+                loss_vec[idx] = float(loss)
+
+        lo, hi = loss_vec.min(), loss_vec.max()
+        if hi > lo:
+            norm = (loss_vec - lo) / (hi - lo)
+            self.weights = 1.0 + self.boost * norm
+        else:
             self.weights.fill(1.0)
 
         probs = self.weights / self.weights.sum()
@@ -178,6 +181,7 @@ def make_edge_sampler(
     batch_size: int,
     refresh_batches: int = 1_000,
     boost: float = 0.10,
+    loss_logger=None,
 ):
     return WeightedEdgeSampler(
         db_path,
@@ -186,4 +190,5 @@ def make_edge_sampler(
         batch_size=batch_size,
         refresh_batches=refresh_batches,
         boost=boost,
+        loss_logger=loss_logger,
     )

@@ -12,15 +12,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
+from tqdm import tqdm
 
 from config import project_config
 from scripts.autoencoder.edge_loss_logger import EdgeLossLogger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
-from scripts.autoencoder.training_callbacks import (
-    JointReconstructionLogger,
-    RowReconstructionLogger,
-)
+from scripts.autoencoder.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -89,7 +87,6 @@ def build_joint_trainer(
     warm: bool,
     db_path: Path,
 ) -> Tuple[JointAutoencoder, DataLoader, EdgeLossLogger, TitlesAutoencoder, PeopleAutoencoder, int]:
-
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
 
@@ -107,6 +104,8 @@ def build_joint_trainer(
     movie_ae.model.to(device)
     people_ae.model.to(device)
 
+    loss_logger = EdgeLossLogger(str(db_path))
+
     edge_gen = make_edge_sampler(
         db_path=str(db_path),
         movie_ae=movie_ae,
@@ -114,6 +113,7 @@ def build_joint_trainer(
         batch_size=config["batch_size"],
         refresh_batches=config["edge_sampler"]["refresh_batches"],
         boost=config["edge_sampler"]["weak_edge_boost"],
+        loss_logger=loss_logger,
     )
 
     ds = _EdgeIterable(edge_gen, movie_ae, people_ae)
@@ -131,8 +131,6 @@ def build_joint_trainer(
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
-
-    loss_logger = EdgeLossLogger(str(db_path))
 
     joint = JointAutoencoder(movie_ae, people_ae).to(device)
     total_edges = len(edge_gen.edges)
@@ -179,9 +177,11 @@ def main():
         weight_decay=float(project_config["weight_decay"]),
     )
     temperature = float(project_config.get("nce_temp", 0.07))
+    nce_weight = float(project_config.get("nce_weight", 1.0))
     log_interval = int(project_config.get("log_interval", 20))
     save_interval = int(project_config.get("save_interval", 10000))
     flush_interval = int(project_config.get("flush_interval", 2000))
+    batch_size = int(project_config["batch_size"])
 
     writer = None
     if SummaryWriter is not None:
@@ -231,80 +231,90 @@ def main():
     joint_model.train()
     global_step = 0
     data_iter = iter(loader)
-
     last_log_t = time.perf_counter()
     since_last_log = 0
+    edges_seen = 0
 
-    while True:
-        t_fetch0 = time.perf_counter()
-        M, P, eids = next(data_iter)
-        data_time = time.perf_counter() - t_fetch0
+    with tqdm(unit="batch", dynamic_ncols=True) as pbar:
+        while True:
+            t_fetch0 = time.perf_counter()
+            M, P, eids = next(data_iter)
+            data_time = time.perf_counter() - t_fetch0
 
-        M = [m.to(device, non_blocking=True) for m in M]
-        P = [p.to(device, non_blocking=True) for p in P]
-        eids = eids.to(device)
+            M = [m.to(device, non_blocking=True) for m in M]
+            P = [p.to(device, non_blocking=True) for p in P]
+            eids = eids.to(device)
 
-        t_step0 = time.perf_counter()
-        m_z, p_z, m_rec, p_rec = joint_model(M, P)
+            t_step0 = time.perf_counter()
+            m_z, p_z, m_rec, p_rec = joint_model(M, P)
 
-        rec_loss = 0.0
-        for f, pred, tgt in zip(mov_ae.fields, m_rec, M):
-            rec_loss = rec_loss + f.compute_loss(pred, tgt) * float(f.weight)
-        for f, pred, tgt in zip(per_ae.fields, p_rec, P):
-            rec_loss = rec_loss + f.compute_loss(pred, tgt) * float(f.weight)
+            rec_loss = 0.0
+            for f, pred, tgt in zip(mov_ae.fields, m_rec, M):
+                rec_loss = rec_loss + f.compute_loss(pred, tgt) * float(f.weight)
+            for f, pred, tgt in zip(per_ae.fields, p_rec, P):
+                rec_loss = rec_loss + f.compute_loss(pred, tgt) * float(f.weight)
 
-        nce = info_nce_loss(m_z, p_z, temperature=temperature)
-        total = rec_loss + 0.0 * nce
+            nce = info_nce_loss(m_z, p_z, temperature=temperature)
+            total = rec_loss + nce_weight * nce
 
-        opt.zero_grad()
-        total.backward()
-        opt.step()
+            opt.zero_grad()
+            total.backward()
+            opt.step()
 
-        batch_time = time.perf_counter() - t_step0
-        iter_time = data_time + batch_time
+            batch_time = time.perf_counter() - t_step0
+            iter_time = data_time + batch_time
 
-        total_val = float(total.detach().cpu().item())
-        rec_val = float(rec_loss.detach().cpu().item())
-        nce_val = float(nce.detach().cpu().item())
+            total_val = float(total.detach().cpu().item())
+            rec_val = float(rec_loss.detach().cpu().item())
+            nce_val = float(nce.detach().cpu().item())
 
-        for eid in eids.detach().cpu().tolist():
-            logger.add(int(eid), 0, global_step, total_val, {})
+            for eid in eids.detach().cpu().tolist():
+                logger.add(int(eid), 0, global_step, total_val, {})
 
-        if writer is not None:
-            writer.add_scalar("loss/total", total_val, global_step)
-            writer.add_scalar("loss/reconstruction", rec_val, global_step)
-            writer.add_scalar("loss/nce", nce_val, global_step)
-            writer.add_scalar("time/iter_sec", iter_time, global_step)
-            for i, g in enumerate(opt.param_groups):
-                writer.add_scalar(f"lr/group_{i}", float(g["lr"]), global_step)
+            if writer is not None:
+                writer.add_scalar("loss/total", total_val, global_step)
+                writer.add_scalar("loss/reconstruction", rec_val, global_step)
+                writer.add_scalar("loss/nce", nce_val, global_step)
+                writer.add_scalar("time/iter_sec", iter_time, global_step)
+                writer.add_scalar("coeff/nce_weight", nce_weight, global_step)
+                for i, g in enumerate(opt.param_groups):
+                    writer.add_scalar(f"lr/group_{i}", float(g["lr"]), global_step)
 
-        since_last_log += 1
-        if since_last_log % log_interval == 0:
-            now = time.perf_counter()
-            elapsed = max(1e-9, now - last_log_t)
-            ips = (log_interval * project_config["batch_size"]) / elapsed
-            last_log_t = now
-            logging.info(
-                f"step {global_step} "
-                f"loss {total_val:.4f} rec {rec_val:.4f} nce {nce_val:.4f} "
-                f"dt {data_time:.3f}s bt {batch_time:.3f}s ips {_fmt(ips)}"
+            since_last_log += 1
+            if since_last_log % log_interval == 0:
+                now = time.perf_counter()
+                elapsed = max(1e-9, now - last_log_t)
+                ips = (log_interval * batch_size) / elapsed
+                last_log_t = now
+                logging.info(
+                    f"step {global_step} loss {total_val:.4f} rec {rec_val:.4f} nce {nce_val:.4f} dt {data_time:.3f}s bt {batch_time:.3f}s ips {_fmt(ips)}"
+                )
+
+            edges_seen += batch_size
+            pbar.update(1)
+            pbar.set_description(f"batches {global_step + 1}")
+            pbar.set_postfix(
+                edges=f"{min(edges_seen, total_edges)}/{total_edges}",
+                loss=f"{total_val:.4f}",
+                rec=f"{rec_val:.4f}",
+                nce=f"{nce_val:.4f}",
             )
 
-        JointReconstructionLogger.on_batch_end(joint_recon, global_step)
-        RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
-        RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
+            JointReconstructionLogger.on_batch_end(joint_recon, global_step)
+            RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
+            RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
 
-        if (global_step + 1) % flush_interval == 0:
-            logger.flush()
+            if (global_step + 1) % flush_interval == 0:
+                logger.flush()
 
-        if (global_step + 1) % save_interval == 0:
-            mov_ae.save_model()
-            per_ae.save_model()
-            logging.info(f"checkpoint saved at step {global_step+1}")
+            if (global_step + 1) % save_interval == 0:
+                mov_ae.save_model()
+                per_ae.save_model()
+                logging.info(f"checkpoint saved at step {global_step+1}")
 
-        global_step += 1
-        if stop_flag["stop"]:
-            break
+            global_step += 1
+            if stop_flag["stop"]:
+                break
 
     logger.flush()
     mov_ae.save_model()

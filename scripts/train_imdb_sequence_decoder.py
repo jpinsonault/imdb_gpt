@@ -79,12 +79,12 @@ class MoviesToPeopleSequenceAutoencoder:
 
         # instantiate and immediately load & freeze the pretrained row autoencoders
         self.movie_autoencoder_instance = TitlesAutoencoder(config, db_path, model_dir / "TitlesAutoencoder")
-        self.movie_autoencoder_instance.load_model()
+        # self.movie_autoencoder_instance.load_model()
         self.movie_encoder = self.movie_autoencoder_instance.encoder
         self.movie_encoder.trainable = False
 
         self.people_autoencoder_instance = PeopleAutoencoder(config, db_path, model_dir / "PeopleAutoencoder")
-        self.people_autoencoder_instance.load_model()
+        # self.people_autoencoder_instance.load_model()
         self.people_decoder = self.people_autoencoder_instance.decoder
         self.people_decoder.trainable = False
 
