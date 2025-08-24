@@ -131,6 +131,38 @@ def _collate(batch):
     return Xm, Yp, M
 
 
+class _TransformerTrunk(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        seq_len: int,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.query = nn.Parameter(torch.randn(seq_len, latent_dim))
+        layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_mult * latent_dim,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(latent_dim)
+
+    def forward(self, z_m: torch.Tensor) -> torch.Tensor:
+        memory = z_m.unsqueeze(0)
+        q = self.query.unsqueeze(1).expand(self.seq_len, z_m.size(0), z_m.size(1))
+        out = self.decoder(q, memory)
+        out = out.transpose(0, 1)
+        out = self.norm(out)
+        return out
+
+
 class MovieToPeopleSequencePredictor(nn.Module):
     def __init__(
         self,
@@ -140,26 +172,29 @@ class MovieToPeopleSequencePredictor(nn.Module):
         seq_len: int,
         width: int | None = None,
         depth: int = 3,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.movie_encoder = movie_encoder
         self.people_decoder = people_decoder
         self.latent_dim = latent_dim
         self.seq_len = seq_len
-        w = width or latent_dim * 2
-        layers = []
-        layers.append(nn.Linear(latent_dim, w))
-        layers.append(nn.GELU())
-        for _ in range(max(0, depth - 1)):
-            layers.append(nn.Linear(w, w))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(w, latent_dim * seq_len))
-        self.trunk = nn.Sequential(*layers)
+        self.trunk = _TransformerTrunk(
+            latent_dim=latent_dim,
+            seq_len=seq_len,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_mult=ff_mult,
+            dropout=dropout,
+        )
 
     def forward(self, movie_inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         z_m = self.movie_encoder(movie_inputs)
-        b = z_m.size(0)
-        z_seq = self.trunk(z_m).view(b, self.seq_len, self.latent_dim)
+        z_seq = self.trunk(z_m)
+        b = z_seq.size(0)
         flat = z_seq.reshape(b * self.seq_len, self.latent_dim)
         outs = self.people_decoder(flat)
         seq_outs = []
@@ -238,6 +273,35 @@ def _sequence_loss_and_breakdown(
     return total, field_losses
 
 
+def _unit_normalize(x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x, dim=-1)
+
+
+def _info_nce_pair(z_pred: torch.Tensor, z_tgt: torch.Tensor, temperature: float) -> torch.Tensor:
+    logits = z_pred @ z_tgt.t()
+    logits = logits / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+
+def _encode_people_latents_for_timestep(
+    people_encoder: nn.Module,
+    targets_seq: List[torch.Tensor],
+    timestep: int,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    xs = []
+    for y in targets_seq:
+        sl = y.index_select(dim=1, index=torch.tensor([timestep], device=y.device))
+        sl = sl.squeeze(1)
+        sl = sl.index_select(dim=0, index=indices)
+        xs.append(sl)
+    with torch.no_grad():
+        z = people_encoder(xs)
+    return z
+
+
 def _load_frozen_autoencoders(config: Dict[str, Any]) -> Tuple[TitlesAutoencoder, PeopleAutoencoder]:
     mov = TitlesAutoencoder(config)
     per = PeopleAutoencoder(config)
@@ -250,12 +314,16 @@ def _load_frozen_autoencoders(config: Dict[str, Any]) -> Tuple[TitlesAutoencoder
     model_dir = Path(config["model_dir"])
     mov.encoder.load_state_dict(torch.load(model_dir / "TitlesAutoencoder_encoder.pt", map_location="cpu"))
     per.decoder.load_state_dict(torch.load(model_dir / "PeopleAutoencoder_decoder.pt", map_location="cpu"))
+    per.encoder.load_state_dict(torch.load(model_dir / "PeopleAutoencoder_encoder.pt", map_location="cpu"))
     for p in mov.encoder.parameters():
         p.requires_grad = False
     for p in per.decoder.parameters():
         p.requires_grad = False
+    for p in per.encoder.parameters():
+        p.requires_grad = False
     mov.encoder.eval()
     per.decoder.eval()
+    per.encoder.eval()
     return mov, per
 
 
@@ -272,6 +340,9 @@ def train_sequence_predictor(
     batch_size = int(config["batch_size"])
     lr = float(config.get("learning_rate", 2e-4))
     wd = float(config.get("weight_decay", 1e-4))
+    temp = float(config.get("latent_temperature", 0.07))
+    w_lat = float(config.get("latent_loss_weight", 1.0))
+    w_rec = float(config.get("recon_loss_weight", 0.1))
     model = MovieToPeopleSequencePredictor(mov.encoder, per.decoder, latent_dim, seq_len).to(device)
     ds = MoviesPeopleSequenceDataset(
         db_path=str(Path(config["db_path"])),
@@ -292,6 +363,9 @@ def train_sequence_predictor(
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
+    mov.encoder.to(device)
+    per.decoder.to(device)
+    per.encoder.to(device)
     opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     run_logger = build_run_logger(config)
@@ -323,7 +397,25 @@ def train_sequence_predictor(
             t_step0 = time.perf_counter()
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 preds = model(xm)
-                loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
+                rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
+                with torch.no_grad():
+                    z_seq_pred = model.trunk(mov.encoder(xm))
+                    z_seq_pred = _unit_normalize(z_seq_pred)
+                nce_losses = []
+                for t in range(seq_len):
+                    idx = torch.nonzero(m[:, t] > 0.5, as_tuple=False).flatten()
+                    if idx.numel() < 2:
+                        continue
+                    zt = _encode_people_latents_for_timestep(per.encoder, yp, t, idx)
+                    zt = _unit_normalize(zt)
+                    zp = z_seq_pred.index_select(dim=1, index=torch.tensor([t], device=z_seq_pred.device)).squeeze(1)
+                    zp = zp.index_select(dim=0, index=idx)
+                    nce_losses.append(_info_nce_pair(zp, zt, temp))
+                if nce_losses:
+                    nce_loss = torch.stack(nce_losses).mean()
+                else:
+                    nce_loss = torch.tensor(0.0, device=device)
+                loss = w_lat * nce_loss + w_rec * rec_loss
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -333,9 +425,9 @@ def train_sequence_predictor(
             step += 1
             pbar.update(1)
             pbar.set_postfix(loss=float(loss.detach().cpu().item()))
-            run_logger.add_scalars(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0, iter_time, opt)
+            run_logger.add_scalars(float(loss.detach().cpu().item()), float(rec_loss.detach().cpu().item()), float(nce_loss.detach().cpu().item()), iter_time, opt)
             run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-            run_logger.tick(float(loss.detach().cpu().item()), float(loss.detach().cpu().item()), 0.0)
+            run_logger.tick(float(loss.detach().cpu().item()), float(rec_loss.detach().cpu().item()), float(nce_loss.detach().cpu().item()))
             seq_logger.on_batch_end(step)
             if save_every and step % save_every == 0:
                 out = Path(config["model_dir"])
@@ -348,7 +440,7 @@ def train_sequence_predictor(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder using frozen row autoencoders")
+    parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder with latent supervision")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--movie-limit", type=int, default=0)

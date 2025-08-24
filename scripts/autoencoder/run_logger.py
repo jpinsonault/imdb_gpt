@@ -108,12 +108,7 @@ class RunLogger:
         if self.step % self.log_every != 0:
             return
         now = time.perf_counter()
-        elapsed = max(1e-9, now - self.last_log_t)
-        ips = (self.log_every * self.batch_size) / elapsed
         self.last_log_t = now
-        logging.info(
-            f"step {self.step} loss {total:.4f} rec {rec:.4f} nce {nce:.4f} ips {ips:.2f}"
-        )
 
     def close(self):
         if self.writer:
