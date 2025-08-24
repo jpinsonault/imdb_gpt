@@ -7,13 +7,13 @@ project_config = {
     'docker_data_dir_mount': '/app/imdb',
 
     'latent_dim': 256,
-    'batch_size': 512,
+    'batch_size': 1024,
     'learning_rate': 0.0005,
     'weight_decay': 1e-4,
 
     'reconstruction_interval': 100,
     'callback_interval': 100,
-    'people_sequence_length': 1,
+    'people_sequence_length': 10,
     'movie_limit': 1000000000,
     'db_path': './data/imdb.db',
     'nce_temp': 0.03,
@@ -32,6 +32,6 @@ project_config = {
     'save_interval': 10000,
     'flush_interval': 2000,
     'use_cuda_graphs': True,
-    'num_workers': 6,
-    'prefetch_factor': 6,
+    'num_workers': 1,
+    'prefetch_factor': 1,
 }

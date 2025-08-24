@@ -149,6 +149,43 @@ class _GPUEventTimer:
             frags.append(f"{k:>8}: {ms:7.2f} ms {pct:6.1f}%")
         print(f"[step {step_idx}] " + " | ".join(frags))
 
+class CudaPrefetcher:
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+        self.it = iter(loader)
+        self.next_batch = None
+        self._preload()
+
+    def _to_device(self, batch):
+        xm, yp, m = batch
+        xm = [x.to(self.device, non_blocking=True) for x in xm]
+        yp = [y.to(self.device, non_blocking=True) for y in yp]
+        m = m.to(self.device, non_blocking=True)
+        return xm, yp, m
+
+    def _preload(self):
+        try:
+            batch = next(self.it)
+        except StopIteration:
+            self.next_batch = None
+            return
+        if self.stream is None:
+            self.next_batch = self._to_device(batch)
+            return
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(batch)
+
+    def next(self):
+        if self.next_batch is None:
+            return None
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        self._preload()
+        return batch
+
 class MoviesPeopleSequenceDataset(IterableDataset):
     def __init__(
         self,
@@ -186,28 +223,48 @@ class MoviesPeopleSequenceDataset(IterableDataset):
             AND t.numVotes >= 10
         GROUP BY t.tconst
         """
-        self.people_sql = """
-        SELECT
-            p.primaryName,
-            p.birthYear,
-            p.deathYear,
-            GROUP_CONCAT(pp.profession, ',')
-        FROM people p
-        LEFT JOIN people_professions pp ON p.nconst = pp.nconst
-        INNER JOIN principals pr ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
-        GROUP BY p.nconst
-        HAVING COUNT(pp.profession) > 0
-        ORDER BY pr.ordering
-        LIMIT ?
-        """
+        self.seq_lookup_sql = "SELECT people_json FROM movie_people_seq WHERE tconst = ? LIMIT 1"
 
     def __iter__(self):
+        import json
+        import sqlite3
+        from torch.utils.data import get_worker_info
+
         con = sqlite3.connect(self.db_path, check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA temp_store=MEMORY;")
+        con.execute("PRAGMA cache_size=-200000;")
+        con.execute("PRAGMA mmap_size=268435456;")
+        con.execute("PRAGMA busy_timeout=5000;")
+
         cur = con.cursor()
         lim = "" if self.movie_limit is None else f" LIMIT {int(self.movie_limit)}"
         cur.execute(self.movie_sql + lim)
-        for tconst, title, startYear, endYear, runtime, rating, votes, genres in cur:
+
+        wi = get_worker_info()
+        if wi is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = wi.id
+            num_workers = wi.num_workers
+
+        for idx, row in enumerate(cur):
+            if (idx % num_workers) != worker_id:
+                continue
+
+            tconst, title, startYear, endYear, runtime, rating, votes, genres = row
+            s = con.execute(self.seq_lookup_sql, (tconst,)).fetchone()
+            if not s:
+                continue
+            ppl = json.loads(s[0]) or []
+            orig_len = min(len(ppl), self.seq_len)
+            if orig_len < self.seq_len:
+                ppl = ppl + [{} for _ in range(self.seq_len - orig_len)]
+            else:
+                ppl = ppl[: self.seq_len]
+
             movie_row = {
                 "tconst": tconst,
                 "primaryTitle": title,
@@ -218,24 +275,9 @@ class MoviesPeopleSequenceDataset(IterableDataset):
                 "numVotes": votes,
                 "genres": genres.split(",") if genres else [],
             }
-            ppl = []
-            for r in con.execute(self.people_sql, (tconst, self.seq_len)):
-                ppl.append(
-                    {
-                        "primaryName": r[0],
-                        "birthYear": r[1],
-                        "deathYear": r[2],
-                        "professions": r[3].split(",") if r[3] else None,
-                    }
-                )
-            if not ppl:
-                continue
-            orig_len = min(len(ppl), self.seq_len)
-            if orig_len < self.seq_len:
-                ppl = ppl + [{} for _ in range(self.seq_len - orig_len)]
-            else:
-                ppl = ppl[: self.seq_len]
+
             x_movie = [f.transform(movie_row.get(f.name)) for f in self.movie_fields]
+
             y_people = []
             for f in self.people_fields:
                 steps = []
@@ -245,9 +287,11 @@ class MoviesPeopleSequenceDataset(IterableDataset):
                     else:
                         steps.append(f.get_base_padding_value())
                 y_people.append(torch.stack(steps, dim=0))
+
             mask = torch.zeros(self.seq_len, dtype=torch.float32)
             mask[:orig_len] = 1.0
             yield x_movie, y_people, mask
+
         con.close()
 
 
@@ -455,6 +499,159 @@ def _load_frozen_autoencoders(config: Dict[str, Any]) -> Tuple[TitlesAutoencoder
     per.encoder.eval()
     return mov, per
 
+class MoviesPeopleSequenceMemoryDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        db_path: str,
+        movie_fields: List[BaseField],
+        people_fields: List[BaseField],
+        seq_len: int,
+        movie_limit: int | None = None,
+    ):
+        super().__init__()
+        self.db_path = db_path
+        self.movie_fields = movie_fields
+        self.people_fields = people_fields
+        self.seq_len = seq_len
+        self.movie_limit = movie_limit
+        self.movie_sql = """
+        SELECT
+            t.tconst,
+            t.primaryTitle,
+            t.startYear,
+            t.endYear,
+            t.runtimeMinutes,
+            t.averageRating,
+            t.numVotes,
+            GROUP_CONCAT(g.genre, ',')
+        FROM titles t
+        INNER JOIN title_genres g ON g.tconst = t.tconst
+        WHERE
+            t.startYear IS NOT NULL
+            AND t.averageRating IS NOT NULL
+            AND t.runtimeMinutes IS NOT NULL
+            AND t.runtimeMinutes >= 5
+            AND t.startYear >= 1850
+            AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
+            AND t.numVotes >= 10
+        GROUP BY t.tconst
+        """
+        self.people_sql = """
+        SELECT
+            p.primaryName,
+            p.birthYear,
+            p.deathYear,
+            GROUP_CONCAT(pp.profession, ',')
+        FROM people p
+        LEFT JOIN people_professions pp ON p.nconst = pp.nconst
+        INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
+        GROUP BY p.nconst
+        HAVING COUNT(pp.profession) > 0
+        ORDER BY pr.ordering
+        LIMIT ?
+        """
+        self.samples = self._materialize()
+
+    def _materialize(self):
+        import sqlite3
+        con = sqlite3.connect(self.db_path, check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA temp_store=MEMORY;")
+        con.execute("PRAGMA cache_size=-200000;")
+        con.execute("PRAGMA mmap_size=268435456;")
+        con.execute("PRAGMA busy_timeout=5000;")
+        cur = con.cursor()
+        lim = "" if self.movie_limit is None else f" LIMIT {int(self.movie_limit)}"
+        cur.execute(self.movie_sql + lim)
+        out = []
+        for tconst, title, startYear, endYear, runtime, rating, votes, genres in cur:
+            movie_row = {
+                "tconst": tconst,
+                "primaryTitle": title,
+                "startYear": startYear,
+                "endYear": endYear,
+                "runtimeMinutes": runtime,
+                "averageRating": rating,
+                "numVotes": votes,
+                "genres": genres.split(",") if genres else [],
+            }
+            ppl_rows = con.execute(self.people_sql, (tconst, self.seq_len)).fetchall()
+            if not ppl_rows:
+                continue
+            ppl = []
+            for r in ppl_rows:
+                ppl.append({
+                    "primaryName": r[0],
+                    "birthYear": r[1],
+                    "deathYear": r[2],
+                    "professions": r[3].split(",") if r[3] else None,
+                })
+            orig_len = min(len(ppl), self.seq_len)
+            if orig_len < self.seq_len:
+                ppl = ppl + [{} for _ in range(self.seq_len - orig_len)]
+            else:
+                ppl = ppl[: self.seq_len]
+            x_movie = [f.transform(movie_row.get(f.name)) for f in self.movie_fields]
+            y_people = []
+            for f in self.people_fields:
+                steps = []
+                for t in range(self.seq_len):
+                    if t < orig_len:
+                        steps.append(f.transform_target(ppl[t].get(f.name)))
+                    else:
+                        steps.append(f.get_base_padding_value())
+                y_people.append(torch.stack(steps, dim=0))
+            mask = torch.zeros(self.seq_len, dtype=torch.float32)
+            mask[:orig_len] = 1.0
+            out.append((x_movie, y_people, mask))
+        con.close()
+        return out
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        return self.samples[idx]
+
+class CudaPrefetcher:
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+        self.it = iter(loader)
+        self.next_batch = None
+        self._preload()
+
+    def _to_device(self, batch):
+        xm, yp, m = batch
+        xm = [x.to(self.device, non_blocking=True) for x in xm]
+        yp = [y.to(self.device, non_blocking=True) for y in yp]
+        m = m.to(self.device, non_blocking=True)
+        return xm, yp, m
+
+    def _preload(self):
+        try:
+            batch = next(self.it)
+        except StopIteration:
+            self.next_batch = None
+            return
+        if self.stream is None:
+            self.next_batch = self._to_device(batch)
+            return
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(batch)
+
+    def next(self):
+        if self.next_batch is None:
+            return None
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        self._preload()
+        return batch
+
 
 def train_sequence_predictor(
     config: Dict[str, Any],
@@ -478,6 +675,14 @@ def train_sequence_predictor(
     use_compile = bool(config.get("compile_trunk", True))
     use_compile_nce = bool(config.get("compile_nce", True))
     use_cuda_graphs = bool(config.get("use_cuda_graphs", False))
+
+    from scripts.precompute_movie_people_seq import build_movie_people_seq
+    import sqlite3
+    _conn = sqlite3.connect(str(Path(config["db_path"])))
+    _has = _conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='movie_people_seq'").fetchone()
+    _conn.close()
+    if _has is None:
+        build_movie_people_seq(str(Path(config["db_path"])), seq_len)
 
     model = MovieToPeopleSequencePredictor(
         movie_encoder=mov.encoder,
@@ -519,6 +724,7 @@ def train_sequence_predictor(
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
+        drop_last=False,
     )
 
     mov.encoder.to(device)
@@ -548,22 +754,19 @@ def train_sequence_predictor(
     timer = _GPUEventTimer(print_every=log_every)
 
     step = 0
-    it = iter(loader)
+    prefetch = CudaPrefetcher(loader, device)
     model.train()
 
     with tqdm(total=steps, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
         while step < steps:
             with timer.cpu_range("data"):
-                try:
-                    xm, yp, m = next(it)
-                except StopIteration:
-                    it = iter(loader)
-                    xm, yp, m = next(it)
-
-            with timer.cpu_range("h2d"):
-                xm = [x.to(device, non_blocking=True) for x in xm]
-                yp = [y.to(device, non_blocking=True) for y in yp]
-                m = m.to(device, non_blocking=True)
+                batch = prefetch.next()
+                if batch is None:
+                    prefetch = CudaPrefetcher(loader, device)
+                    batch = prefetch.next()
+                    if batch is None:
+                        break
+                xm, yp, m = batch
 
             timer.start_step()
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
@@ -606,26 +809,23 @@ def train_sequence_predictor(
             step += 1
             pbar.update(1)
 
-            if step % log_every == 0:
-                vals = timer.end_step_and_accumulate()
-                if vals is not None:
-                    keys, out = vals
-                    timer.print_line(keys, out, step)
-                    run_logger.add_scalars(
-                        float(loss.detach().cpu().item()),
-                        float(rec_loss.detach().cpu().item()),
-                        float(nce_loss.detach().cpu().item()),
-                        out["total"] / 1000.0,
-                        opt,
-                    )
-                    run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-                    run_logger.tick(
-                        float(loss.detach().cpu().item()),
-                        float(rec_loss.detach().cpu().item()),
-                        float(nce_loss.detach().cpu().item()),
-                    )
-            else:
-                timer.end_step_and_accumulate()
+            vals = timer.end_step_and_accumulate()
+            if vals is not None:
+                keys, out = vals
+                timer.print_line(keys, out, step)
+                run_logger.add_scalars(
+                    float(loss.detach().cpu().item()),
+                    float(rec_loss.detach().cpu().item()),
+                    float(nce_loss.detach().cpu().item()),
+                    out["total"] / 1000.0,
+                    opt,
+                )
+                run_logger.add_field_losses("loss/sequence_people", field_breakdown)
+                run_logger.tick(
+                    float(loss.detach().cpu().item()),
+                    float(rec_loss.detach().cpu().item()),
+                    float(nce_loss.detach().cpu().item()),
+                )
 
             seq_logger.on_batch_end(step)
 
@@ -638,7 +838,6 @@ def train_sequence_predictor(
     out.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
     run_logger.close()
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder with latent supervision")
