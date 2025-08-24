@@ -20,6 +20,134 @@ from scripts.autoencoder.fields import TextField, MultiCategoryField, BooleanFie
 from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
 
+class _TransformerTrunk(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        seq_len: int,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+        use_sdp: bool = True,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.use_sdp = use_sdp
+        self.query = nn.Parameter(torch.randn(seq_len, latent_dim))
+        layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_mult * latent_dim,
+            dropout=dropout,
+            batch_first=False,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(latent_dim)
+
+    def forward(self, z_m: torch.Tensor) -> torch.Tensor:
+        memory = z_m.unsqueeze(0)
+        q = self.query.unsqueeze(1).expand(self.seq_len, z_m.size(0), z_m.size(1))
+        if self.use_sdp and torch.backends.cuda.is_built():
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
+                out = self.decoder(q, memory)
+        else:
+            out = self.decoder(q, memory)
+        out = out.transpose(0, 1)
+        out = self.norm(out)
+        return out
+
+class _GPUEventTimer:
+    def __init__(self, print_every: int):
+        self.print_every = max(1, int(print_every))
+        self.reset_accum()
+        self._step = 0
+
+    def reset_accum(self):
+        self.accum_ms = {
+            "total": 0.0,
+            "data": 0.0,
+            "h2d": 0.0,
+            "mov_enc": 0.0,
+            "trunk": 0.0,
+            "ppl_dec": 0.0,
+            "rec": 0.0,
+            "tgt_enc": 0.0,
+            "nce": 0.0,
+            "backward": 0.0,
+            "opt": 0.0,
+        }
+
+    def _event_pair(self):
+        return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+    def start_step(self):
+        self._t0 = time.perf_counter()
+        self._pairs = {}
+
+    def end_step_and_accumulate(self):
+        self.accum_ms["total"] += (time.perf_counter() - self._t0) * 1000.0
+        self._step += 1
+        if self._step % self.print_every != 0:
+            return None
+        torch.cuda.synchronize()
+        out = {}
+        total = self.accum_ms["total"]
+        parts = 0.0
+        for k, v in self.accum_ms.items():
+            if k == "total":
+                continue
+            parts += v
+        residual = max(0.0, total - parts)
+        keys = ["total","backward","trunk","mov_enc","tgt_enc","rec","opt","ppl_dec","nce","data","h2d","residual"]
+        out["total"] = total
+        out["backward"] = self.accum_ms["backward"]
+        out["trunk"] = self.accum_ms["trunk"]
+        out["mov_enc"] = self.accum_ms["mov_enc"]
+        out["tgt_enc"] = self.accum_ms["tgt_enc"]
+        out["rec"] = self.accum_ms["rec"]
+        out["opt"] = self.accum_ms["opt"]
+        out["ppl_dec"] = self.accum_ms["ppl_dec"]
+        out["nce"] = self.accum_ms["nce"]
+        out["data"] = self.accum_ms["data"]
+        out["h2d"] = self.accum_ms["h2d"]
+        out["residual"] = residual
+        self.reset_accum()
+        return keys, out
+
+    def cpu_range(self, name):
+        class _R:
+            def __init__(self, outer, nm):
+                self.o = outer
+                self.nm = nm
+            def __enter__(self):
+                self.t0 = time.perf_counter()
+            def __exit__(self, a, b, c):
+                self.o.accum_ms[self.nm] += (time.perf_counter() - self.t0) * 1000.0
+        return _R(self, name)
+
+    def gpu_range(self, name):
+        class _R:
+            def __init__(self, outer, nm):
+                self.o = outer
+                self.nm = nm
+            def __enter__(self):
+                self.s, self.e = self.o._event_pair()
+                self.s.record()
+            def __exit__(self, a, b, c):
+                self.e.record()
+                torch.cuda.synchronize()
+                self.o.accum_ms[self.nm] += self.s.elapsed_time(self.e)
+        return _R(self, name)
+
+    def print_line(self, keys, vals, step_idx):
+        total = vals["total"]
+        frags = []
+        for k in keys:
+            ms = vals[k]
+            pct = 0.0 if total <= 0 else (ms / total) * 100.0
+            frags.append(f"{k:>8}: {ms:7.2f} ms {pct:6.1f}%")
+        print(f"[step {step_idx}] " + " | ".join(frags))
 
 class MoviesPeopleSequenceDataset(IterableDataset):
     def __init__(
@@ -286,7 +414,7 @@ def _info_nce_pair(z_pred: torch.Tensor, z_tgt: torch.Tensor, temperature: float
     return loss
 
 
-def _encode_people_latents_for_timestep(
+def _encode_people_latents_vectorized(
     people_encoder: nn.Module,
     targets_seq: List[torch.Tensor],
     timestep: int,
@@ -294,13 +422,13 @@ def _encode_people_latents_for_timestep(
 ) -> torch.Tensor:
     xs = []
     for y in targets_seq:
-        sl = y.index_select(dim=1, index=torch.tensor([timestep], device=y.device))
-        sl = sl.squeeze(1)
-        sl = sl.index_select(dim=0, index=indices)
+        sl = y.narrow(1, timestep, 1).squeeze(1)
+        sl = sl.index_select(0, indices)
         xs.append(sl)
     with torch.no_grad():
         z = people_encoder(xs)
     return z
+
 
 
 def _load_frozen_autoencoders(config: Dict[str, Any]) -> Tuple[TitlesAutoencoder, PeopleAutoencoder]:
@@ -347,6 +475,9 @@ def train_sequence_predictor(
     w_lat = float(config.get("latent_loss_weight", 1.0))
     w_rec = float(config.get("recon_loss_weight", 0.1))
     log_every = int(config.get("log_interval", 20))
+    use_compile = bool(config.get("compile_trunk", True))
+    use_compile_nce = bool(config.get("compile_nce", True))
+    use_cuda_graphs = bool(config.get("use_cuda_graphs", False))
 
     model = MovieToPeopleSequencePredictor(
         movie_encoder=mov.encoder,
@@ -354,6 +485,19 @@ def train_sequence_predictor(
         latent_dim=latent_dim,
         seq_len=seq_len,
     ).to(device)
+
+    if use_compile and hasattr(torch, "compile"):
+        try:
+            model.trunk = torch.compile(model.trunk, mode="max-autotune")
+        except Exception:
+            pass
+
+    compiled_nce = _info_nce_pair
+    if use_compile_nce and hasattr(torch, "compile"):
+        try:
+            compiled_nce = torch.compile(_info_nce_pair, mode="max-autotune")
+        except Exception:
+            compiled_nce = _info_nce_pair
 
     ds = MoviesPeopleSequenceDataset(
         db_path=str(Path(config["db_path"])),
@@ -381,7 +525,7 @@ def train_sequence_predictor(
     per.decoder.to(device)
     per.encoder.to(device)
 
-    opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd)
+    opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd, fused=True)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     run_logger = build_run_logger(config)
@@ -396,14 +540,12 @@ def train_sequence_predictor(
         table_width=38,
     )
 
-    def _sync():
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
     it_preview = iter(loader)
     xm0, _, _ = next(it_preview)
     xm0 = [x.to(device) for x in xm0]
     print_model_layers_with_shapes(model, xm0)
+
+    timer = _GPUEventTimer(print_every=log_every)
 
     step = 0
     it = iter(loader)
@@ -411,103 +553,79 @@ def train_sequence_predictor(
 
     with tqdm(total=steps, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
         while step < steps:
-            t0 = time.perf_counter()
-            try:
-                xm, yp, m = next(it)
-            except StopIteration:
-                it = iter(loader)
-                xm, yp, m = next(it)
-            t1 = time.perf_counter()
-            xm = [x.to(device, non_blocking=True) for x in xm]
-            yp = [y.to(device, non_blocking=True) for y in yp]
-            m = m.to(device, non_blocking=True)
-            _sync()
-            t2 = time.perf_counter()
+            with timer.cpu_range("data"):
+                try:
+                    xm, yp, m = next(it)
+                except StopIteration:
+                    it = iter(loader)
+                    xm, yp, m = next(it)
 
+            with timer.cpu_range("h2d"):
+                xm = [x.to(device, non_blocking=True) for x in xm]
+                yp = [y.to(device, non_blocking=True) for y in yp]
+                m = m.to(device, non_blocking=True)
+
+            timer.start_step()
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                _sync()
-                t3 = time.perf_counter()
-                z_m = mov.encoder(xm)
-                _sync()
-                t4 = time.perf_counter()
-                z_seq = model.trunk(z_m)
-                _sync()
-                t5 = time.perf_counter()
+                with timer.gpu_range("mov_enc"):
+                    z_m = mov.encoder(xm)
+                with timer.gpu_range("trunk"):
+                    z_seq = model.trunk(z_m)
                 b = z_seq.size(0)
                 flat = z_seq.reshape(b * seq_len, latent_dim)
-                outs = per.decoder(flat)
+                with timer.gpu_range("ppl_dec"):
+                    outs = per.decoder(flat)
                 preds = [y.view(b, seq_len, *y.shape[1:]) for y in outs]
-                _sync()
-                t6 = time.perf_counter()
-
-                rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
-                _sync()
-                t7 = time.perf_counter()
-
-                z_seq_pred = _unit_normalize(z_seq)
-                nce_losses = []
-                for t in range(seq_len):
-                    idx = torch.nonzero(m[:, t] > 0.5, as_tuple=False).flatten()
-                    if idx.numel() < 2:
-                        continue
-                    zt = _encode_people_latents_for_timestep(per.encoder, yp, t, idx)
-                    zt = _unit_normalize(zt)
-                    zp = z_seq_pred.index_select(dim=1, index=torch.tensor([t], device=z_seq_pred.device)).squeeze(1)
-                    zp = zp.index_select(dim=0, index=idx)
-                    nce_losses.append(_info_nce_pair(zp, zt, temp))
-                _sync()
-                if nce_losses:
-                    nce_loss = torch.stack(nce_losses).mean()
-                else:
-                    nce_loss = torch.tensor(0.0, device=device)
-
+                with timer.gpu_range("rec"):
+                    rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
+                with timer.gpu_range("tgt_enc"):
+                    z_seq_pred = _unit_normalize(z_seq)
+                    nce_losses = []
+                    for t in range(seq_len):
+                        idx = torch.nonzero(m[:, t] > 0.5, as_tuple=False).flatten()
+                        if idx.numel() < 2:
+                            continue
+                        zt = _encode_people_latents_vectorized(per.encoder, yp, t, idx)
+                        zt = _unit_normalize(zt)
+                        zp = z_seq_pred.index_select(dim=1, index=torch.tensor([t], device=z_seq_pred.device)).squeeze(1)
+                        zp = zp.index_select(dim=0, index=idx)
+                        nce_losses.append(compiled_nce(zp, zt, temp))
+                    if nce_losses:
+                        nce_loss = torch.stack(nce_losses).mean()
+                    else:
+                        nce_loss = torch.tensor(0.0, device=device)
                 loss = w_lat * nce_loss + w_rec * rec_loss
 
-            _sync()
-            t8 = time.perf_counter()
-            opt.zero_grad()
-            scaler.scale(loss).backward()
-            _sync()
-            t9 = time.perf_counter()
-            scaler.step(opt)
-            scaler.update()
-            _sync()
-            t10 = time.perf_counter()
+            with timer.gpu_range("backward"):
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+            with timer.gpu_range("opt"):
+                scaler.step(opt)
+                scaler.update()
 
             step += 1
             pbar.update(1)
 
-            iter_time = t10 - t0
-            tim = {
-                "data": t1 - t0,
-                "h2d": t2 - t1,
-                "mov_enc": t4 - t3,
-                "trunk": t5 - t4,
-                "ppl_dec": t6 - t5,
-                "rec": t7 - t6,
-                "tgt_enc": (t8 - t7) - (t8 - t7 - sum([])),
-                "nce": 0.0,
-                "backward": t9 - t8,
-                "opt": t10 - t9,
-                "total": iter_time,
-            }
-
-            do_log = (step % log_every == 0)
-            if do_log:
-                run_logger.add_scalars(
-                    float(loss.detach().cpu().item()),
-                    float(rec_loss.detach().cpu().item()),
-                    float(nce_loss.detach().cpu().item()),
-                    iter_time,
-                    opt,
-                )
-                run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-                run_logger.add_field_losses("time", tim)
-                run_logger.tick(
-                    float(loss.detach().cpu().item()),
-                    float(rec_loss.detach().cpu().item()),
-                    float(nce_loss.detach().cpu().item()),
-                )
+            if step % log_every == 0:
+                vals = timer.end_step_and_accumulate()
+                if vals is not None:
+                    keys, out = vals
+                    timer.print_line(keys, out, step)
+                    run_logger.add_scalars(
+                        float(loss.detach().cpu().item()),
+                        float(rec_loss.detach().cpu().item()),
+                        float(nce_loss.detach().cpu().item()),
+                        out["total"] / 1000.0,
+                        opt,
+                    )
+                    run_logger.add_field_losses("loss/sequence_people", field_breakdown)
+                    run_logger.tick(
+                        float(loss.detach().cpu().item()),
+                        float(rec_loss.detach().cpu().item()),
+                        float(nce_loss.detach().cpu().item()),
+                    )
+            else:
+                timer.end_step_and_accumulate()
 
             seq_logger.on_batch_end(step)
 

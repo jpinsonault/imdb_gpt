@@ -627,6 +627,41 @@ class TextField(BaseField):
         pass
 
 
+
+
+class _TextEncoder(nn.Module):
+    def __init__(self, vocab: int, max_len: int, ch: int, latent_dim: int):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, ch)
+        self.conv = nn.Conv1d(ch, ch * 2, kernel_size=5, stride=2, padding=2)
+        self.out = nn.Linear((max_len // 2) * (ch * 2), latent_dim)
+
+    def forward(self, x):
+        x = self.emb(x)          # B,L,C
+        x = x.transpose(1, 2)    # B,C,L
+        x = F.gelu(self.conv(x)) # B,2C,L/2
+        x = x.flatten(1)
+        return self.out(x)
+
+
+class _TextDecoder(nn.Module):
+    def __init__(self, vocab: int, max_len: int, ch: int, latent_dim: int):
+        super().__init__()
+        self.seq_half = max_len // 2
+        self.ch = ch
+        self.fc = nn.Linear(latent_dim, self.seq_half * ch)
+        self.deconv = nn.ConvTranspose1d(ch, ch, kernel_size=5, stride=2, padding=2, output_padding=1)
+        self.head = nn.Conv1d(ch, vocab, kernel_size=1)
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = x.view(z.size(0), self.ch, self.seq_half)
+        x = F.gelu(self.deconv(x))
+        x = self.head(x)
+        x = x.transpose(1, 2)
+        return x
+    
+
 class NumericDigitCategoryField(BaseField):
     def __init__(self, name: str, base: int = 10, fraction_digits: int = 0, optional: bool = False):
         super().__init__(name, optional)
@@ -783,38 +818,6 @@ class NumericDigitCategoryField(BaseField):
     def print_stats(self):
         pass
 
-
-class _TextEncoder(nn.Module):
-    def __init__(self, vocab: int, max_len: int, ch: int, latent_dim: int):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, ch)
-        self.conv = nn.Conv1d(ch, ch * 2, kernel_size=5, stride=2, padding=2)
-        self.out = nn.Linear((max_len // 2) * (ch * 2), latent_dim)
-
-    def forward(self, x):
-        x = self.emb(x)          # B,L,C
-        x = x.transpose(1, 2)    # B,C,L
-        x = F.gelu(self.conv(x)) # B,2C,L/2
-        x = x.flatten(1)
-        return self.out(x)
-
-
-class _TextDecoder(nn.Module):
-    def __init__(self, vocab: int, max_len: int, ch: int, latent_dim: int):
-        super().__init__()
-        self.seq_half = max_len // 2
-        self.ch = ch
-        self.fc = nn.Linear(latent_dim, self.seq_half * ch)
-        self.deconv = nn.ConvTranspose1d(ch, ch, kernel_size=5, stride=2, padding=2, output_padding=1)
-        self.head = nn.Conv1d(ch, vocab, kernel_size=1)
-
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), self.ch, self.seq_half)
-        x = F.gelu(self.deconv(x))
-        x = self.head(x)
-        x = x.transpose(1, 2)
-        return x
 
 
 class _DigitsEncoder(nn.Module):
