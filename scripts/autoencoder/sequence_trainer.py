@@ -23,7 +23,6 @@ def train_sequence_predictor(
     config: Dict[str, Any],
     steps: int,
     save_every: int,
-    movie_limit: int | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,7 +65,6 @@ def train_sequence_predictor(
         movie_fields=mov.fields,
         people_fields=per.fields,
         seq_len=seq_len,
-        movie_limit=movie_limit,
     )
 
     num_workers = int(config.get("num_workers", 2))

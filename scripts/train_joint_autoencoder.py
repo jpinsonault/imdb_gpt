@@ -14,7 +14,7 @@ from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
 from config import project_config
-from scripts.autoencoder.edge_loss_logger import EdgeLossLogger
+from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
 from scripts.autoencoder.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
@@ -115,7 +115,7 @@ def _per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torc
         return F.cross_entropy(pred, t, reduction="none")
     if isinstance(field, TextField):
         B, L, V = pred.shape
-        pad_id = int(field.pad_token_id)
+        pad_id = 0 if not hasattr(field, "pad_token_id") or field.pad_token_id is None else int(field.pad_token_id)
         loss_flat = F.cross_entropy(pred.reshape(B * L, V), tgt.reshape(B * L), ignore_index=pad_id, reduction="none")
         loss = loss_flat.view(B, L)
         mask = (tgt != pad_id).float()
@@ -132,7 +132,7 @@ def build_joint_trainer(
     config: Dict[str, Any],
     warm: bool,
     db_path: Path,
-) -> Tuple[JointAutoencoder, DataLoader, EdgeLossLogger, TitlesAutoencoder, PeopleAutoencoder, int]:
+):
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
 
@@ -150,7 +150,7 @@ def build_joint_trainer(
     movie_ae.model.to(device)
     people_ae.model.to(device)
 
-    loss_logger = EdgeLossLogger(str(db_path))
+    loss_logger = LossLedger()
 
     edge_gen = make_edge_sampler(
         db_path=str(db_path),
@@ -309,7 +309,7 @@ def main():
             batch_max = float(total_per_sample.max().detach().cpu().item())
 
             for eid, edgeloss in zip(eids.detach().cpu().tolist(), total_per_sample.detach().cpu().tolist()):
-                logger.add(int(eid), 0, global_step, float(edgeloss), {})
+                logger.add(int(eid), float(edgeloss))
 
             run_logger.add_scalars(total_val, rec_val, nce_val, iter_time, opt)
             run_logger.add_field_losses("loss/movie", field_losses_movie)

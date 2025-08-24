@@ -11,6 +11,12 @@ class CudaPrefetcher:
         self._preload()
 
     def _to_device(self, batch):
+        if isinstance(batch, (list, tuple)) and len(batch) == 4:
+            xm, yp, m, k = batch
+            xm = [x.to(self.device, non_blocking=True) for x in xm]
+            yp = [y.to(self.device, non_blocking=True) for y in yp]
+            m = m.to(self.device, non_blocking=True)
+            return xm, yp, m, k
         xm, yp, m = batch
         xm = [x.to(self.device, non_blocking=True) for x in xm]
         yp = [y.to(self.device, non_blocking=True) for y in yp]

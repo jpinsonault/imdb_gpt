@@ -4,31 +4,7 @@ import sqlite3
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 
-
-class AliasSampler:
-    def __init__(self, probs: np.ndarray):
-        n = len(probs)
-        self.n = n
-        self.p = np.zeros(n, dtype=np.float32)
-        self.a = np.zeros(n, dtype=np.int32)
-        scaled = probs * n
-        small, large = [], []
-        for i, v in enumerate(scaled):
-            (small if v < 1.0 else large).append(i)
-        while small and large:
-            s, l = small.pop(), large.pop()
-            self.p[s] = scaled[s]
-            self.a[s] = l
-            scaled[l] = (scaled[l] - 1) + scaled[s]
-            (small if scaled[l] < 1.0 else large).append(l)
-        for i in large + small:
-            self.p[i] = 1.0
-            self.a[i] = i
-
-    def draw(self, k: int) -> np.ndarray:
-        i = np.random.randint(0, self.n, size=k)
-        accept = np.random.random(size=k) < self.p[i]
-        return np.where(accept, i, self.a[i])
+from .mapping_samplers import AliasSampler
 
 
 class WeightedEdgeSampler:
@@ -157,16 +133,17 @@ class WeightedEdgeSampler:
             return
 
         recorded = self.loss_logger.snapshot()
-        loss_vec = np.full(len(self.edges), 1000.0, dtype=np.float32)
+        default_loss = float(getattr(self.loss_logger, "default_loss", 1000.0))
+        loss_vec = np.full(len(self.edges), default_loss, dtype=np.float32)
         for eid, loss in recorded.items():
             idx = self.edge_to_idx.get(eid)
             if idx is not None:
                 loss_vec[idx] = float(loss)
 
-        lo, hi = loss_vec.min(), loss_vec.max()
+        lo, hi = float(loss_vec.min()), float(loss_vec.max())
         if hi > lo:
             norm = (loss_vec - lo) / (hi - lo)
-            self.weights = 1.0 + self.boost * norm
+            self.weights = 1.0 + self.boost * norm.astype(np.float32)
         else:
             self.weights.fill(1.0)
 
