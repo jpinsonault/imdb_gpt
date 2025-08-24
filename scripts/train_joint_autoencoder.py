@@ -150,7 +150,8 @@ def build_joint_trainer(
     movie_ae.model.to(device)
     people_ae.model.to(device)
 
-    loss_logger = LossLedger()
+    from scripts.autoencoder.mapping_samplers import SharedLossLedger
+    loss_logger = SharedLossLedger(default_loss=1000.0)
 
     edge_gen = make_edge_sampler(
         db_path=str(db_path),
@@ -182,6 +183,7 @@ def build_joint_trainer(
     total_edges = len(edge_gen.edges)
     logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config['batch_size']} workers={num_workers}")
     return joint, loader, loss_logger, movie_ae, people_ae, total_edges
+
 
 
 def _fmt(x: float) -> str:

@@ -60,12 +60,20 @@ def train_sequence_predictor(
         except Exception:
             pass
 
-    ds = MoviesPeopleSequenceDataset(
+    from scripts.autoencoder.mapping_samplers import MoviePeoplePairSampler, SequencePairIterable, collate_pairs, SharedLossLedger
+
+    loss_logger = SharedLossLedger(default_loss=1000.0)
+    sampler = MoviePeoplePairSampler(
         db_path=str(Path(config["db_path"])),
         movie_fields=mov.fields,
         people_fields=per.fields,
         seq_len=seq_len,
+        batch_size=batch_size,
+        refresh_batches=int(config.get("edge_sampler", {}).get("refresh_batches", 100)),
+        boost=float(config.get("edge_sampler", {}).get("weak_edge_boost", 0.10)),
+        loss_logger=loss_logger,
     )
+    ds = SequencePairIterable(sampler)
 
     num_workers = int(config.get("num_workers", 2))
     prefetch_factor = int(config.get("prefetch_factor", 2))
@@ -74,7 +82,7 @@ def train_sequence_predictor(
     loader = DataLoader(
         ds,
         batch_size=batch_size,
-        collate_fn=_collate,
+        collate_fn=collate_pairs,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
         persistent_workers=True if num_workers > 0 else False,
@@ -102,7 +110,7 @@ def train_sequence_predictor(
     )
 
     it_preview = iter(loader)
-    xm0, _, _ = next(it_preview)
+    xm0, _, _, _ = next(it_preview)
     xm0 = [x.to(device) for x in xm0]
     print_model_layers_with_shapes(model, xm0)
 
@@ -113,6 +121,22 @@ def train_sequence_predictor(
     prefetch = CudaPrefetcher(loader, device)
     model.train()
 
+    def _per_sample_seq_recon(fields, preds_seq, targets_seq, mask):
+        per_losses = []
+        for f, pred, tgt in zip(fields, preds_seq, targets_seq):
+            ps = torch.zeros(mask.size(0), device=mask.device)
+            if isinstance(f, torch.nn.Module):
+                pass
+            from scripts.autoencoder.sequence_losses import _per_sample_field_loss_seq
+            l_bt = _per_sample_field_loss_seq(f, pred, tgt)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            ps = (l_bt * mask).sum(dim=1) / denom
+            per_losses.append(ps)
+        s = per_losses[0]
+        for t in per_losses[1:]:
+            s = s + t
+        return s
+
     with tqdm(total=steps, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
         while step < steps:
             with timer.cpu_range("data"):
@@ -122,7 +146,7 @@ def train_sequence_predictor(
                     batch = prefetch.next()
                     if batch is None:
                         break
-                xm, yp, m = batch
+                xm, yp, m, k = batch
 
             timer.start_step()
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
@@ -173,12 +197,18 @@ def train_sequence_predictor(
                     float(nce_loss.detach().cpu().item()),
                 )
 
-            seq_logger.on_batch_end(step)
+            with torch.no_grad():
+                rec_per_sample = _per_sample_seq_recon(per.fields, preds, yp, m)
+                total_per_sample = w_rec * rec_per_sample
+                for key_id, tl in zip(k.detach().cpu().tolist(), total_per_sample.detach().cpu().tolist()):
+                    loss_logger.add(int(key_id), float(tl))
 
             if save_every and step % save_every == 0:
                 out = Path(config["model_dir"])
                 out.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
+
+            seq_logger.on_batch_end(step)
 
     out = Path(config["model_dir"])
     out.mkdir(parents=True, exist_ok=True)

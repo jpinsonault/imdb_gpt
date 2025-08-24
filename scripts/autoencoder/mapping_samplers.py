@@ -8,6 +8,44 @@ from torch.utils.data import IterableDataset
 
 from .fields import BaseField
 
+class SharedLossLedger:
+    _BULK_SIZE = 10000
+
+    def __init__(self, default_loss: float = 1000.0, shared_map=None):
+        self._default = float(default_loss)
+        if shared_map is None:
+            from multiprocessing import Manager
+            self._manager = Manager()
+            self._map = self._manager.dict()
+        else:
+            self._manager = None
+            self._map = shared_map
+        self._cache = []
+
+    def add(self, key_id: int, total_loss: float):
+        self._cache.append((int(key_id), float(total_loss)))
+        if len(self._cache) >= self._BULK_SIZE:
+            self.flush()
+
+    def flush(self):
+        if not self._cache:
+            return
+        for k, v in self._cache:
+            self._map[k] = v
+        self._cache.clear()
+
+    def snapshot(self) -> dict[int, float]:
+        self.flush()
+        return dict(self._map)
+
+    def close(self):
+        self.flush()
+        self._map.clear()
+
+    @property
+    def default_loss(self) -> float:
+        return self._default
+
 
 class LossLedger:
     _BULK_SIZE = 10000
