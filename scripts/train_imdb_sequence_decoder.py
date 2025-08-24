@@ -20,43 +20,6 @@ from scripts.autoencoder.fields import TextField, MultiCategoryField, BooleanFie
 from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
 
-class _TransformerTrunk(nn.Module):
-    def __init__(
-        self,
-        latent_dim: int,
-        seq_len: int,
-        num_layers: int = 2,
-        num_heads: int = 4,
-        ff_mult: int = 4,
-        dropout: float = 0.0,
-        use_sdp: bool = True,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.use_sdp = use_sdp
-        self.query = nn.Parameter(torch.randn(seq_len, latent_dim))
-        layer = nn.TransformerDecoderLayer(
-            d_model=latent_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_mult * latent_dim,
-            dropout=dropout,
-            batch_first=False,
-        )
-        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(latent_dim)
-
-    def forward(self, z_m: torch.Tensor) -> torch.Tensor:
-        memory = z_m.unsqueeze(0)
-        q = self.query.unsqueeze(1).expand(self.seq_len, z_m.size(0), z_m.size(1))
-        if self.use_sdp and torch.backends.cuda.is_built():
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
-                out = self.decoder(q, memory)
-        else:
-            out = self.decoder(q, memory)
-        out = out.transpose(0, 1)
-        out = self.norm(out)
-        return out
-
 class _GPUEventTimer:
     def __init__(self, print_every: int):
         self.print_every = max(1, int(print_every))
@@ -652,6 +615,29 @@ class CudaPrefetcher:
         self._preload()
         return batch
 
+def _info_nce_masked_rows(z_pred_seq: torch.Tensor, z_tgt_seq: torch.Tensor, mask: torch.Tensor, temperature: float) -> torch.Tensor:
+    z_pred_seq = F.normalize(z_pred_seq, dim=-1)
+    z_tgt_seq = F.normalize(z_tgt_seq, dim=-1)
+    B, T, _ = z_pred_seq.shape
+    losses = []
+    for t in range(T):
+        row_mask = mask[:, t] > 0.5
+        k = int(row_mask.sum().item())
+        if k < 2:
+            continue
+        zp = z_pred_seq[row_mask, t, :]
+        zt = z_tgt_seq[row_mask, t, :]
+        logits = (zp @ zt.t()) / temperature
+        labels = torch.arange(k, device=logits.device)
+        losses.append(F.cross_entropy(logits, labels))
+    if losses:
+        return torch.stack(losses).mean()
+    return z_pred_seq.new_zeros(())
+
+def disable_inductor_autotune():
+    from torch._inductor import config as _inductor_cfg
+    _inductor_cfg.max_autotune = False
+
 
 def train_sequence_predictor(
     config: Dict[str, Any],
@@ -673,9 +659,9 @@ def train_sequence_predictor(
     w_rec = float(config.get("recon_loss_weight", 0.1))
     log_every = int(config.get("log_interval", 20))
     use_compile = bool(config.get("compile_trunk", True))
-    use_compile_nce = bool(config.get("compile_nce", True))
     use_cuda_graphs = bool(config.get("use_cuda_graphs", False))
 
+    disable_inductor_autotune()
     from scripts.precompute_movie_people_seq import build_movie_people_seq
     import sqlite3
     _conn = sqlite3.connect(str(Path(config["db_path"])))
@@ -696,13 +682,6 @@ def train_sequence_predictor(
             model.trunk = torch.compile(model.trunk, mode="max-autotune")
         except Exception:
             pass
-
-    compiled_nce = _info_nce_pair
-    if use_compile_nce and hasattr(torch, "compile"):
-        try:
-            compiled_nce = torch.compile(_info_nce_pair, mode="max-autotune")
-        except Exception:
-            compiled_nce = _info_nce_pair
 
     ds = MoviesPeopleSequenceDataset(
         db_path=str(Path(config["db_path"])),
@@ -782,21 +761,11 @@ def train_sequence_predictor(
                 with timer.gpu_range("rec"):
                     rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
                 with timer.gpu_range("tgt_enc"):
-                    z_seq_pred = _unit_normalize(z_seq)
-                    nce_losses = []
-                    for t in range(seq_len):
-                        idx = torch.nonzero(m[:, t] > 0.5, as_tuple=False).flatten()
-                        if idx.numel() < 2:
-                            continue
-                        zt = _encode_people_latents_vectorized(per.encoder, yp, t, idx)
-                        zt = _unit_normalize(zt)
-                        zp = z_seq_pred.index_select(dim=1, index=torch.tensor([t], device=z_seq_pred.device)).squeeze(1)
-                        zp = zp.index_select(dim=0, index=idx)
-                        nce_losses.append(compiled_nce(zp, zt, temp))
-                    if nce_losses:
-                        nce_loss = torch.stack(nce_losses).mean()
-                    else:
-                        nce_loss = torch.tensor(0.0, device=device)
+                    with torch.no_grad():
+                        flat_targets = [y.view(b * seq_len, *y.shape[2:]) for y in yp]
+                        z_tgt_flat = per.encoder(flat_targets)
+                        z_tgt_seq = z_tgt_flat.view(b, seq_len, latent_dim)
+                    nce_loss = _info_nce_masked_rows(z_seq, z_tgt_seq, m, temp)
                 loss = w_lat * nce_loss + w_rec * rec_loss
 
             with timer.gpu_range("backward"):
@@ -838,6 +807,7 @@ def train_sequence_predictor(
     out.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
     run_logger.close()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder with latent supervision")
