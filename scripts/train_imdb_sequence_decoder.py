@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import sqlite3
+from scripts.autoencoder.print_model import print_model_layers_with_shapes
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -334,7 +335,9 @@ def train_sequence_predictor(
     movie_limit: int | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     mov, per = _load_frozen_autoencoders(config)
+
     latent_dim = int(config["latent_dim"])
     seq_len = int(config["people_sequence_length"])
     batch_size = int(config["batch_size"])
@@ -343,7 +346,15 @@ def train_sequence_predictor(
     temp = float(config.get("latent_temperature", 0.07))
     w_lat = float(config.get("latent_loss_weight", 1.0))
     w_rec = float(config.get("recon_loss_weight", 0.1))
-    model = MovieToPeopleSequencePredictor(mov.encoder, per.decoder, latent_dim, seq_len).to(device)
+    log_every = int(config.get("log_interval", 20))
+
+    model = MovieToPeopleSequencePredictor(
+        movie_encoder=mov.encoder,
+        people_decoder=per.decoder,
+        latent_dim=latent_dim,
+        seq_len=seq_len,
+    ).to(device)
+
     ds = MoviesPeopleSequenceDataset(
         db_path=str(Path(config["db_path"])),
         movie_fields=mov.fields,
@@ -351,9 +362,11 @@ def train_sequence_predictor(
         seq_len=seq_len,
         movie_limit=movie_limit,
     )
+
     num_workers = int(config.get("num_workers", 2))
     prefetch_factor = int(config.get("prefetch_factor", 2))
     pin = bool(torch.cuda.is_available())
+
     loader = DataLoader(
         ds,
         batch_size=batch_size,
@@ -363,11 +376,14 @@ def train_sequence_predictor(
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
+
     mov.encoder.to(device)
     per.decoder.to(device)
     per.encoder.to(device)
+
     opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+
     run_logger = build_run_logger(config)
     seq_logger = SequenceReconstructionLogger(
         movie_ae=mov,
@@ -379,28 +395,56 @@ def train_sequence_predictor(
         num_samples=2,
         table_width=38,
     )
+
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    it_preview = iter(loader)
+    xm0, _, _ = next(it_preview)
+    xm0 = [x.to(device) for x in xm0]
+    print_model_layers_with_shapes(model, xm0)
+
     step = 0
     it = iter(loader)
     model.train()
-    with tqdm(total=steps, desc="sequence", dynamic_ncols=True) as pbar:
+
+    with tqdm(total=steps, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
         while step < steps:
-            t_fetch0 = time.perf_counter()
+            t0 = time.perf_counter()
             try:
                 xm, yp, m = next(it)
             except StopIteration:
                 it = iter(loader)
                 xm, yp, m = next(it)
-            data_time = time.perf_counter() - t_fetch0
+            t1 = time.perf_counter()
             xm = [x.to(device, non_blocking=True) for x in xm]
             yp = [y.to(device, non_blocking=True) for y in yp]
             m = m.to(device, non_blocking=True)
-            t_step0 = time.perf_counter()
+            _sync()
+            t2 = time.perf_counter()
+
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                preds = model(xm)
+                _sync()
+                t3 = time.perf_counter()
+                z_m = mov.encoder(xm)
+                _sync()
+                t4 = time.perf_counter()
+                z_seq = model.trunk(z_m)
+                _sync()
+                t5 = time.perf_counter()
+                b = z_seq.size(0)
+                flat = z_seq.reshape(b * seq_len, latent_dim)
+                outs = per.decoder(flat)
+                preds = [y.view(b, seq_len, *y.shape[1:]) for y in outs]
+                _sync()
+                t6 = time.perf_counter()
+
                 rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
-                with torch.no_grad():
-                    z_seq_pred = model.trunk(mov.encoder(xm))
-                    z_seq_pred = _unit_normalize(z_seq_pred)
+                _sync()
+                t7 = time.perf_counter()
+
+                z_seq_pred = _unit_normalize(z_seq)
                 nce_losses = []
                 for t in range(seq_len):
                     idx = torch.nonzero(m[:, t] > 0.5, as_tuple=False).flatten()
@@ -411,28 +455,67 @@ def train_sequence_predictor(
                     zp = z_seq_pred.index_select(dim=1, index=torch.tensor([t], device=z_seq_pred.device)).squeeze(1)
                     zp = zp.index_select(dim=0, index=idx)
                     nce_losses.append(_info_nce_pair(zp, zt, temp))
+                _sync()
                 if nce_losses:
                     nce_loss = torch.stack(nce_losses).mean()
                 else:
                     nce_loss = torch.tensor(0.0, device=device)
+
                 loss = w_lat * nce_loss + w_rec * rec_loss
+
+            _sync()
+            t8 = time.perf_counter()
             opt.zero_grad()
             scaler.scale(loss).backward()
+            _sync()
+            t9 = time.perf_counter()
             scaler.step(opt)
             scaler.update()
-            batch_time = time.perf_counter() - t_step0
-            iter_time = data_time + batch_time
+            _sync()
+            t10 = time.perf_counter()
+
             step += 1
             pbar.update(1)
-            pbar.set_postfix(loss=float(loss.detach().cpu().item()))
-            run_logger.add_scalars(float(loss.detach().cpu().item()), float(rec_loss.detach().cpu().item()), float(nce_loss.detach().cpu().item()), iter_time, opt)
-            run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-            run_logger.tick(float(loss.detach().cpu().item()), float(rec_loss.detach().cpu().item()), float(nce_loss.detach().cpu().item()))
+
+            iter_time = t10 - t0
+            tim = {
+                "data": t1 - t0,
+                "h2d": t2 - t1,
+                "mov_enc": t4 - t3,
+                "trunk": t5 - t4,
+                "ppl_dec": t6 - t5,
+                "rec": t7 - t6,
+                "tgt_enc": (t8 - t7) - (t8 - t7 - sum([])),
+                "nce": 0.0,
+                "backward": t9 - t8,
+                "opt": t10 - t9,
+                "total": iter_time,
+            }
+
+            do_log = (step % log_every == 0)
+            if do_log:
+                run_logger.add_scalars(
+                    float(loss.detach().cpu().item()),
+                    float(rec_loss.detach().cpu().item()),
+                    float(nce_loss.detach().cpu().item()),
+                    iter_time,
+                    opt,
+                )
+                run_logger.add_field_losses("loss/sequence_people", field_breakdown)
+                run_logger.add_field_losses("time", tim)
+                run_logger.tick(
+                    float(loss.detach().cpu().item()),
+                    float(rec_loss.detach().cpu().item()),
+                    float(nce_loss.detach().cpu().item()),
+                )
+
             seq_logger.on_batch_end(step)
+
             if save_every and step % save_every == 0:
                 out = Path(config["model_dir"])
                 out.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
+
     out = Path(config["model_dir"])
     out.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")

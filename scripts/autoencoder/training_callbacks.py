@@ -305,6 +305,8 @@ class RowReconstructionLogger:
                 table.add_row([field_name, original_str, reconstructed_str])
 
             print(table)
+
+
 class SequenceReconstructionLogger:
     def __init__(self, movie_ae, people_ae, predictor, db_path: str, seq_len: int, interval_steps: int = 200, num_samples: int = 2, table_width: int = 38):
         import sqlite3, random
@@ -317,7 +319,7 @@ class SequenceReconstructionLogger:
         self.w = table_width
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         movies = list(islice(self.m_ae.row_generator(), 50000))
-        rng = random.Random(7331)
+        rng = random.Random()
         rng.shuffle(movies)
         self.samples = []
         for m in movies:
@@ -358,6 +360,9 @@ class SequenceReconstructionLogger:
         import numpy as np
         try:
             a = np.array(arr)
+            from .fields import NumericDigitCategoryField
+            if isinstance(field, NumericDigitCategoryField):
+                return field.to_string(a if a.ndim >= 2 else a.flatten())
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
                 return field.to_string(a)
             return field.to_string(a.flatten() if a.ndim > 1 else a)
@@ -372,6 +377,14 @@ class SequenceReconstructionLogger:
         outs = self.pred(xs)
         return [o.detach().cpu().numpy()[0] for o in outs]
 
+    @torch.no_grad()
+    def _roundtrip_person(self, person_row):
+        xs = [f.transform(person_row.get(f.name)) for f in self.p_ae.fields]
+        xs = [x.unsqueeze(0).to(self.p_ae.device) for x in xs]
+        z = self.p_ae.encoder(xs)
+        outs = self.p_ae.decoder(z)
+        return [o.detach().cpu().numpy()[0] for o in outs]
+
     def on_batch_end(self, global_step: int):
         if not self.samples:
             return
@@ -383,15 +396,17 @@ class SequenceReconstructionLogger:
             print("\nSequence reconstruction")
             print(f"movie: {m_row.get('primaryTitle', '')}")
             for t in range(self.seq_len):
-                tab = PrettyTable(["field", "orig", "recon"])
+                tab = PrettyTable(["field", "orig", "round", "recon"])
                 tab.align = "l"
-                for f, pred in zip(self.p_ae.fields, preds):
+                rt = self._roundtrip_person(ppl[t])
+                for i, (f, pred) in enumerate(zip(self.p_ae.fields, preds)):
                     y = pred[t]
                     orig_raw = ppl[t].get(f.name, "")
                     if isinstance(orig_raw, list):
                         orig_str = ", ".join(map(str, orig_raw))
                     else:
                         orig_str = str(orig_raw)
+                    round_str = self._tensor_to_string(f, rt[i])
                     recon_str = self._tensor_to_string(f, y)
-                    tab.add_row([f.name, orig_str[: self.w], recon_str[: self.w]])
+                    tab.add_row([f.name, orig_str[: self.w], round_str[: self.w], recon_str[: self.w]])
                 print(f"\ntimestep {t+1}/{self.seq_len}\n{tab}")
