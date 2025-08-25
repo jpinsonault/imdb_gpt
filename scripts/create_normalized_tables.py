@@ -286,7 +286,7 @@ def populate_principals_and_characters(conn):
 
 
 if __name__ == '__main__':
-    data_dir = Path(project_config["data_dir"])
+    data_dir = Path(project_config.data_dir)
     db_path = data_dir / 'imdb.db'
 
     conn = sqlite3.connect(db_path)

@@ -6,6 +6,7 @@ import time
 import logging
 from typing import Dict, Any
 
+from config import ProjectConfig
 import torch
 
 try:
@@ -28,13 +29,13 @@ def _unique_log_dir(root: str, base: str) -> str:
 
 
 class RunLogger:
-    def __init__(self, log_root: str, run_prefix: str, config: Dict[str, Any]):
+    def __init__(self, log_root: str, run_prefix: str, config: ProjectConfig):
         self.enabled = _TBWriter is not None
         self.run_dir = _unique_log_dir(log_root, run_prefix) if self.enabled else None
         self.writer = _TBWriter(log_dir=self.run_dir) if self.enabled else None
         self.step = 0
-        self.log_every = int(config.get("log_interval", 20))
-        self.batch_size = int(config["batch_size"])
+        self.log_every = int(config.log_interval)
+        self.batch_size = config.batch_size
         self.last_log_t = time.perf_counter()
         if self.writer:
             self._write_config(config)
@@ -116,6 +117,6 @@ class RunLogger:
             self.writer.close()
 
 
-def build_run_logger(config: Dict[str, Any]) -> RunLogger:
-    log_root = config.get("tensorboard_dir", "runs")
+def build_run_logger(config: ProjectConfig) -> RunLogger:
+    log_root = config.tensorboard_dir
     return RunLogger(log_root, "joint_autoencoder", config)

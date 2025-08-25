@@ -60,7 +60,7 @@ def download_imdb_datasets(data_dir: Path, base_url, file_names):
             
             
 if __name__ == '__main__':
-    data_dir = Path(project_config['data_dir']) / 'imdb_tsvs'
+    data_dir = Path(project_config.data_dir) / 'imdb_tsvs'
     base_url = 'https://datasets.imdbws.com/'
     file_names = [
         'name.basics.tsv.gz',

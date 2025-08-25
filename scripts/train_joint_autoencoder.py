@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
-from config import project_config
+from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
@@ -129,7 +129,7 @@ def _per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torc
 
 
 def build_joint_trainer(
-    config: Dict[str, Any],
+    config: ProjectConfig,
     warm: bool,
     db_path: Path,
 ):
@@ -156,21 +156,21 @@ def build_joint_trainer(
         db_path=str(db_path),
         movie_ae=movie_ae,
         person_ae=people_ae,
-        batch_size=config["batch_size"],
-        refresh_batches=config["edge_sampler"]["refresh_batches"],
-        boost=config["edge_sampler"]["weak_edge_boost"],
+        batch_size=config.batch_size,
+        refresh_batches=config.edge_sampler.refresh_batches,
+        boost=config.edge_sampler.weak_edge_boost,
         loss_logger=loss_logger,
     )
 
     ds = _EdgeIterable(edge_gen, movie_ae, people_ae)
 
-    num_workers = int(config.get("num_workers", 2))
-    prefetch_factor = int(config.get("prefetch_factor", 2))
+    num_workers = config.num_workers
+    prefetch_factor = config.prefetch_factor
     pin = bool(torch.cuda.is_available())
 
     loader = DataLoader(
         ds,
-        batch_size=config["batch_size"],
+        batch_size=config.batch_size,
         collate_fn=_collate_edge,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if num_workers > 0 else 2,
@@ -180,7 +180,7 @@ def build_joint_trainer(
 
     joint = JointAutoencoder(movie_ae, people_ae).to(device)
     total_edges = len(edge_gen.edges)
-    logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config['batch_size']} workers={num_workers}")
+    logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config.batch_size} workers={num_workers}")
     return joint, loader, loss_logger, movie_ae, people_ae, total_edges
 
 
@@ -192,35 +192,35 @@ def _fmt(x: float) -> str:
     return f"{x:.2f}"
 
 
-def main():
+def main(config: ProjectConfig):
     parser = argparse.ArgumentParser(description="Train movie-person joint embedding autoencoder")
     parser.add_argument("--warm", action="store_true")
     args = parser.parse_args()
 
-    data_dir = Path(project_config["data_dir"])
+    data_dir = Path(config.data_dir)
     db_path = data_dir / "imdb.db"
 
-    joint_model, loader, logger, mov_ae, per_ae, total_edges = build_joint_trainer(project_config, args.warm, db_path)
+    joint_model, loader, logger, mov_ae, per_ae, total_edges = build_joint_trainer(config, args.warm, db_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     opt = torch.optim.AdamW(
         joint_model.parameters(),
-        lr=float(project_config["learning_rate"]),
-        weight_decay=float(project_config["weight_decay"]),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
-    temperature = float(project_config.get("nce_temp", 0.07))
-    nce_weight = float(project_config.get("nce_weight", 1.0))
-    save_interval = int(project_config.get("save_interval", 10000))
-    flush_interval = int(project_config.get("flush_interval", 2000))
-    batch_size = int(project_config["batch_size"])
+    temperature = config.nce_temp
+    nce_weight = config.nce_weight
+    save_interval = config.save_interval
+    flush_interval = config.flush_interval
+    batch_size = config.batch_size
 
-    run_logger = build_run_logger(project_config)
+    run_logger = build_run_logger(config)
     if run_logger.run_dir:
         logging.info(f"tensorboard logdir: {run_logger.run_dir}")
 
-    jr_interval = int(project_config.get("recon_log_interval", 500))
-    rr_interval = int(project_config.get("row_recon_interval", 1000))
-    rr_samples = int(project_config.get("row_recon_samples", 3))
+    jr_interval = config.recon_log_interval
+    rr_interval = config.row_recon_interval
+    rr_samples = config.row_recon_samples
 
     joint_recon = JointReconstructionLogger(
         mov_ae,
@@ -349,7 +349,7 @@ def main():
     mov_ae.save_model()
     per_ae.save_model()
 
-    out = Path(project_config["model_dir"])
+    out = Path(project_config.model_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.save(joint_model.state_dict(), out / "JointMoviePersonAE_final.pt")
     run_logger.close()

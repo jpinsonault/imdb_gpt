@@ -114,7 +114,7 @@ def create_vector_id_table(db_path):
     
         
 if __name__ == '__main__':
-    data_dir = Path(project_config["data_dir"]) / "imdb.db"
+    data_dir = Path(project_config.data_dir) / "imdb.db"
     create_vector_id_table(data_dir)
     
     with sqlite3.connect(data_dir) as conn:

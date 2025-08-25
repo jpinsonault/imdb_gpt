@@ -330,7 +330,7 @@ def load_db_files(db_path, file_paths):
 
 
 if __name__ == '__main__':
-    data_dir = Path(project_config["data_dir"])
+    data_dir = Path(project_config.data_dir)
     db_path = data_dir / 'imdb.db'
     
     tsv_dir = data_dir / 'imdb_tsvs'

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, List, Dict, Tuple
 
 import numpy as np
+from config import ProjectConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,18 +83,18 @@ def _collate(batch: List[Tuple[List[torch.Tensor], List[torch.Tensor]]]) -> Tupl
 
 
 class RowAutoencoder:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: ProjectConfig):
         self.config = config
-        self.model_dir = Path(config["model_dir"])
+        self.model_dir = Path(config.model_dir)
         self.model = None
         self.encoder = None
         self.decoder = None
 
         self.fields: List[BaseField] = self.build_fields()
-        self.latent_dim = int(self.config["latent_dim"])
+        self.latent_dim = self.config.latent_dim
         self.num_rows_in_dataset = 0
 
-        self.db_path: str = config["db_path"]
+        self.db_path: str = config.db_path
         self.stats_accumulated = False
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -139,8 +140,8 @@ class RowAutoencoder:
         return True
 
     def accumulate_stats(self):
-        use_cache = self.config.get("use_cache", True)
-        refresh_cache = self.config.get("refresh_cache", False)
+        use_cache = self.config.use_cache
+        refresh_cache = self.config.refresh_cache
         if refresh_cache:
             self._drop_cache_table()
         if use_cache and self._load_cache():
@@ -223,7 +224,7 @@ class RowAutoencoder:
 
     def _make_loader(self) -> DataLoader:
         ds = _RowDataset(self.row_generator, self.fields)
-        bs = int(self.config.get("batch_size", 32))
+        bs = self.config.batch_size
         return DataLoader(ds, batch_size=bs, collate_fn=_collate)
 
     def save_model(self):
@@ -241,9 +242,9 @@ class RowAutoencoder:
         if self.model is None:
             self.build_autoencoder()
 
-        epochs = int(self.config.get("epochs", 10))
-        lr = float(self.config.get("learning_rate", 2e-4))
-        wd = float(self.config.get("weight_decay", 1e-4))
+        epochs = self.config.epochs
+        lr = self.config.learning_rate
+        wd = self.config.weight_decay
 
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
 

@@ -14,13 +14,15 @@ from scripts.autoencoder.sequence_datasets import MoviesPeopleSequenceDataset, _
 from scripts.autoencoder.prefetch import CudaPrefetcher
 from scripts.autoencoder.sequence_losses import _sequence_loss_and_breakdown, _info_nce_masked_rows
 from scripts.precompute_movie_people_seq import build_movie_people_seq
+from config import ProjectConfig
+
 
 def disable_inductor_autotune():
     from torch._inductor import config as _inductor_cfg
     _inductor_cfg.max_autotune = False
 
 def train_sequence_predictor(
-    config: Dict[str, Any],
+    config: ProjectConfig,
     steps: int,
     save_every: int,
 ):
@@ -28,24 +30,24 @@ def train_sequence_predictor(
 
     mov, per = _load_frozen_autoencoders(config)
 
-    latent_dim = int(config["latent_dim"])
-    seq_len = int(config["people_sequence_length"])
-    batch_size = int(config["batch_size"])
-    lr = float(config.get("learning_rate", 2e-4))
-    wd = float(config.get("weight_decay", 1e-4))
-    temp = float(config.get("latent_temperature", 0.07))
-    w_lat = float(config.get("latent_loss_weight", 1.0))
-    w_rec = float(config.get("recon_loss_weight", 0.1))
-    log_every = int(config.get("log_interval", 20))
-    use_compile = bool(config.get("compile_trunk", True))
-    use_cuda_graphs = bool(config.get("use_cuda_graphs", False))
+    latent_dim = config.latent_dim
+    seq_len = config.people_sequence_length
+    batch_size = config.batch_size
+    lr = config.learning_rate
+    wd = config.weight_decay
+    temp = config.latent_temperature
+    w_lat = config.latent_loss_weight
+    w_rec = config.recon_loss_weight
+    log_every = config.log_interval
+    use_compile = config.compile_trunk
+    use_cuda_graphs = config.use_cuda_graphs
 
     disable_inductor_autotune()
-    _conn = sqlite3.connect(str(Path(config["db_path"])))
+    _conn = sqlite3.connect(str(Path(config.db_path)))
     _has = _conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='movie_people_seq'").fetchone()
     _conn.close()
     if _has is None:
-        build_movie_people_seq(str(Path(config["db_path"])), seq_len)
+        build_movie_people_seq(str(Path(config.db_path)), seq_len)
 
     model = MovieToPeopleSequencePredictor(
         movie_encoder=mov.encoder,
@@ -61,14 +63,14 @@ def train_sequence_predictor(
             pass
 
     ds = MoviesPeopleSequenceDataset(
-        db_path=str(Path(config["db_path"])),
+        db_path=str(Path(config.db_path)),
         movie_fields=mov.fields,
         people_fields=per.fields,
         seq_len=seq_len,
     )
 
-    num_workers = int(config.get("num_workers", 2))
-    prefetch_factor = int(config.get("prefetch_factor", 2))
+    num_workers = config.num_workers
+    prefetch_factor = config.prefetch_factor
     pin = bool(torch.cuda.is_available())
 
     loader = DataLoader(
@@ -94,9 +96,9 @@ def train_sequence_predictor(
         movie_ae=mov,
         people_ae=per,
         predictor=model,
-        db_path=str(Path(config["db_path"])),
+        db_path=str(Path(config.db_path)),
         seq_len=seq_len,
-        interval_steps=int(config.get("callback_interval", 100)),
+        interval_steps=config.callback_interval,
         num_samples=2,
         table_width=38,
     )
@@ -176,11 +178,11 @@ def train_sequence_predictor(
             seq_logger.on_batch_end(step)
 
             if save_every and step % save_every == 0:
-                out = Path(config["model_dir"])
+                out = Path(config.model_dir)
                 out.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
 
-    out = Path(config["model_dir"])
+    out = Path(config.model_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
     run_logger.close()

@@ -1,9 +1,10 @@
 # scripts/autoencoder/ae_loader.py
 from pathlib import Path
+from config import ProjectConfig
 import torch
 from .imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 
-def _load_frozen_autoencoders(config):
+def _load_frozen_autoencoders(config: ProjectConfig):
     mov = TitlesAutoencoder(config)
     per = PeopleAutoencoder(config)
     mov.accumulate_stats()
@@ -12,7 +13,7 @@ def _load_frozen_autoencoders(config):
     per.finalize_stats()
     mov.build_autoencoder()
     per.build_autoencoder()
-    model_dir = Path(config["model_dir"])
+    model_dir = Path(config.model_dir)
     mov.encoder.load_state_dict(torch.load(model_dir / "TitlesAutoencoder_encoder.pt", map_location="cpu"))
     per.decoder.load_state_dict(torch.load(model_dir / "PeopleAutoencoder_decoder.pt", map_location="cpu"))
     per.encoder.load_state_dict(torch.load(model_dir / "PeopleAutoencoder_encoder.pt", map_location="cpu"))

@@ -187,7 +187,7 @@ def stream_and_insert_edges(conn: sqlite3.Connection, *, chunk_size: int = INSER
 # main CLI helper
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    db_path = Path(project_config["data_dir"]) / "imdb.db"
+    db_path = Path(project_config.data_dir) / "imdb.db"
     conn = sqlite3.connect(db_path)
 
     create_edges_table(conn)

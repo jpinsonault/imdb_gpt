@@ -1,51 +1,54 @@
-# config.py
-project_config = {
-    'project_name': 'imdb_gpt',
-    'data_dir': "./data/",
-    'log_dir': 'logs',
-    'model_dir': 'models',
-    'corpus_dir': "./data/corpus/",
-    'docker_data_dir_mount': '/app/imdb',
+class ProjectConfig:
+    """Simple project configuration."""
+    def __init__(self):
+        self.project_name = "imdb_gpt"
+        self.data_dir = "./data/"
+        self.log_dir = "logs"
+        self.model_dir = "models"
+        self.corpus_dir = "./data/corpus/"
+        self.docker_data_dir_mount = "/app/imdb"
 
-    'latent_dim': 256,
-    'batch_size': 512,
-    'learning_rate': 0.0005,
-    'weight_decay': 1e-4,
+        self.latent_dim = 256
+        self.batch_size = 512
+        self.learning_rate = 0.0005
+        self.weight_decay = 1e-4
 
-    'people_sequence_length': 10,
-    'latent_loss_weight': 1.0,
-    'recon_loss_weight': 0.10,
-    'latent_temperature': 0.03,
+        self.people_sequence_length = 10
+        self.latent_loss_weight = 1.0
+        self.recon_loss_weight = 0.10
+        self.latent_temperature = 0.03
 
-    # joint trainer specifics
-    'nce_temp': 0.03,     # 
-    'nce_weight': 1.0,    
+        self.nce_temp = 0.03
+        self.nce_weight = 1.0
 
-    'edge_sampler': {
-        'refresh_batches': 100,   
-        'weak_edge_boost': 0.10,  
-    },
+        self.refresh_batches = 100
+        self.weak_edge_boost = 0.10
 
-    
-    'tensorboard_dir': 'logs',
-    'log_interval': 20,
-    'callback_interval': 100,     
-    'recon_log_interval': 20,     
-    'row_recon_interval': 28,
-    'row_recon_samples': 3,
+        self.tensorboard_dir = "logs"
+        self.log_interval = 20
+        self.callback_interval = 100
+        self.recon_log_interval = 20
+        self.row_recon_interval = 28
+        self.row_recon_samples = 3
 
-    'movie_limit': 100_000_000_000,
+        self.movie_limit = 100000000000
+        self.db_path = "./data/imdb.db"
 
-    # i/o + runtime
-    'db_path': './data/imdb.db',
+        self.save_interval = 10000
+        self.flush_interval = 2000
 
-    # checkpoints / flushing
-    'save_interval': 10000,
-    'flush_interval': 2000,
+        self.use_cuda_graphs = True
+        self.compile_trunk = True
+        self.num_workers = 1
+        self.prefetch_factor = 1
 
-    # perf knobs
-    'use_cuda_graphs': True,
-    'compile_trunk': True,  # enable torch.compile for sequence predictor trunk
-    'num_workers': 1,
-    'prefetch_factor': 1,
-}
+        self.use_cache = True
+        self.refresh_cache = False
+        self.epochs = 10
+        self.input_length = 4096
+
+    def to_dict(self):
+        return dict(self.__dict__)
+
+
+project_config = ProjectConfig()

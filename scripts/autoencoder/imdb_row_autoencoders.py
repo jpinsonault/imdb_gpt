@@ -45,7 +45,7 @@ class TitlesAutoencoder(RowAutoencoder):
                 HAVING COUNT(g.genre) > 0
                 LIMIT ?
             """,
-                (self.config["movie_limit"],),
+                (self.config.movie_limit,),
             )
             for tconst, primaryTitle, startYear, endYear, runtime, rating, votes, genres in c:
                 yield {
