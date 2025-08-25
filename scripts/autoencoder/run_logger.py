@@ -41,8 +41,17 @@ class RunLogger:
             self._write_config(config)
             self._write_hardware()
 
-    def _write_config(self, config: Dict[str, Any]):
-        txt = json.dumps(config, indent=2, sort_keys=True)
+    def _write_config(self, config):
+        from dataclasses import is_dataclass, asdict
+        if isinstance(config, dict):
+            node = config
+        elif hasattr(config, "to_dict"):
+            node = config.to_dict()
+        elif is_dataclass(config):
+            node = asdict(config)
+        else:
+            node = dict(vars(config))
+        txt = json.dumps(node, indent=2, sort_keys=True)
         self.writer.add_text("config/json", f"<pre>{html.escape(txt)}</pre>", 0)
         if self.run_dir:
             try:
@@ -51,20 +60,21 @@ class RunLogger:
             except Exception:
                 pass
         flat = {}
-        stack = [("", config)]
+        stack = [("", node)]
         while stack:
-            prefix, node = stack.pop()
-            if isinstance(node, dict):
-                for k, v in node.items():
+            prefix, cur = stack.pop()
+            if isinstance(cur, dict):
+                for k, v in cur.items():
                     key = f"{prefix}.{k}" if prefix else k
                     stack.append((key, v))
             else:
-                flat[prefix] = node
+                flat[prefix] = cur
         nums = {k: float(v) for k, v in flat.items() if isinstance(v, (int, float))}
         try:
             self.writer.add_hparams(nums, {})
         except Exception:
             pass
+
 
     def _write_hardware(self):
         lines = [f"torch {torch.__version__}"]
