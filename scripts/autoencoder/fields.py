@@ -523,16 +523,9 @@ class TextField(BaseField):
                 self.texts.append(s)
 
     def _finalize_stats(self):
-        special_tokens = [SPECIAL_PAD, SPECIAL_START, SPECIAL_END]
-        if not self.texts and self.optional:
-            self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
-            self.tokenizer.train([])
-        elif not self.texts and not self.optional:
-            self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
-            self.tokenizer.train([])
-        else:
-            self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
-            self.tokenizer.train(self.texts)
+        special_tokens = ["<unk>", SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
+        self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
+        self.tokenizer.train(self.texts if self.texts else [])
 
         self.pad_token_id = self.tokenizer.token_to_id(SPECIAL_PAD)
         max_tokens = 0
@@ -544,7 +537,8 @@ class TextField(BaseField):
                 ids = self.tokenizer.encode(t)
                 total_tokens += len(ids)
                 total_raw += len(t)
-                max_tokens = max(max_tokens, len(ids))
+                if len(ids) > max_tokens:
+                    max_tokens = len(ids)
             self.avg_raw_length = total_raw / n
             self.avg_token_count = total_tokens / n
             self.avg_chars_saved = self.avg_raw_length - self.avg_token_count
@@ -565,7 +559,6 @@ class TextField(BaseField):
 
         multiple = 2 ** self.downsample_steps
         if multiple > 1:
-            orig = self.max_length
             adj = max(multiple, self.max_length)
             rounded = ((adj + multiple - 1) // multiple) * multiple
             self.max_length = rounded
@@ -625,8 +618,6 @@ class TextField(BaseField):
 
     def print_stats(self):
         pass
-
-
 
 
 class _TextEncoder(nn.Module):

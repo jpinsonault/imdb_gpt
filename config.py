@@ -1,4 +1,3 @@
-# config.py
 from dataclasses import dataclass, asdict
 
 @dataclass
@@ -16,8 +15,8 @@ class ProjectConfig:
     weight_decay: float = 1e-4
 
     people_sequence_length: int = 10
-    latent_loss_weight: float = 1.0
-    recon_loss_weight: float = 0.10
+    latent_loss_weight: float = 0.5
+    recon_loss_weight: float = 1.0
     latent_temperature: float = 0.03
 
     nce_temp: float = 0.03
@@ -45,7 +44,7 @@ class ProjectConfig:
     prefetch_factor: int = 1
 
     use_cache: bool = True
-    refresh_cache: bool = False
+    refresh_cache: bool = True
     epochs: int = 10
     input_length: int = 4096
 
