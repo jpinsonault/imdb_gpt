@@ -1,6 +1,22 @@
 # scripts/autoencoder/imdb_sequence_decoders.py
+import math
 import torch
 import torch.nn as nn
+
+class _SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, length: int, batch_size: int) -> torch.Tensor:
+        x = self.pe[:length]
+        return x.unsqueeze(1).expand(length, batch_size, x.size(-1))
+
 
 class _TransformerTrunk(nn.Module):
     def __init__(
@@ -14,7 +30,7 @@ class _TransformerTrunk(nn.Module):
     ):
         super().__init__()
         self.seq_len = seq_len
-        self.query = nn.Parameter(torch.randn(seq_len, latent_dim))
+        self.pos_enc = _SinusoidalPositionalEncoding(latent_dim, seq_len)
         layer = nn.TransformerDecoderLayer(
             d_model=latent_dim,
             nhead=num_heads,
@@ -27,8 +43,8 @@ class _TransformerTrunk(nn.Module):
 
     def forward(self, z_m: torch.Tensor) -> torch.Tensor:
         memory = z_m.unsqueeze(0)
-        q = self.query.unsqueeze(1).expand(self.seq_len, z_m.size(0), z_m.size(1))
-        out = self.decoder(q, memory)
+        tgt = self.pos_enc(self.seq_len, z_m.size(0))
+        out = self.decoder(tgt, memory)
         out = out.transpose(0, 1)
         out = self.norm(out)
         return out

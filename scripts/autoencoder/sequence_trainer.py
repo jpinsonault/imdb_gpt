@@ -115,74 +115,79 @@ def train_sequence_predictor(
     prefetch = CudaPrefetcher(loader, device)
     model.train()
 
-    with tqdm(total=steps, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
-        while step < steps:
-            with timer.cpu_range("data"):
-                batch = prefetch.next()
-                if batch is None:
-                    prefetch = CudaPrefetcher(loader, device)
+    infinite = steps is None or steps <= 0
+    total_for_bar = None if infinite else steps
+
+    try:
+        with tqdm(total=total_for_bar, desc="sequence", dynamic_ncols=True, miniters=50) as pbar:
+            while infinite or step < steps:
+                with timer.cpu_range("data"):
                     batch = prefetch.next()
                     if batch is None:
-                        break
-                xm, yp, m = batch
+                        prefetch = CudaPrefetcher(loader, device)
+                        batch = prefetch.next()
+                        if batch is None:
+                            if infinite:
+                                continue
+                            break
+                    xm, yp, m = batch
 
-            timer.start_step()
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                with timer.gpu_range("mov_enc"):
-                    z_m = mov.encoder(xm)
-                with timer.gpu_range("trunk"):
-                    z_seq = model.trunk(z_m)
-                b = z_seq.size(0)
-                flat = z_seq.reshape(b * seq_len, latent_dim)
-                with timer.gpu_range("ppl_dec"):
-                    outs = per.decoder(flat)
-                preds = [y.view(b, seq_len, *y.shape[1:]) for y in outs]
-                with timer.gpu_range("rec"):
-                    rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
-                with timer.gpu_range("tgt_enc"):
-                    with torch.no_grad():
-                        flat_targets = [y.view(b * seq_len, *y.shape[2:]) for y in yp]
-                        z_tgt_flat = per.encoder(flat_targets)
-                        z_tgt_seq = z_tgt_flat.view(b, seq_len, latent_dim)
-                    nce_loss = _info_nce_masked_rows(z_seq, z_tgt_seq, m, temp)
-                loss = w_lat * nce_loss + w_rec * rec_loss
+                timer.start_step()
+                with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                    with timer.gpu_range("mov_enc"):
+                        z_m = mov.encoder(xm)
+                    with timer.gpu_range("trunk"):
+                        z_seq = model.trunk(z_m)
+                    b = z_seq.size(0)
+                    flat = z_seq.reshape(b * seq_len, latent_dim)
+                    with timer.gpu_range("ppl_dec"):
+                        outs = per.decoder(flat)
+                    preds = [y.view(b, seq_len, *y.shape[1:]) for y in outs]
+                    with timer.gpu_range("rec"):
+                        rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
+                    with timer.gpu_range("tgt_enc"):
+                        with torch.no_grad():
+                            flat_targets = [y.view(b * seq_len, *y.shape[2:]) for y in yp]
+                            z_tgt_flat = per.encoder(flat_targets)
+                            z_tgt_seq = z_tgt_flat.view(b, seq_len, latent_dim)
+                        nce_loss = _info_nce_masked_rows(z_seq, z_tgt_seq, m, temp)
+                    loss = w_lat * nce_loss + w_rec * rec_loss
 
-            with timer.gpu_range("backward"):
-                opt.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-            with timer.gpu_range("opt"):
-                scaler.step(opt)
-                scaler.update()
+                with timer.gpu_range("backward"):
+                    opt.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                with timer.gpu_range("opt"):
+                    scaler.step(opt)
+                    scaler.update()
 
-            step += 1
-            pbar.update(1)
+                step += 1
+                pbar.update(1)
 
-            vals = timer.end_step_and_accumulate()
-            if vals is not None:
-                keys, out = vals
-                timer.print_line(keys, out, step)
-                run_logger.add_scalars(
-                    float(loss.detach().cpu().item()),
-                    float(rec_loss.detach().cpu().item()),
-                    float(nce_loss.detach().cpu().item()),
-                    out["total"] / 1000.0,
-                    opt,
-                )
-                run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-                run_logger.tick(
-                    float(loss.detach().cpu().item()),
-                    float(rec_loss.detach().cpu().item()),
-                    float(nce_loss.detach().cpu().item()),
-                )
+                vals = timer.end_step_and_accumulate()
+                if vals is not None:
+                    keys, out = vals
+                    run_logger.add_scalars(
+                        float(loss.detach().cpu().item()),
+                        float(rec_loss.detach().cpu().item()),
+                        float(nce_loss.detach().cpu().item()),
+                        out["total"] / 1000.0,
+                        opt,
+                    )
+                    run_logger.add_field_losses("loss/sequence_people", field_breakdown)
+                    run_logger.tick(
+                        float(loss.detach().cpu().item()),
+                        float(rec_loss.detach().cpu().item()),
+                        float(nce_loss.detach().cpu().item()),
+                    )
 
-            seq_logger.on_batch_end(step)
+                seq_logger.on_batch_end(step)
 
-            if save_every and step % save_every == 0:
-                out = Path(config.model_dir)
-                out.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
-
-    out = Path(config.model_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
-    run_logger.close()
+                if save_every and step % save_every == 0:
+                    out = Path(config.model_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), out / f"MovieToPeopleSequencePredictor_step_{step}.pt")
+    finally:
+        out = Path(config.model_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), out / "MovieToPeopleSequencePredictor_final.pt")
+        run_logger.close()

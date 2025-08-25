@@ -5,7 +5,7 @@ from scripts.autoencoder.sequence_trainer import train_sequence_predictor
 
 def main():
     parser = argparse.ArgumentParser(description="Train movie-to-people sequence decoder with latent supervision")
-    parser.add_argument("--steps", type=int, default=10000)
+    parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--movie-limit", type=int, default=0)
     args = parser.parse_args()
