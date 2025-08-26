@@ -218,8 +218,8 @@ def main(config: ProjectConfig):
     if run_logger.run_dir:
         logging.info(f"tensorboard logdir: {run_logger.run_dir}")
 
-    jr_interval = config.recon_log_interval
-    rr_interval = config.row_recon_interval
+    jr_interval = config.callback_interval
+    rr_interval = config.callback_interval
     rr_samples = config.row_recon_samples
 
     joint_recon = JointReconstructionLogger(

@@ -1,13 +1,13 @@
 from typing import List
 import sqlite3
 
-from autoencoder.fields import (
+from .fields import (
     NumericDigitCategoryField,
     TextField,
     MultiCategoryField,
     BaseField,
 )
-from autoencoder.row_autoencoder import RowAutoencoder
+from .row_autoencoder import RowAutoencoder
 
 
 class TitlesAutoencoder(RowAutoencoder):

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
-from autoencoder.fields import BaseField
+from .fields import BaseField
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 

@@ -5,6 +5,7 @@ import torch
 class _GPUEventTimer:
     def __init__(self, print_every: int):
         self.print_every = max(1, int(print_every))
+        self.cuda = bool(torch.cuda.is_available())
         self.reset_accum()
         self._step = 0
 
@@ -24,6 +25,8 @@ class _GPUEventTimer:
         }
 
     def _event_pair(self):
+        if not self.cuda:
+            return None, None
         return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
     def start_step(self):
@@ -35,7 +38,11 @@ class _GPUEventTimer:
         self._step += 1
         if self._step % self.print_every != 0:
             return None
-        torch.cuda.synchronize()
+        if self.cuda:
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         out = {}
         total = self.accum_ms["total"]
         parts = 0.0
@@ -44,7 +51,20 @@ class _GPUEventTimer:
                 continue
             parts += v
         residual = max(0.0, total - parts)
-        keys = ["total","backward","trunk","mov_enc","tgt_enc","rec","opt","ppl_dec","nce","data","h2d","residual"]
+        keys = [
+            "total",
+            "backward",
+            "trunk",
+            "mov_enc",
+            "tgt_enc",
+            "rec",
+            "opt",
+            "ppl_dec",
+            "nce",
+            "data",
+            "h2d",
+            "residual",
+        ]
         out["total"] = total
         out["backward"] = self.accum_ms["backward"]
         out["trunk"] = self.accum_ms["trunk"]
@@ -72,6 +92,8 @@ class _GPUEventTimer:
         return _R(self, name)
 
     def gpu_range(self, name):
+        if not self.cuda:
+            return self.cpu_range(name)
         class _R:
             def __init__(self, outer, nm):
                 self.o = outer
@@ -81,7 +103,10 @@ class _GPUEventTimer:
                 self.s.record()
             def __exit__(self, a, b, c):
                 self.e.record()
-                torch.cuda.synchronize()
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
                 self.o.accum_ms[self.nm] += self.s.elapsed_time(self.e)
         return _R(self, name)
 

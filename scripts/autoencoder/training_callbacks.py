@@ -371,9 +371,11 @@ class SequenceReconstructionLogger:
 
     @torch.no_grad()
     def _predict_seq(self, movie_row):
-        device = next(self.pred.parameters()).device
+        device = self.m_ae.device
         xs = [f.transform(movie_row.get(f.name)) for f in self.m_ae.fields]
         xs = [x.unsqueeze(0).to(device) for x in xs]
+        if self.pred is None:
+            raise RuntimeError("SequenceReconstructionLogger requires a non-None predictor")
         outs = self.pred(xs)
         return [o.detach().cpu().numpy()[0] for o in outs]
 

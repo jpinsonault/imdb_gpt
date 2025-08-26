@@ -75,7 +75,6 @@ class RunLogger:
         except Exception:
             pass
 
-
     def _write_hardware(self):
         lines = [f"torch {torch.__version__}"]
         if torch.cuda.is_available():
@@ -114,7 +113,7 @@ class RunLogger:
         self.writer.add_scalar("loss/batch_min", float(batch_min), s)
         self.writer.add_scalar("loss/batch_max", float(batch_max), s)
 
-    def tick(self, total: float, rec: float, nce: float):
+    def tick(self, total: float | None = None, rec: float | None = None, nce: float | None = None):
         self.step += 1
         if self.step % self.log_every != 0:
             return

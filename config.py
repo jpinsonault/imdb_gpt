@@ -9,8 +9,10 @@ class ProjectConfig:
     corpus_dir: str = "./data/corpus/"
     docker_data_dir_mount: str = "/app/imdb"
 
+    max_training_steps: int = None
+
     latent_dim: int = 256
-    batch_size: int = 512
+    batch_size: int = 10
     learning_rate: float = 0.0005
     weight_decay: float = 1e-4
 
@@ -28,8 +30,6 @@ class ProjectConfig:
     tensorboard_dir: str = "logs"
     log_interval: int = 20
     callback_interval: int = 100
-    recon_log_interval: int = 20
-    row_recon_interval: int = 28
     row_recon_samples: int = 3
 
     movie_limit: int = 100000000000
@@ -44,7 +44,7 @@ class ProjectConfig:
     prefetch_factor: int = 1
 
     use_cache: bool = True
-    refresh_cache: bool = True
+    refresh_cache: bool = False
     epochs: int = 10
     input_length: int = 4096
 
