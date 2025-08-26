@@ -40,7 +40,6 @@ def train_sequence_predictor(
     w_rec = config.recon_loss_weight
     log_every = config.log_interval
     use_compile = config.compile_trunk
-    use_cuda_graphs = config.use_cuda_graphs
 
     disable_inductor_autotune()
     _conn = sqlite3.connect(str(Path(config.db_path)))
@@ -174,11 +173,7 @@ def train_sequence_predictor(
                         opt,
                     )
                     run_logger.add_field_losses("loss/sequence_people", field_breakdown)
-                    run_logger.tick(
-                        float(loss.detach().cpu().item()),
-                        float(rec_loss.detach().cpu().item()),
-                        float(nce_loss.detach().cpu().item()),
-                    )
+                    run_logger.tick()
 
                 seq_logger.on_batch_end(step)
 
