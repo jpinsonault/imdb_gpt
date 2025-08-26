@@ -157,8 +157,8 @@ def build_joint_trainer(
         movie_ae=movie_ae,
         person_ae=people_ae,
         batch_size=config.batch_size,
-        refresh_batches=config.edge_sampler.refresh_batches,
-        boost=config.edge_sampler.weak_edge_boost,
+        refresh_batches=config.refresh_batches,
+        boost=config.weak_edge_boost,
         loss_logger=loss_logger,
     )
 
