@@ -12,7 +12,7 @@ class ProjectConfig:
     max_training_steps: int = None
 
     latent_dim: int = 256
-    batch_size: int = 10
+    batch_size: int = 512
     learning_rate: float = 0.0005
     weight_decay: float = 1e-4
 

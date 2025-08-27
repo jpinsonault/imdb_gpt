@@ -89,43 +89,62 @@ class JointAutoencoder(nn.Module):
 
 def _reduce_per_sample_mse(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     diff = pred - tgt
-    if diff.dim() == 1:
-        return diff.pow(2)
-    return diff.pow(2).flatten(1).mean(dim=1)
-
-
-def _reduce_per_sample_bce_logits(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-    loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
-    if loss.dim() == 1:
-        return loss
-    return loss.flatten(1).mean(dim=1)
+    if diff.dim() > 1:
+        return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1)
+    return diff.pow(2)
 
 
 def _per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    if pred.dim() == 3:
+        if tgt.dim() == 3:
+            tgt = tgt.argmax(dim=-1)
+        if hasattr(field, "tokenizer"):
+            B, L, V = pred.shape
+            pad_id = int(getattr(field, "pad_token_id", 0) or 0)
+            loss_flat = F.cross_entropy(
+                pred.reshape(B * L, V),
+                tgt.reshape(B * L),
+                ignore_index=pad_id,
+                reduction="none",
+            )
+            loss_bt = loss_flat.reshape(B, L)
+            mask_tok = (tgt.reshape(B, L) != pad_id).float()
+            denom = mask_tok.sum(dim=1).clamp_min(1.0)
+            return (loss_bt * mask_tok).sum(dim=1) / denom
+        if hasattr(field, "base"):
+            B, P, V = pred.shape
+            loss_flat = F.cross_entropy(
+                pred.reshape(B * P, V),
+                tgt.reshape(B * P).long(),
+                reduction="none",
+            )
+            return loss_flat.reshape(B, P).mean(dim=1)
+
     if isinstance(field, ScalarField):
         return _reduce_per_sample_mse(pred, tgt)
+
     if isinstance(field, BooleanField):
         if getattr(field, "use_bce_loss", True):
-            return _reduce_per_sample_bce_logits(pred, tgt)
+            loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
+            if loss.dim() > 1:
+                loss = loss.reshape(loss.size(0), -1).mean(dim=1)
+            return loss
         return _reduce_per_sample_mse(torch.tanh(pred), tgt)
+
     if isinstance(field, MultiCategoryField):
-        return _reduce_per_sample_bce_logits(pred, tgt)
+        loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
+        if loss.dim() > 1:
+            loss = loss.reshape(loss.size(0), -1).mean(dim=1)
+        return loss
+
     if isinstance(field, SingleCategoryField):
+        B, C = pred.shape[0], pred.shape[-1]
         t = tgt.long().squeeze(-1)
-        return F.cross_entropy(pred, t, reduction="none")
-    if isinstance(field, TextField):
-        B, L, V = pred.shape
-        pad_id = 0 if not hasattr(field, "pad_token_id") or field.pad_token_id is None else int(field.pad_token_id)
-        loss_flat = F.cross_entropy(pred.reshape(B * L, V), tgt.reshape(B * L), ignore_index=pad_id, reduction="none")
-        loss = loss_flat.view(B, L)
-        mask = (tgt != pad_id).float()
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (loss * mask).sum(dim=1) / denom
-    if isinstance(field, NumericDigitCategoryField):
-        B, P, V = pred.shape
-        loss_flat = F.cross_entropy(pred.view(B * P, V), tgt.view(B * P).long(), reduction="none")
-        return loss_flat.view(B, P).mean(dim=1)
+        return F.cross_entropy(pred.reshape(B, C), t.reshape(B), reduction="none")
+
     return _reduce_per_sample_mse(pred, tgt)
+
+
 
 
 def build_joint_trainer(
