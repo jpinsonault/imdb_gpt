@@ -1,112 +1,162 @@
-# scripts/autoencoder/one_to_many/trainer.py
-from __future__ import annotations
 from pathlib import Path
+import sqlite3
 import torch
 from torch.utils.data import DataLoader
-from config import ProjectConfig
-from scripts.autoencoder.one_to_many.dataset import OneToManyDataset, collate_one_to_many
-from scripts.autoencoder.one_to_many.model import OneToManyPredictor
-from scripts.autoencoder.sequence_losses import _sequence_loss_and_breakdown, _info_nce_masked_rows
-from scripts.autoencoder.prefetch import CudaPrefetcher
+from tqdm import tqdm
 from scripts.autoencoder.print_model import print_model_layers_with_shapes
 from scripts.autoencoder.run_logger import build_run_logger
+from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
+from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
+from scripts.autoencoder.one_to_many.dataset import OneToManyDataset, collate_one_to_many
+from scripts.autoencoder.prefetch import CudaPrefetcher
+from scripts.autoencoder.sequence_losses import _sequence_loss_and_breakdown, _info_nce_masked_rows
 from scripts.autoencoder.timing import _GPUEventTimer
+from scripts.precompute_movie_people_seq import build_movie_people_seq
+from config import ProjectConfig
 
-def disable_inductor_autotune():
-    from torch._inductor import config as _inductor_cfg
-    _inductor_cfg.max_autotune = False
+class OneToManyPredictor(torch.nn.Module):
+    def __init__(self, source_encoder: torch.nn.Module, target_decoder: torch.nn.Module, latent_dim: int, seq_len: int, num_layers: int = 2, num_heads: int = 4, ff_mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        import math
+        self.source_encoder = source_encoder
+        self.target_decoder = target_decoder
+        self.latent_dim = latent_dim
+        self.seq_len = seq_len
+        class _PE(torch.nn.Module):
+            def __init__(self, d, n):
+                super().__init__()
+                pe = torch.zeros(n, d)
+                pos = torch.arange(0, n, dtype=torch.float32).unsqueeze(1)
+                div = torch.exp(torch.arange(0, d, 2, dtype=torch.float32) * (-math.log(10000.0) / d))
+                pe[:, 0::2] = torch.sin(pos * div)
+                pe[:, 1::2] = torch.cos(pos * div)
+                self.register_buffer("pe", pe)
+            def forward(self, length: int, batch_size: int):
+                x = self.pe[:length]
+                return x.unsqueeze(1).expand(length, batch_size, x.size(-1))
+        class _Trunk(torch.nn.Module):
+            def __init__(self, d, n, L, H, F, p):
+                super().__init__()
+                self.n = n
+                self.pos = _PE(d, n)
+                layer = torch.nn.TransformerDecoderLayer(d_model=d, nhead=H, dim_feedforward=F * d, dropout=p, batch_first=False)
+                self.dec = torch.nn.TransformerDecoder(layer, num_layers=L)
+                self.norm = torch.nn.LayerNorm(d)
+            def forward(self, z):
+                mem = z.unsqueeze(0)
+                tgt = self.pos(self.n, z.size(0))
+                out = self.dec(tgt, mem)
+                out = out.transpose(0, 1)
+                out = self.norm(out)
+                return out
+        self.trunk = _Trunk(latent_dim, seq_len, num_layers, num_heads, ff_mult, dropout)
+    def forward(self, source_inputs):
+        z = self.source_encoder(source_inputs)
+        z_seq = self.trunk(z)
+        b = z_seq.size(0)
+        flat = z_seq.reshape(b * self.seq_len, self.latent_dim)
+        outs = self.target_decoder(flat)
+        seq_outs = []
+        for y in outs:
+            seq_outs.append(y.view(b, self.seq_len, *y.shape[1:]))
+        return seq_outs
 
-def build_loader(
-    provider,
-    source_fields,
-    target_fields,
-    config: ProjectConfig,
-) -> DataLoader:
-    ds = OneToManyDataset(
-        provider=provider,
-        source_fields=source_fields,
-        target_fields=target_fields,
+def _ensure_movie_people_seq(db_path: str, seq_len: int):
+    conn = sqlite3.connect(str(Path(db_path)))
+    has = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='movie_people_seq'").fetchone()
+    conn.close()
+    if has is None:
+        build_movie_people_seq(str(Path(db_path)), seq_len)
+
+def build_sequence_logger(movie_ae, people_ae, predictor, config: ProjectConfig, db_path: str, seq_len: int):
+    return SequenceReconstructionLogger(
+        movie_ae=movie_ae,
+        people_ae=people_ae,
+        predictor=predictor,
+        db_path=db_path,
+        seq_len=seq_len,
+        interval_steps=config.callback_interval,
+        num_samples=2,
+        table_width=38,
     )
+
+def _build_loader_precomputed(config: ProjectConfig, mov, per, seq_len: int):
+    ds = OneToManyDataset(
+        db_path=str(Path(config.db_path)),
+        source_fields=mov.fields,
+        target_fields=per.fields,
+        seq_len=seq_len,
+        movie_limit=None,
+        movie_cache_size=10000,
+    )
+    num_workers = config.num_workers
+    prefetch_factor = config.prefetch_factor
     pin = bool(torch.cuda.is_available())
-    return DataLoader(
+    loader = DataLoader(
         ds,
         batch_size=config.batch_size,
         collate_fn=collate_one_to_many,
-        num_workers=config.num_workers,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else 2,
-        persistent_workers=True if config.num_workers > 0 else False,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+        persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
         drop_last=False,
     )
+    return loader
 
 def train_one_to_many(
     config: ProjectConfig,
-    provider,
-    source_ae,
-    target_ae,
     steps: int,
     save_every: int,
-    seq_logger=None,
+    provider: str = "precomputed",
+    source_ae: str | None = None,
+    target_ae: str | None = None,
+    **_
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    mov, per = _load_frozen_autoencoders(config)
     latent_dim = config.latent_dim
-    seq_len = provider.seq_len
+    seq_len = config.people_sequence_length
+    batch_size = config.batch_size
     lr = config.learning_rate
     wd = config.weight_decay
     temp = config.latent_temperature
     w_lat = config.latent_loss_weight
     w_rec = config.recon_loss_weight
-    log_every = config.log_interval
     use_compile = config.compile_trunk
-
-    disable_inductor_autotune()
-
+    _ensure_movie_people_seq(config.db_path, seq_len)
     model = OneToManyPredictor(
-        source_encoder=source_ae.encoder,
-        target_decoder=target_ae.decoder,
+        source_encoder=mov.encoder,
+        target_decoder=per.decoder,
         latent_dim=latent_dim,
         seq_len=seq_len,
     ).to(device)
-
     if use_compile and hasattr(torch, "compile"):
         try:
             model.trunk = torch.compile(model.trunk, mode="max-autotune")
         except Exception:
             pass
-
-    loader = build_loader(
-        provider=provider,
-        source_fields=source_ae.fields,
-        target_fields=target_ae.fields,
-        config=config,
-    )
-
-    source_ae.encoder.to(device)
-    target_ae.decoder.to(device)
-    target_ae.encoder.to(device)
-
-    opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd, fused=True)
+    if provider != "precomputed":
+        raise NotImplementedError("only 'precomputed' provider is supported here")
+    loader = _build_loader_precomputed(config, mov, per, seq_len)
+    mov.encoder.to(device)
+    per.decoder.to(device)
+    per.encoder.to(device)
+    opt = torch.optim.AdamW(model.trunk.parameters(), lr=lr, weight_decay=wd, fused=(device.type == "cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
     run_logger = build_run_logger(config)
-
+    seq_logger = build_sequence_logger(mov, per, model, config, str(Path(config.db_path)), seq_len)
     it_preview = iter(loader)
     xm0, _, _ = next(it_preview)
     xm0 = [x.to(device) for x in xm0]
     print_model_layers_with_shapes(model, xm0)
-
-    timer = _GPUEventTimer(print_every=log_every)
-
+    timer = _GPUEventTimer(print_every=config.log_interval)
     step = 0
     prefetch = CudaPrefetcher(loader, device)
     model.train()
-
     infinite = steps is None or steps <= 0
     total_for_bar = None if infinite else steps
-
     try:
-        from tqdm import tqdm
         with tqdm(total=total_for_bar, desc="one_to_many", dynamic_ncols=True, miniters=50) as pbar:
             while infinite or step < steps:
                 with timer.cpu_range("data"):
@@ -118,39 +168,35 @@ def train_one_to_many(
                             if infinite:
                                 continue
                             break
-                    xs, yt, m = batch
-
+                    xm, yp, m = batch
                 timer.start_step()
                 with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                     with timer.gpu_range("mov_enc"):
-                        z_src = source_ae.encoder(xs)
+                        z_m = mov.encoder(xm)
                     with timer.gpu_range("trunk"):
-                        z_seq = model.trunk(z_src)
+                        z_seq = model.trunk(z_m)
                     b = z_seq.size(0)
                     flat = z_seq.reshape(b * seq_len, latent_dim)
                     with timer.gpu_range("ppl_dec"):
-                        outs = target_ae.decoder(flat)
+                        outs = per.decoder(flat)
                     preds = [y.view(b, seq_len, *y.shape[1:]) for y in outs]
                     with timer.gpu_range("rec"):
-                        rec_loss, field_breakdown = _sequence_loss_and_breakdown(target_ae.fields, preds, yt, m)
+                        rec_loss, field_breakdown = _sequence_loss_and_breakdown(per.fields, preds, yp, m)
                     with timer.gpu_range("tgt_enc"):
                         with torch.no_grad():
-                            flat_targets = [y.view(b * seq_len, *y.shape[2:]) for y in yt]
-                            z_tgt_flat = target_ae.encoder(flat_targets)
+                            flat_targets = [y.view(b * seq_len, *y.shape[2:]) for y in yp]
+                            z_tgt_flat = per.encoder(flat_targets)
                             z_tgt_seq = z_tgt_flat.view(b, seq_len, latent_dim)
                         nce_loss = _info_nce_masked_rows(z_seq, z_tgt_seq, m, temp)
                     loss = w_lat * nce_loss + w_rec * rec_loss
-
                 with timer.gpu_range("backward"):
                     opt.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
                 with timer.gpu_range("opt"):
                     scaler.step(opt)
                     scaler.update()
-
                 step += 1
                 pbar.update(1)
-
                 vals = timer.end_step_and_accumulate()
                 if vals is not None:
                     keys, out = vals
@@ -162,19 +208,19 @@ def train_one_to_many(
                         opt,
                     )
                     run_logger.add_field_losses("loss/sequence_target", field_breakdown)
-                    run_logger.tick()
-
-                if seq_logger is not None:
-                    seq_logger.on_batch_end(step)
-
+                    run_logger.tick(
+                        float(loss.detach().cpu().item()),
+                        float(rec_loss.detach().cpu().item()),
+                        float(nce_loss.detach().cpu().item()),
+                    )
+                seq_logger.on_batch_end(step)
                 if save_every and step % save_every == 0:
-                    out = Path(config.model_dir)
-                    out.mkdir(parents=True, exist_ok=True)
-                    torch.save(model.state_dict(), out / f"OneToManyPredictor_step_{step}.pt")
+                    out_dir = Path(config.model_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), out_dir / f"OneToManyPredictor_step_{step}.pt")
     finally:
-        out = Path(config.model_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), out / "OneToManyPredictor_final.pt")
+        out_dir = Path(config.model_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), out_dir / "OneToManyPredictor_final.pt")
         run_logger.close()
-
     return model
