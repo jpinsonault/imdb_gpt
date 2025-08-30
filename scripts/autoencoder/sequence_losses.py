@@ -46,7 +46,7 @@ def _per_sample_field_loss_seq(field: BaseField, pred: torch.Tensor, tgt: torch.
 
     if isinstance(field, TextField):
         if pred.dim() != 4 or tgt.dim() != 3:
-            raise RuntimeError(f"TextField expects pred (B,T,L,V) or (B,T,V,L) and tgt (B,T,L), got pred={tuple(pred.shape)} tgt={tuple(tgt.shape)}")
+            raise RuntimeError(f"TextField expects pred (B,T,L,V)/(B,T,V,L) and tgt (B,T,L), got pred={tuple(pred.shape)} tgt={tuple(tgt.shape)}")
         vocab = field.tokenizer.get_vocab_size()
         if pred.shape[-1] == vocab and pred.shape[-2] == tgt.shape[-1]:
             logits = pred
@@ -85,10 +85,41 @@ def _per_sample_field_loss_seq(field: BaseField, pred: torch.Tensor, tgt: torch.
         ).view(B * T, P)
         return loss_flat.mean(dim=1).view(B, T)
 
+    if pred.dim() == 4 and tgt.dim() == 3:
+        if pred.shape[-1] == tgt.shape[-1]:
+            logits = pred.transpose(-1, -2)
+        elif pred.shape[-2] == tgt.shape[-1]:
+            logits = pred
+        else:
+            diff = pred - tgt
+            if diff.dim() > 2:
+                diff = diff.flatten(2).mean(dim=2)
+            return diff.pow(2)
+        B, T, P, V = logits.shape
+        if hasattr(field, "pad_token_id"):
+            pad_id = int(getattr(field, "pad_token_id"))
+            loss_flat = F.cross_entropy(
+                logits.view(B * T * P, V),
+                tgt.view(B * T * P).long(),
+                ignore_index=pad_id,
+                reduction="none",
+            ).view(B * T, P)
+            mask_tok = (tgt.view(B * T, P) != pad_id).float()
+            denom = mask_tok.sum(dim=1).clamp_min(1.0)
+            loss_bt = (loss_flat * mask_tok).sum(dim=1) / denom
+            return loss_bt.view(B, T)
+        loss_flat = F.cross_entropy(
+            logits.view(B * T * P, V),
+            tgt.view(B * T * P).long(),
+            reduction="none",
+        ).view(B * T, P)
+        return loss_flat.mean(dim=1).view(B, T)
+
     diff = pred - tgt
     if diff.dim() > 2:
         diff = diff.flatten(2).mean(dim=2)
     return diff.pow(2)
+
 
 def _sequence_loss_and_breakdown(
     fields: List[BaseField],
