@@ -2,17 +2,24 @@
 import torch
 import torch.nn.functional as F
 from typing import List
-from .fields import BaseField, ScalarField, BooleanField, MultiCategoryField, SingleCategoryField, TextField, NumericDigitCategoryField
+from .fields import (
+    BaseField,
+    ScalarField,
+    BooleanField,
+    MultiCategoryField,
+    SingleCategoryField,
+    TextField,
+    NumericDigitCategoryField,
+)
 
 def _per_sample_field_loss_seq(field: BaseField, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     if isinstance(field, ScalarField):
         diff = pred - tgt
         if diff.dim() > 2:
             diff = diff.flatten(2)
-            loss = diff.pow(2).mean(dim=2)
-        else:
-            loss = diff.pow(2)
-        return loss
+            return diff.pow(2).mean(dim=2)
+        return diff.pow(2)
+
     if isinstance(field, BooleanField):
         if getattr(field, "use_bce_loss", True):
             loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
@@ -22,39 +29,66 @@ def _per_sample_field_loss_seq(field: BaseField, pred: torch.Tensor, tgt: torch.
         diff = torch.tanh(pred) - tgt
         if diff.dim() > 2:
             diff = diff.flatten(2).mean(dim=2)
-        else:
-            diff = diff
         return diff.pow(2)
+
     if isinstance(field, MultiCategoryField):
         loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
         if loss.dim() > 2:
             loss = loss.flatten(2).mean(dim=2)
         return loss
+
     if isinstance(field, SingleCategoryField):
         B, T = pred.shape[0], pred.shape[1]
         C = pred.shape[-1]
         t = tgt.long().squeeze(-1)
         loss = F.cross_entropy(pred.view(B * T, C), t.view(B * T), reduction="none")
         return loss.view(B, T)
+
     if isinstance(field, TextField):
-        B, T, L, V = pred.shape
+        if pred.dim() != 4 or tgt.dim() != 3:
+            raise RuntimeError(f"TextField expects pred (B,T,L,V) or (B,T,V,L) and tgt (B,T,L), got pred={tuple(pred.shape)} tgt={tuple(tgt.shape)}")
+        vocab = field.tokenizer.get_vocab_size()
+        if pred.shape[-1] == vocab and pred.shape[-2] == tgt.shape[-1]:
+            logits = pred
+        elif pred.shape[-2] == vocab and pred.shape[-1] == tgt.shape[-1]:
+            logits = pred.transpose(-1, -2)
+        else:
+            raise RuntimeError(f"TextField logits/tgt mismatch: pred={tuple(pred.shape)} tgt={tuple(tgt.shape)} vocab={vocab}")
+        B, T, L, V = logits.shape
         pad_id = int(field.pad_token_id)
-        loss_flat = F.cross_entropy(pred.view(B * T, L, V).reshape(B * T * L, V), tgt.view(B * T, L).reshape(B * T * L), ignore_index=pad_id, reduction="none")
-        loss_flat = loss_flat.view(B * T, L)
+        loss_flat = F.cross_entropy(
+            logits.view(B * T * L, V),
+            tgt.view(B * T * L),
+            ignore_index=pad_id,
+            reduction="none",
+        ).view(B * T, L)
         mask_tok = (tgt.view(B * T, L) != pad_id).float()
         denom = mask_tok.sum(dim=1).clamp_min(1.0)
         loss_bt = (loss_flat * mask_tok).sum(dim=1) / denom
         return loss_bt.view(B, T)
+
     if isinstance(field, NumericDigitCategoryField):
-        B, T, P, V = pred.shape
-        loss_flat = F.cross_entropy(pred.view(B * T * P, V), tgt.view(B * T * P).long(), reduction="none")
-        loss_bt = loss_flat.view(B * T, P).mean(dim=1)
-        return loss_bt.view(B, T)
+        if pred.dim() != 4 or tgt.dim() != 3:
+            raise RuntimeError(f"DigitCategory expects pred (B,T,P,V)/(B,T,V,P) and tgt (B,T,P), got pred={tuple(pred.shape)} tgt={tuple(tgt.shape)}")
+        base = int(getattr(field, "base", 10))
+        if pred.shape[-1] == base and pred.shape[-2] == tgt.shape[-1]:
+            logits = pred
+        elif pred.shape[-2] == base and pred.shape[-1] == tgt.shape[-1]:
+            logits = pred.transpose(-1, -2)
+        else:
+            raise RuntimeError(f"DigitCategory logits/tgt mismatch: pred={tuple(pred.shape)} tgt={tuple(tgt.shape)} base={base}")
+        B, T, P, V = logits.shape
+        loss_flat = F.cross_entropy(
+            logits.view(B * T * P, V),
+            tgt.view(B * T * P).long(),
+            reduction="none",
+        ).view(B * T, P)
+        return loss_flat.mean(dim=1).view(B, T)
+
     diff = pred - tgt
     if diff.dim() > 2:
         diff = diff.flatten(2).mean(dim=2)
     return diff.pow(2)
-
 
 def _sequence_loss_and_breakdown(
     fields: List[BaseField],
@@ -72,7 +106,6 @@ def _sequence_loss_and_breakdown(
         total = total + val * float(f.weight)
         field_losses[f.name] = float(val.detach().cpu().item())
     return total, field_losses
-
 
 def _info_nce_masked_rows(z_pred_seq: torch.Tensor, z_tgt_seq: torch.Tensor, mask: torch.Tensor, temperature: float) -> torch.Tensor:
     z_pred_seq = torch.nn.functional.normalize(z_pred_seq, dim=-1)

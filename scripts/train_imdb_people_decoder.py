@@ -1,9 +1,9 @@
 # scripts/train_imdb_people_decoder.py
 from config import project_config
-from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.one_to_many.trainer import build_sequence_logger, train_one_to_many
-from scripts.autoencoder.one_to_many.provider import ImdbMovieToPeopleProvider
-from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
+from .autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+from .autoencoder.one_to_many.trainer import build_sequence_logger, train_one_to_many
+from .autoencoder.one_to_many.provider import ImdbMovieToPeopleProvider
+from .autoencoder.training_callbacks import SequenceReconstructionLogger
 
 def main():
     mov = TitlesAutoencoder(project_config)
@@ -28,8 +28,6 @@ def main():
     _ = train_one_to_many(
         config=project_config,
         provider=provider,
-        source_ae=mov,
-        target_ae=per,
         steps=project_config.max_training_steps,
         save_every=0,
         seq_logger=seq_logger,

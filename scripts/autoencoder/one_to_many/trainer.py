@@ -15,13 +15,13 @@ from scripts.precompute_movie_people_seq import build_movie_people_seq
 from config import ProjectConfig
 
 class OneToManyPredictor(torch.nn.Module):
-    def __init__(self, source_encoder: torch.nn.Module, target_decoder: torch.nn.Module, latent_dim: int, seq_len: int, num_layers: int = 2, num_heads: int = 4, ff_mult: int = 4, dropout: float = 0.0):
+    def __init__(self, source_encoder: torch.nn.Module, target_decoder: torch.nn.Module, latent_dim: int, seq_len: int, num_layers: int = 4, num_heads: int = 8, ff_mult: int = 8, dropout: float = 0.1):
         super().__init__()
         import math
         self.source_encoder = source_encoder
         self.target_decoder = target_decoder
-        self.latent_dim = latent_dim
-        self.seq_len = seq_len
+        self.latent_dim = int(latent_dim)
+        self.seq_len = int(seq_len)
         class _PE(torch.nn.Module):
             def __init__(self, d, n):
                 super().__init__()
@@ -37,16 +37,29 @@ class OneToManyPredictor(torch.nn.Module):
         class _Trunk(torch.nn.Module):
             def __init__(self, d, n, L, H, F, p):
                 super().__init__()
-                self.n = n
+                self.n = int(n)
+                self.d = int(d)
                 self.pos = _PE(d, n)
-                layer = torch.nn.TransformerDecoderLayer(d_model=d, nhead=H, dim_feedforward=F * d, dropout=p, batch_first=False)
+                self.q = torch.nn.Parameter(torch.zeros(self.n, self.d))
+                torch.nn.init.xavier_uniform_(self.q)
+                layer = torch.nn.TransformerDecoderLayer(d_model=d, nhead=H, dim_feedforward=F * d, dropout=p, batch_first=False, norm_first=True)
                 self.dec = torch.nn.TransformerDecoder(layer, num_layers=L)
+                self.post = torch.nn.Sequential(
+                    torch.nn.LayerNorm(d),
+                    torch.nn.Linear(d, F * d),
+                    torch.nn.GELU(),
+                    torch.nn.Dropout(p),
+                    torch.nn.Linear(F * d, d),
+                )
                 self.norm = torch.nn.LayerNorm(d)
             def forward(self, z):
                 mem = z.unsqueeze(0)
-                tgt = self.pos(self.n, z.size(0))
+                b = z.size(0)
+                tgt = self.q.unsqueeze(1).expand(self.n, b, self.d)
+                tgt = tgt + self.pos(self.n, b)
                 out = self.dec(tgt, mem)
                 out = out.transpose(0, 1)
+                out = out + self.post(out)
                 out = self.norm(out)
                 return out
         self.trunk = _Trunk(latent_dim, seq_len, num_layers, num_heads, ff_mult, dropout)
@@ -108,16 +121,12 @@ def train_one_to_many(
     config: ProjectConfig,
     steps: int,
     save_every: int,
-    provider: str = "precomputed",
-    source_ae: str | None = None,
-    target_ae: str | None = None,
     **_
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mov, per = _load_frozen_autoencoders(config)
     latent_dim = config.latent_dim
     seq_len = config.people_sequence_length
-    batch_size = config.batch_size
     lr = config.learning_rate
     wd = config.weight_decay
     temp = config.latent_temperature
@@ -136,8 +145,7 @@ def train_one_to_many(
             model.trunk = torch.compile(model.trunk, mode="max-autotune")
         except Exception:
             pass
-    if provider != "precomputed":
-        raise NotImplementedError("only 'precomputed' provider is supported here")
+    
     loader = _build_loader_precomputed(config, mov, per, seq_len)
     mov.encoder.to(device)
     per.decoder.to(device)
