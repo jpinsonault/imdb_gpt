@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict, Any
 import numpy as np
 import torch
 import torch.nn as nn
@@ -81,3 +81,15 @@ class BaseField:
 
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    def get_state(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "optional": self.optional,
+            "stats_finalized": self._stats_finalized,
+        }
+
+    def set_state(self, state: Dict[str, Any]) -> None:
+        self.name = state.get("name", self.name)
+        self.optional = bool(state.get("optional", self.optional))
+        self._stats_finalized = bool(state.get("stats_finalized", True))

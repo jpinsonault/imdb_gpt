@@ -1,5 +1,6 @@
 from typing import List, Optional
 import numpy as np
+from scripts.autoencoder.fields.constants import SPECIAL_END, SPECIAL_PAD, SPECIAL_SEP, SPECIAL_START
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,7 +50,7 @@ class TextField(BaseField):
                 self.texts.append(s)
 
     def _finalize_stats(self):
-        special_tokens = ["<unk>", SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
+        special_tokens = [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
         self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
         self.tokenizer.train(self.texts if self.texts else [])
 
