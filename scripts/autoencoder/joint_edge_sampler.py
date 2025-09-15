@@ -134,21 +134,23 @@ class WeightedEdgeSampler:
 
         recorded = self.loss_logger.snapshot()
         default_loss = float(getattr(self.loss_logger, "default_loss", 1000.0))
+
         loss_vec = np.full(len(self.edges), default_loss, dtype=np.float32)
         for eid, loss in recorded.items():
             idx = self.edge_to_idx.get(eid)
             if idx is not None:
                 loss_vec[idx] = float(loss)
 
-        lo, hi = float(loss_vec.min()), float(loss_vec.max())
-        if hi > lo:
-            norm = (loss_vec - lo) / (hi - lo)
-            self.weights = 1.0 + self.boost * norm.astype(np.float32)
-        else:
-            self.weights.fill(1.0)
+        tau = 0.5
+        loss_vec = (loss_vec - loss_vec.mean()) / (loss_vec.std() + 1e-6)
+        logits = loss_vec / max(1e-6, tau)
+        exps = np.exp(logits - logits.max())
+        probs = exps / exps.sum()
 
-        probs = self.weights / self.weights.sum()
-        self.alias = AliasSampler(probs)
+        probs = (1.0 - self.boost) * (np.ones_like(probs) / len(probs)) + self.boost * probs
+        self.weights = probs.astype(np.float32) * len(probs)
+        self.alias = AliasSampler(probs.astype(np.float32))
+
 
 
 def make_edge_sampler(

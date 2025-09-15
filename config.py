@@ -25,7 +25,7 @@ class ProjectConfig:
     nce_weight: float = 1.0
 
     refresh_batches: int = 100
-    weak_edge_boost: float = 0.10
+    weak_edge_boost: float = 0.50
 
     tensorboard_dir: str = "logs"
     log_interval: int = 20
@@ -40,8 +40,8 @@ class ProjectConfig:
 
     use_cuda_graphs: bool = True
     compile_trunk: bool = True
-    num_workers: int = 1
-    prefetch_factor: int = 1
+    num_workers: int = 0
+    prefetch_factor: int = 0
 
     use_cache: bool = True
     refresh_cache: bool = False
