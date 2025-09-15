@@ -52,3 +52,4 @@ class ProjectConfig:
         return asdict(self)
 
 project_config = ProjectConfig()
+ 
