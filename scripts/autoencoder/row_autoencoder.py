@@ -36,6 +36,9 @@ class _FieldEncoders(nn.Module):
         self.proj = nn.ModuleList([nn.Identity() if _out_dim(m) == latent_dim else nn.Linear(_out_dim(m), latent_dim) for m in self.encs])
         self.fuse = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=4, batch_first=True)
         self.norm = nn.LayerNorm(latent_dim)
+        self.field_embed = nn.Parameter(torch.randn(len(fields), latent_dim) * 0.02)
+        self.q_bias = nn.Parameter(torch.zeros(len(fields), latent_dim))
+        self.k_bias = nn.Parameter(torch.zeros(len(fields), latent_dim))
 
     def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
         outs = []
@@ -46,9 +49,13 @@ class _FieldEncoders(nn.Module):
             y = proj(y)
             outs.append(y)
         tokens = torch.stack(outs, dim=1)
-        attn_out, _ = self.fuse(tokens, tokens, tokens)
+        tokens = tokens + self.field_embed.unsqueeze(0)
+        q = tokens + self.q_bias.unsqueeze(0)
+        k = tokens + self.k_bias.unsqueeze(0)
+        attn_out, _ = self.fuse(q, k, tokens)
         z = self.norm(attn_out.mean(dim=1))
         return z
+
 
 
 class _FieldDecoders(nn.Module):

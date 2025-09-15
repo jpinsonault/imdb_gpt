@@ -25,7 +25,7 @@ class ProjectConfig:
     nce_weight: float = 1.0
 
     refresh_batches: int = 100
-    weak_edge_boost: float = 0.50
+    weak_edge_boost: float = 0.10
 
     tensorboard_dir: str = "logs"
     log_interval: int = 20

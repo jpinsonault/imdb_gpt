@@ -93,6 +93,7 @@ def build_sequence_logger(movie_ae, people_ae, predictor, config: ProjectConfig,
         table_width=38,
     )
 
+
 def _build_loader_precomputed(config: ProjectConfig, mov, per, seq_len: int):
     ds = OneToManyDataset(
         db_path=str(Path(config.db_path)),
@@ -102,20 +103,22 @@ def _build_loader_precomputed(config: ProjectConfig, mov, per, seq_len: int):
         movie_limit=None,
         movie_cache_size=10000,
     )
-    num_workers = config.num_workers
-    prefetch_factor = config.prefetch_factor
+    num_workers = int(getattr(config, "num_workers", 0) or 0)
+    cfg_pf = int(getattr(config, "prefetch_factor", 2) or 0)
+    prefetch_factor = None if num_workers == 0 else max(1, cfg_pf)
     pin = bool(torch.cuda.is_available())
     loader = DataLoader(
         ds,
         batch_size=config.batch_size,
         collate_fn=collate_one_to_many,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+        prefetch_factor=prefetch_factor,
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
         drop_last=False,
     )
     return loader
+
 
 def train_one_to_many(
     config: ProjectConfig,

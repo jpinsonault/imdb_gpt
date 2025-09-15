@@ -145,8 +145,7 @@ def _per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torc
     return _reduce_per_sample_mse(pred, tgt)
 
 
-
-
+# scripts/train_joint_autoencoder.py
 def build_joint_trainer(
     config: ProjectConfig,
     warm: bool,
@@ -183,8 +182,9 @@ def build_joint_trainer(
 
     ds = _EdgeIterable(edge_gen, movie_ae, people_ae)
 
-    num_workers = config.num_workers
-    prefetch_factor = config.prefetch_factor
+    num_workers = int(getattr(config, "num_workers", 0) or 0)
+    cfg_pf = int(getattr(config, "prefetch_factor", 2) or 0)
+    prefetch_factor = None if num_workers == 0 else max(1, cfg_pf)
     pin = bool(torch.cuda.is_available())
 
     loader = DataLoader(
@@ -192,7 +192,7 @@ def build_joint_trainer(
         batch_size=config.batch_size,
         collate_fn=_collate_edge,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else 2,
+        prefetch_factor=prefetch_factor,
         persistent_workers=True if num_workers > 0 else False,
         pin_memory=pin,
     )
@@ -201,14 +201,6 @@ def build_joint_trainer(
     total_edges = len(edge_gen.edges)
     logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config.batch_size} workers={num_workers}")
     return joint, loader, loss_logger, movie_ae, people_ae, total_edges
-
-
-def _fmt(x: float) -> str:
-    if x >= 1e6:
-        return f"{x/1e6:.2f}M"
-    if x >= 1e3:
-        return f"{x/1e3:.2f}k"
-    return f"{x:.2f}"
 
 
 def main(config: ProjectConfig):
