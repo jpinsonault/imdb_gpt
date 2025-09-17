@@ -1,6 +1,8 @@
 from typing import List
 import sqlite3
 
+from scripts.sql_filters import movie_from_join, movie_group_by, movie_having, movie_where_clause, people_from_join, people_group_by, people_having, people_where_clause
+
 from .fields import (
     NumericDigitCategoryField,
     TextField,
@@ -18,10 +20,11 @@ class TitlesAutoencoder(RowAutoencoder):
         ]
 
     def row_generator(self):
+        import sqlite3
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             c = conn.cursor()
             c.execute(
-                """
+                f"""
                 SELECT
                     t.tconst,
                     t.primaryTitle,
@@ -31,20 +34,13 @@ class TitlesAutoencoder(RowAutoencoder):
                     t.averageRating,
                     t.numVotes,
                     GROUP_CONCAT(g.genre, ',')
-                FROM titles t
-                INNER JOIN title_genres g ON g.tconst = t.tconst
+                {movie_from_join()}
                 WHERE
-                    t.startYear IS NOT NULL
-                    AND t.averageRating IS NOT NULL
-                    AND t.runtimeMinutes IS NOT NULL
-                    AND t.runtimeMinutes >= 5
-                    AND t.startYear >= 1850
-                    AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
-                    AND t.numVotes >= 10
-                GROUP BY t.tconst
-                HAVING COUNT(g.genre) > 0
+                    {movie_where_clause()}
+                {movie_group_by()}
+                {movie_having()}
                 LIMIT ?
-            """,
+                """,
                 (self.config.movie_limit,),
             )
             for tconst, primaryTitle, startYear, endYear, runtime, rating, votes, genres in c:
@@ -58,6 +54,7 @@ class TitlesAutoencoder(RowAutoencoder):
                     "numVotes": votes,
                     "genres": genres.split(","),
                 }
+
 
     def row_by_tconst(self, tconst: str) -> dict:
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
@@ -102,21 +99,22 @@ class PeopleAutoencoder(RowAutoencoder):
         ]
 
     def row_generator(self):
+        import sqlite3
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             c = conn.cursor()
             c.execute(
-                """
+                f"""
                 SELECT
                     p.primaryName,
                     p.birthYear,
                     p.deathYear,
                     GROUP_CONCAT(pp.profession, ',') AS professions
-                FROM people p
-                LEFT JOIN people_professions pp ON p.nconst = pp.nconst
-                WHERE p.birthYear IS NOT NULL
-                GROUP BY p.nconst
-                HAVING COUNT(pp.profession) > 0
-            """
+                {people_from_join()}
+                WHERE
+                    {people_where_clause()}
+                {people_group_by()}
+                {people_having()}
+                """
             )
             for row in c:
                 yield {
@@ -125,6 +123,7 @@ class PeopleAutoencoder(RowAutoencoder):
                     "deathYear": row[2],
                     "professions": row[3].split(",") if row[3] else None,
                 }
+
 
     def row_by_nconst(self, nconst: str) -> dict:
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:

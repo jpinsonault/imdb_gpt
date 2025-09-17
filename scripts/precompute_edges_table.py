@@ -18,6 +18,7 @@ import sqlite3, hashlib, random, sys
 from pathlib import Path
 from tqdm import tqdm
 from config import project_config
+from scripts.sql_filters import movie_where_clause
 
 
 # --------------------------------------------------------------------------- #
@@ -55,15 +56,7 @@ def create_edges_table(conn: sqlite3.Connection) -> None:
 # --------------------------------------------------------------------------- #
 # [2] estimate row count (optional, just to show progress)
 # --------------------------------------------------------------------------- #
-MOVIE_FILTER_CLAUSE = """
-    t.startYear IS NOT NULL
-    AND t.startYear >= 1850
-    AND t.averageRating IS NOT NULL
-    AND t.runtimeMinutes IS NOT NULL
-    AND t.runtimeMinutes >= 5
-    AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
-    AND t.numVotes >= 10
-"""
+MOVIE_FILTER_CLAUSE = movie_where_clause()
 
 def estimate_edges(conn: sqlite3.Connection, sample_size: int = 1_000, *, seed: int = 1234) -> int:
     print("\n[2/4] Estimating edges from a movie sample …")

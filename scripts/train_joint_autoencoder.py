@@ -297,8 +297,6 @@ def main(config: ProjectConfig):
         logging.info(f"tensorboard logdir: {run_logger.run_dir}")
 
     jr_interval = config.callback_interval
-    rr_interval = config.callback_interval
-    rr_samples = config.row_recon_samples
 
     joint_recon = JointReconstructionLogger(
         mov_ae,
@@ -307,20 +305,6 @@ def main(config: ProjectConfig):
         interval_steps=jr_interval,
         num_samples=4,
         table_width=38,
-    )
-    row_recon_movies = RowReconstructionLogger(
-        interval_steps=rr_interval,
-        row_autoencoder=mov_ae,
-        db_path=str(db_path),
-        num_samples=rr_samples,
-        table_width=40,
-    )
-    row_recon_people = RowReconstructionLogger(
-        interval_steps=rr_interval,
-        row_autoencoder=per_ae,
-        db_path=str(db_path),
-        num_samples=rr_samples,
-        table_width=40,
     )
 
     stop_flag = {"stop": False}
@@ -374,8 +358,6 @@ def main(config: ProjectConfig):
                 )
 
                 JointReconstructionLogger.on_batch_end(joint_recon, global_step - 1)
-                RowReconstructionLogger.on_batch_end(row_recon_movies, global_step - 1)
-                RowReconstructionLogger.on_batch_end(row_recon_people, global_step - 1)
 
                 if (global_step) % flush_interval == 0:
                     logger.flush()
@@ -426,8 +408,6 @@ def main(config: ProjectConfig):
                 )
 
                 JointReconstructionLogger.on_batch_end(joint_recon, global_step)
-                RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
-                RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
 
                 if (global_step + 1) % flush_interval == 0:
                     logger.flush()

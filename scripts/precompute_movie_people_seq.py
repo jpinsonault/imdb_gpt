@@ -3,6 +3,11 @@ import sqlite3
 from pathlib import Path
 
 def build_movie_people_seq(db_path: str, seq_len: int):
+    import sqlite3, json
+    from scripts.sql_filters import (
+        movie_from_join, movie_where_clause, movie_group_by,
+        people_from_join, people_where_clause, people_group_by, people_having,
+    )
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -19,33 +24,24 @@ def build_movie_people_seq(db_path: str, seq_len: int):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_movie_people_seq_tconst ON movie_people_seq(tconst);")
 
-    movie_sql = """
+    movie_sql = f"""
     SELECT t.tconst
-    FROM titles t
-    INNER JOIN title_genres g ON g.tconst = t.tconst
+    {movie_from_join()}
     WHERE
-        t.startYear IS NOT NULL
-        AND t.averageRating IS NOT NULL
-        AND t.runtimeMinutes IS NOT NULL
-        AND t.runtimeMinutes >= 5
-        AND t.startYear >= 1850
-        AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
-        AND t.numVotes >= 10
-    GROUP BY t.tconst
+        {movie_where_clause()}
+    {movie_group_by()}
     """
 
-    people_sql = """
+    people_sql = f"""
     SELECT
         p.primaryName,
         p.birthYear,
         p.deathYear,
         GROUP_CONCAT(pp.profession, ',')
-    FROM people p
-    LEFT JOIN people_professions pp ON p.nconst = pp.nconst
-    INNER JOIN principals pr ON pr.nconst = p.nconst
-    WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
-    GROUP BY p.nconst
-    HAVING COUNT(pp.profession) > 0
+    {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
+    WHERE pr.tconst = ? AND {people_where_clause()}
+    {people_group_by()}
+    {people_having()}
     ORDER BY pr.ordering
     LIMIT ?
     """
@@ -79,6 +75,7 @@ def build_movie_people_seq(db_path: str, seq_len: int):
         conn.commit()
 
     conn.close()
+
 
 if __name__ == "__main__":
     import argparse

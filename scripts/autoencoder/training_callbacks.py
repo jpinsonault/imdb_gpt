@@ -6,36 +6,35 @@ import random
 import sqlite3
 import os
 import numpy as np
+from scripts.sql_filters import people_from_join, people_group_by, people_having, people_where_clause
 import torch
 from prettytable import PrettyTable
 from typing import Any, List, Dict, Optional
 from .fields import NumericDigitCategoryField, TextField
 
 def _sample_random_person(conn, tconst):
-    q = """
+    q = f"""
         SELECT p.primaryName,
                p.birthYear,
                p.deathYear,
                GROUP_CONCAT(pp.profession, ',')
-        FROM   people p
-        LEFT   JOIN people_professions pp ON pp.nconst = p.nconst
-        INNER  JOIN principals pr         ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? 
-          AND p.birthYear IS NOT NULL
-        GROUP  BY p.nconst
-        HAVING COUNT(pp.profession) > 0
-        ORDER  BY RANDOM()
-        LIMIT  1
+        {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND {people_where_clause()}
+        {people_group_by()}
+        {people_having()}
+        ORDER BY RANDOM()
+        LIMIT 1
     """
     r = conn.execute(q, (tconst,)).fetchone()
     if not r:
         return None
     return {
         "primaryName": r[0],
-        "birthYear":   r[1],
-        "deathYear":   r[2],
+        "birthYear": r[1],
+        "deathYear": r[2],
         "professions": r[3].split(',') if r[3] else None,
     }
+
 
 def _norm(x): return np.linalg.norm(x) + 1e-9
 def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
@@ -334,14 +333,12 @@ class SequenceReconstructionLogger:
                 break
 
     def _people_for(self, tconst: str):
-        q = """
+        q = f"""
         SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
-        FROM people p
-        LEFT JOIN people_professions pp ON pp.nconst = p.nconst
-        INNER JOIN principals pr ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? AND p.birthYear IS NOT NULL
-        GROUP BY p.nconst
-        HAVING COUNT(pp.profession) > 0
+        {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
+        WHERE pr.tconst = ? AND {people_where_clause()}
+        {people_group_by()}
+        {people_having()}
         ORDER BY pr.ordering
         LIMIT ?
         """
@@ -355,6 +352,7 @@ class SequenceReconstructionLogger:
                 "professions": row[3].split(",") if row[3] else None,
             })
         return out
+
 
     def _tensor_to_string(self, field, arr):
         import numpy as np

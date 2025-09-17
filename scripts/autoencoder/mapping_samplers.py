@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import List, Tuple, Dict, Optional
 import numpy as np
+from scripts.sql_filters import movie_where_clause, people_having, people_where_clause
 import torch
 from torch.utils.data import IterableDataset
 
@@ -151,23 +152,19 @@ class MoviePeoplePairSampler:
         JOIN people p ON p.nconst = pr.nconst
         LEFT JOIN people_professions pp ON pp.nconst = p.nconst
         WHERE
-            t.startYear IS NOT NULL
-            AND t.startYear >= 1850
-            AND t.averageRating IS NOT NULL
-            AND t.runtimeMinutes IS NOT NULL
-            AND t.runtimeMinutes >= 5
-            AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries')
-            AND t.numVotes >= 10
-            AND p.birthYear IS NOT NULL
+            {movie_where_clause()}
+            AND {people_where_clause()}
             AND pr.ordering BETWEEN 1 AND ?
         GROUP BY pr.tconst, pr.ordering, pr.nconst
-        HAVING COUNT(pp.profession) > 0
+        {people_having()}
         """
         out: List[Tuple[str, int, str]] = []
+        import sqlite3
         with sqlite3.connect(self.db_path, check_same_thread=False) as con:
             for tconst, ordering, nconst in con.execute(sql, (self.seq_len,)):
                 out.append((str(tconst), int(ordering), str(nconst)))
         return out
+
 
     def _movie_row(self, tconst: str) -> Dict:
         if tconst in self.mov_cache_row:
