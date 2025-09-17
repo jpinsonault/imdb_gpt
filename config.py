@@ -11,8 +11,8 @@ class ProjectConfig:
 
     max_training_steps: int = None
 
-    latent_dim: int = 256
-    batch_size: int = 512
+    latent_dim: int = 256+128
+    batch_size: int = 2048
     learning_rate: float = 0.0005
     weight_decay: float = 1e-4
 
@@ -21,11 +21,11 @@ class ProjectConfig:
     recon_loss_weight: float = 1.0
     latent_temperature: float = 0.03
 
-    nce_temp: float = 0.03
+    nce_temp: float = 0.1
     nce_weight: float = 1.0
 
     refresh_batches: int = 100
-    weak_edge_boost: float = 0.10
+    weak_edge_boost: float = 0.0
 
     tensorboard_dir: str = "logs"
     log_interval: int = 20

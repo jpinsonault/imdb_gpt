@@ -3,6 +3,8 @@ import logging
 import sqlite3
 import numpy as np
 from typing import List, Tuple, Dict, Optional
+import torch
+from torch.utils.data import Dataset
 
 from .mapping_samplers import AliasSampler
 
@@ -152,7 +154,6 @@ class WeightedEdgeSampler:
         self.alias = AliasSampler(probs.astype(np.float32))
 
 
-
 def make_edge_sampler(
     db_path: str,
     movie_ae,
@@ -171,3 +172,19 @@ def make_edge_sampler(
         boost=boost,
         loss_logger=loss_logger,
     )
+
+
+class EdgeEpochDataset(Dataset):
+    def __init__(self, sampler: WeightedEdgeSampler):
+        super().__init__()
+        self.sampler = sampler
+        self.sampler._ensure_conn()
+
+    def __len__(self):
+        return len(self.sampler.edges)
+
+    def __getitem__(self, idx: int):
+        i = int(idx)
+        m, p = self.sampler._get_tensors(i)
+        eid = self.sampler.edges[i][0]
+        return m, p, eid

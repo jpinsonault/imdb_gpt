@@ -1,4 +1,3 @@
-# scripts/train_joint_autoencoder.py
 from __future__ import annotations
 import argparse
 import logging
@@ -16,7 +15,7 @@ from tqdm import tqdm
 from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.joint_edge_sampler import make_edge_sampler
+from scripts.autoencoder.joint_edge_sampler import make_edge_sampler, EdgeEpochDataset
 from scripts.autoencoder.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
 from scripts.autoencoder.fields import (
@@ -145,11 +144,11 @@ def _per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torc
     return _reduce_per_sample_mse(pred, tgt)
 
 
-# scripts/train_joint_autoencoder.py
 def build_joint_trainer(
     config: ProjectConfig,
     warm: bool,
     db_path: Path,
+    sampling_mode: str = "epoch",
 ):
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
@@ -180,38 +179,106 @@ def build_joint_trainer(
         loss_logger=loss_logger,
     )
 
-    ds = _EdgeIterable(edge_gen, movie_ae, people_ae)
-
     num_workers = int(getattr(config, "num_workers", 0) or 0)
     cfg_pf = int(getattr(config, "prefetch_factor", 2) or 0)
     prefetch_factor = None if num_workers == 0 else max(1, cfg_pf)
     pin = bool(torch.cuda.is_available())
 
-    loader = DataLoader(
-        ds,
-        batch_size=config.batch_size,
-        collate_fn=_collate_edge,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True if num_workers > 0 else False,
-        pin_memory=pin,
-    )
+    if sampling_mode == "epoch":
+        ds_epoch = EdgeEpochDataset(edge_gen)
+        loader = DataLoader(
+            ds_epoch,
+            batch_size=config.batch_size,
+            shuffle=True,
+            drop_last=False,
+            collate_fn=_collate_edge,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=pin,
+        )
+    else:
+        ds_iter = _EdgeIterable(edge_gen, movie_ae, people_ae)
+        loader = DataLoader(
+            ds_iter,
+            batch_size=config.batch_size,
+            collate_fn=_collate_edge,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True if num_workers > 0 else False,
+            pin_memory=pin,
+        )
 
     joint = JointAutoencoder(movie_ae, people_ae).to(device)
     total_edges = len(edge_gen.edges)
-    logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config.batch_size} workers={num_workers}")
-    return joint, loader, loss_logger, movie_ae, people_ae, total_edges
+    logging.info(f"joint trainer ready device={device} edges={total_edges} bs={config.batch_size} workers={num_workers} mode={sampling_mode}")
+    return joint, loader, loss_logger, movie_ae, people_ae, total_edges, sampling_mode
+
+
+def _train_step(
+    joint_model: JointAutoencoder,
+    M: List[torch.Tensor],
+    P: List[torch.Tensor],
+    eids: torch.Tensor,
+    mov_ae: TitlesAutoencoder,
+    per_ae: PeopleAutoencoder,
+    opt: torch.optim.Optimizer,
+    logger: LossLedger,
+    temperature: float,
+    nce_weight: float,
+    device: torch.device,
+):
+    m_z, p_z, m_rec, p_rec = joint_model(M, P)
+
+    rec_loss = 0.0
+    field_losses_movie: Dict[str, float] = {}
+    field_losses_person: Dict[str, float] = {}
+    rec_per_sample = torch.zeros(M[0].size(0), device=device)
+
+    for f, pred, tgt in zip(mov_ae.fields, m_rec, M):
+        per_s = _per_sample_field_loss(f, pred, tgt) * float(f.weight)
+        rec_per_sample = rec_per_sample + per_s
+        field_losses_movie[f.name] = float(per_s.mean().detach().cpu().item())
+        rec_loss = rec_loss + per_s.mean()
+
+    for f, pred, tgt in zip(per_ae.fields, p_rec, P):
+        per_s = _per_sample_field_loss(f, pred, tgt) * float(f.weight)
+        rec_per_sample = rec_per_sample + per_s
+        field_losses_person[f.name] = float(per_s.mean().detach().cpu().item())
+        rec_loss = rec_loss + per_s.mean()
+
+    nce_mean, nce_per = info_nce_components(m_z, p_z, temperature=temperature)
+    total = rec_loss + nce_weight * nce_mean
+    total_per_sample = rec_per_sample + nce_weight * nce_per
+
+    opt.zero_grad()
+    total.backward()
+    opt.step()
+
+    total_val = float(total.detach().cpu().item())
+    rec_val = float(rec_loss.detach().cpu().item())
+    nce_val = float(nce_mean.detach().cpu().item())
+    batch_min = float(total_per_sample.min().detach().cpu().item())
+    batch_max = float(total_per_sample.max().detach().cpu().item())
+
+    for eid, edgeloss in zip(eids.detach().cpu().tolist(), total_per_sample.detach().cpu().tolist()):
+        logger.add(int(eid), float(edgeloss))
+
+    return total_val, rec_val, nce_val, batch_min, batch_max, field_losses_movie, field_losses_person
 
 
 def main(config: ProjectConfig):
     parser = argparse.ArgumentParser(description="Train movie-person joint embedding autoencoder")
     parser.add_argument("--warm", action="store_true")
+    parser.add_argument("--sampling-mode", choices=["epoch", "weighted"], default="epoch")
     args = parser.parse_args()
 
     data_dir = Path(config.data_dir)
     db_path = data_dir / "imdb.db"
 
-    joint_model, loader, logger, mov_ae, per_ae, total_edges = build_joint_trainer(config, args.warm, db_path)
+    joint_model, loader, logger, mov_ae, per_ae, total_edges, sampling_mode = build_joint_trainer(
+        config, args.warm, db_path, sampling_mode=args.sampling_mode
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     opt = torch.optim.AdamW(
@@ -269,92 +336,110 @@ def main(config: ProjectConfig):
 
     joint_model.train()
     global_step = 0
-    data_iter = iter(loader)
     edges_seen = 0
 
-    with tqdm(unit="batch", dynamic_ncols=True) as pbar:
-        while True:
-            t_fetch0 = time.perf_counter()
-            M, P, eids = next(data_iter)
-            data_time = time.perf_counter() - t_fetch0
+    if sampling_mode == "epoch":
+        epochs = int(getattr(config, "epochs", 1) or 1)
+        for epoch in range(epochs):
+            pbar = tqdm(loader, unit="batch", dynamic_ncols=True)
+            pbar.set_description(f"epoch {epoch+1}/{epochs}")
+            for M, P, eids in pbar:
+                t_fetch0 = time.perf_counter()
+                M = [m.to(device, non_blocking=True) for m in M]
+                P = [p.to(device, non_blocking=True) for p in P]
+                eids = eids.to(device)
+                _ = time.perf_counter() - t_fetch0
 
-            M = [m.to(device, non_blocking=True) for m in M]
-            P = [p.to(device, non_blocking=True) for p in P]
-            eids = eids.to(device)
+                t_step0 = time.perf_counter()
+                total_val, rec_val, nce_val, batch_min, batch_max, field_losses_movie, field_losses_person = _train_step(
+                    joint_model, M, P, eids, mov_ae, per_ae, opt, logger, temperature, nce_weight, device
+                )
+                _ = time.perf_counter() - t_step0
 
-            t_step0 = time.perf_counter()
-            m_z, p_z, m_rec, p_rec = joint_model(M, P)
+                run_logger.add_scalars(total_val, rec_val, nce_val, 0.0, opt)
+                run_logger.add_field_losses("loss/movie", field_losses_movie)
+                run_logger.add_field_losses("loss/person", field_losses_person)
+                run_logger.add_extremes(batch_min, batch_max)
+                run_logger.tick(total_val, rec_val, nce_val)
 
-            rec_loss = 0.0
-            field_losses_movie: Dict[str, float] = {}
-            field_losses_person: Dict[str, float] = {}
-            rec_per_sample = torch.zeros(M[0].size(0), device=device)
+                edges_seen += eids.size(0)
+                global_step += 1
+                pbar.set_postfix(
+                    edges=f"{min(edges_seen, total_edges)}/{total_edges}",
+                    loss=f"{total_val:.4f}",
+                    rec=f"{rec_val:.4f}",
+                    nce=f"{nce_val:.4f}",
+                    min=f"{batch_min:.4f}",
+                    max=f"{batch_max:.4f}",
+                )
 
-            for f, pred, tgt in zip(mov_ae.fields, m_rec, M):
-                per_s = _per_sample_field_loss(f, pred, tgt) * float(f.weight)
-                rec_per_sample = rec_per_sample + per_s
-                field_losses_movie[f.name] = float(per_s.mean().detach().cpu().item())
-                rec_loss = rec_loss + per_s.mean()
+                JointReconstructionLogger.on_batch_end(joint_recon, global_step - 1)
+                RowReconstructionLogger.on_batch_end(row_recon_movies, global_step - 1)
+                RowReconstructionLogger.on_batch_end(row_recon_people, global_step - 1)
 
-            for f, pred, tgt in zip(per_ae.fields, p_rec, P):
-                per_s = _per_sample_field_loss(f, pred, tgt) * float(f.weight)
-                rec_per_sample = rec_per_sample + per_s
-                field_losses_person[f.name] = float(per_s.mean().detach().cpu().item())
-                rec_loss = rec_loss + per_s.mean()
+                if (global_step) % flush_interval == 0:
+                    logger.flush()
 
-            nce_mean, nce_per = info_nce_components(m_z, p_z, temperature=temperature)
-            total = rec_loss + nce_weight * nce_mean
-            total_per_sample = rec_per_sample + nce_weight * nce_per
+                if (global_step) % save_interval == 0:
+                    mov_ae.save_model()
+                    per_ae.save_model()
+                    logging.info(f"checkpoint saved at step {global_step}")
 
-            opt.zero_grad()
-            total.backward()
-            opt.step()
-
-            batch_time = time.perf_counter() - t_step0
-            iter_time = data_time + batch_time
-
-            total_val = float(total.detach().cpu().item())
-            rec_val = float(rec_loss.detach().cpu().item())
-            nce_val = float(nce_mean.detach().cpu().item())
-            batch_min = float(total_per_sample.min().detach().cpu().item())
-            batch_max = float(total_per_sample.max().detach().cpu().item())
-
-            for eid, edgeloss in zip(eids.detach().cpu().tolist(), total_per_sample.detach().cpu().tolist()):
-                logger.add(int(eid), float(edgeloss))
-
-            run_logger.add_scalars(total_val, rec_val, nce_val, iter_time, opt)
-            run_logger.add_field_losses("loss/movie", field_losses_movie)
-            run_logger.add_field_losses("loss/person", field_losses_person)
-            run_logger.add_extremes(batch_min, batch_max)
-            run_logger.tick(total_val, rec_val, nce_val)
-
-            edges_seen += batch_size
-            pbar.update(1)
-            pbar.set_description(f"batches {global_step + 1}")
-            pbar.set_postfix(
-                edges=f"{min(edges_seen, total_edges)}/{total_edges}",
-                loss=f"{total_val:.4f}",
-                rec=f"{rec_val:.4f}",
-                nce=f"{nce_val:.4f}",
-                min=f"{batch_min:.4f}",
-                max=f"{batch_max:.4f}",
-            )
-
-            JointReconstructionLogger.on_batch_end(joint_recon, global_step)
-            RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
-            RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
-
-            if (global_step + 1) % flush_interval == 0:
-                logger.flush()
-
-            if (global_step + 1) % save_interval == 0:
-                mov_ae.save_model()
-                per_ae.save_model()
-                logging.info(f"checkpoint saved at step {global_step+1}")
-
-            global_step += 1
+                if stop_flag["stop"]:
+                    break
             if stop_flag["stop"]:
                 break
+    else:
+        data_iter = iter(loader)
+        with tqdm(unit="batch", dynamic_ncols=True) as pbar:
+            while True:
+                t_fetch0 = time.perf_counter()
+                M, P, eids = next(data_iter)
+                _ = time.perf_counter() - t_fetch0
+
+                M = [m.to(device, non_blocking=True) for m in M]
+                P = [p.to(device, non_blocking=True) for p in P]
+                eids = eids.to(device)
+
+                t_step0 = time.perf_counter()
+                total_val, rec_val, nce_val, batch_min, batch_max, field_losses_movie, field_losses_person = _train_step(
+                    joint_model, M, P, eids, mov_ae, per_ae, opt, logger, temperature, nce_weight, device
+                )
+                iter_time = (time.perf_counter() - t_fetch0) + (time.perf_counter() - t_step0)
+
+                run_logger.add_scalars(total_val, rec_val, nce_val, iter_time, opt)
+                run_logger.add_field_losses("loss/movie", field_losses_movie)
+                run_logger.add_field_losses("loss/person", field_losses_person)
+                run_logger.add_extremes(batch_min, batch_max)
+                run_logger.tick(total_val, rec_val, nce_val)
+
+                edges_seen += batch_size
+                pbar.update(1)
+                pbar.set_description(f"batches {global_step + 1}")
+                pbar.set_postfix(
+                    edges=f"{edges_seen}",
+                    loss=f"{total_val:.4f}",
+                    rec=f"{rec_val:.4f}",
+                    nce=f"{nce_val:.4f}",
+                    min=f"{batch_min:.4f}",
+                    max=f"{batch_max:.4f}",
+                )
+
+                JointReconstructionLogger.on_batch_end(joint_recon, global_step)
+                RowReconstructionLogger.on_batch_end(row_recon_movies, global_step)
+                RowReconstructionLogger.on_batch_end(row_recon_people, global_step)
+
+                if (global_step + 1) % flush_interval == 0:
+                    logger.flush()
+
+                if (global_step + 1) % save_interval == 0:
+                    mov_ae.save_model()
+                    per_ae.save_model()
+                    logging.info(f"checkpoint saved at step {global_step+1}")
+
+                global_step += 1
+                if stop_flag["stop"]:
+                    break
 
     logger.flush()
     mov_ae.save_model()
