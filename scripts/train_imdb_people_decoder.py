@@ -2,7 +2,7 @@ from config import project_config
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.one_to_many.trainer import build_sequence_logger, train_one_to_many
 from scripts.autoencoder.one_to_many.provider import ImdbMovieToPeopleProvider
-from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
+from scripts.autoencoder.training_callbacks.training_callbacks import SequenceReconstructionLogger
 
 def main():
     mov = TitlesAutoencoder(project_config)

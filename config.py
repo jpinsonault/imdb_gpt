@@ -11,7 +11,7 @@ class ProjectConfig:
 
     max_training_steps: int = None
 
-    latent_dim: int = 256+128
+    latent_dim: int = 512
     batch_size: int = 2048
     learning_rate: float = 0.0005
     weight_decay: float = 1e-4
@@ -45,7 +45,7 @@ class ProjectConfig:
 
     use_cache: bool = True
     refresh_cache: bool = False
-    epochs: int = 10
+    epochs: int = 100
     input_length: int = 4096
 
     def to_dict(self):

@@ -10,7 +10,7 @@ from scripts.sql_filters import people_from_join, people_group_by, people_having
 import torch
 from prettytable import PrettyTable
 from typing import Any, List, Dict, Optional
-from .fields import NumericDigitCategoryField, TextField
+from ..fields import NumericDigitCategoryField, TextField
 
 def _sample_random_person(conn, tconst):
     q = f"""
@@ -358,7 +358,7 @@ class SequenceReconstructionLogger:
         import numpy as np
         try:
             a = np.array(arr)
-            from .fields import NumericDigitCategoryField
+            from ..fields import NumericDigitCategoryField
             if isinstance(field, NumericDigitCategoryField):
                 return field.to_string(a if a.ndim >= 2 else a.flatten())
             if hasattr(field, "tokenizer") and field.tokenizer is not None:

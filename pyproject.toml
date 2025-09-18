@@ -17,4 +17,5 @@ dependencies = [
     "flask-cors>=5.0.1",
     "simplejson>=3.20.1",
     "requests",
+    "matplotlib>=3.10.6",
 ]

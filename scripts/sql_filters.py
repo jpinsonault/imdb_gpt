@@ -1,7 +1,23 @@
 # scripts/sql_filters.py
 
 def movie_from_join() -> str:
-    return "FROM titles t INNER JOIN title_genres g ON g.tconst = t.tconst"
+    return f"""
+FROM (
+  SELECT *
+  FROM (
+    SELECT t.*,
+           ROW_NUMBER() OVER (
+             PARTITION BY LOWER(t.primaryTitle)
+             ORDER BY t.numVotes DESC, t.tconst
+           ) AS _rn
+    FROM titles t
+    WHERE {movie_where_clause()}
+      AND EXISTS (SELECT 1 FROM title_genres gg WHERE gg.tconst = t.tconst)
+  ) d
+  WHERE d._rn = 1
+) t
+INNER JOIN title_genres g ON g.tconst = t.tconst
+"""
 
 def movie_where_clause() -> str:
     return (

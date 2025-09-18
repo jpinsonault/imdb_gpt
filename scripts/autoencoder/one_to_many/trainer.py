@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from scripts.autoencoder.print_model import print_model_layers_with_shapes
 from scripts.autoencoder.run_logger import build_run_logger
-from scripts.autoencoder.training_callbacks import SequenceReconstructionLogger
+from scripts.autoencoder.training_callbacks.training_callbacks import SequenceReconstructionLogger
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
 from scripts.autoencoder.one_to_many.dataset import OneToManyDataset, collate_one_to_many
 from scripts.autoencoder.prefetch import CudaPrefetcher

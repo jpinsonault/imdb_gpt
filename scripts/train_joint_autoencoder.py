@@ -16,7 +16,7 @@ from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler, EdgeEpochDataset
-from scripts.autoencoder.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
+from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
 from scripts.autoencoder.fields import (
     TextField,
@@ -369,6 +369,7 @@ def main(config: ProjectConfig):
 
                 if stop_flag["stop"]:
                     break
+
             if stop_flag["stop"]:
                 break
     else:
