@@ -1,4 +1,3 @@
-# scripts/measure_joint_encoder_performance.py
 import argparse
 from pathlib import Path
 
@@ -55,6 +54,7 @@ def main():
     parser.add_argument("--table-width", type=int, default=38)
     parser.add_argument("--similarity-out", type=str, default=None)
     parser.add_argument("--similarity-max-items", type=int, default=50000)
+    parser.add_argument("--plot-dir", type=str, default="plots")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -77,6 +77,7 @@ def main():
         table_width=args.table_width,
         similarity_out=args.similarity_out,
         similarity_max_items=args.similarity_max_items,
+        plot_dir=args.plot_dir,
     )
     runner.run()
 

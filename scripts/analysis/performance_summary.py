@@ -1,10 +1,15 @@
 from pathlib import Path
+import math
+import os
+import unicodedata
+from collections import Counter, defaultdict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from prettytable import PrettyTable
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 
 class PerformanceSummary:
@@ -17,6 +22,7 @@ class PerformanceSummary:
         table_width: int = 38,
         similarity_out: str | None = None,
         similarity_max_items: int = 50000,
+        plot_dir: str | None = "plots",
     ):
         self.m_ae = movie_ae
         self.p_ae = people_ae
@@ -25,6 +31,7 @@ class PerformanceSummary:
         self.w = int(table_width)
         self.sim_out = Path(similarity_out) if similarity_out else None
         self.sim_max = int(similarity_max_items)
+        self.plot_dir = Path(plot_dir) if plot_dir else Path("plots")
 
     def _as_numpy(self, x):
         if isinstance(x, torch.Tensor):
@@ -92,10 +99,11 @@ class PerformanceSummary:
         xs_cols = [[] for _ in fields]
         ys_cols = [[] for _ in fields]
         rows = []
+        values = []
 
         @torch.no_grad()
         def _flush():
-            nonlocal worst, best
+            nonlocal worst, best, values
             if not rows:
                 return
             X = [torch.stack(col, dim=0).to(device) for col in xs_cols]
@@ -132,13 +140,25 @@ class PerformanceSummary:
                         idx = max(range(len(best)), key=lambda k: best[k][0])
                         best[idx] = item
 
+                row = rows[i]
+                txt = ""
+                yr = None
+                if "primaryTitle" in row:
+                    txt = str(row.get("primaryTitle", "") or "")
+                    yr = row.get("startYear")
+                elif "primaryName" in row:
+                    txt = str(row.get("primaryName", "") or "")
+                    yr = row.get("birthYear")
+                try:
+                    yr = int(yr) if yr is not None else None
+                except Exception:
+                    yr = None
+                values.append({"text": txt, "year": yr, "loss": float(losses[i])})
+
             for j in range(len(xs_cols)):
                 xs_cols[j].clear()
                 ys_cols[j].clear()
             rows.clear()
-
-        titles_for_similarity = []
-        people_for_similarity = []
 
         gen = list(ae.row_generator())
         for row in tqdm(gen, desc=f"eval {ae.__class__.__name__}", unit="row", dynamic_ncols=True):
@@ -151,17 +171,12 @@ class PerformanceSummary:
             rows.append(row)
             if len(rows) >= self.bs:
                 _flush()
-
-            if "primaryTitle" in row:
-                titles_for_similarity.append(str(row.get("primaryTitle", "")))
-            if "primaryName" in row:
-                people_for_similarity.append(str(row.get("primaryName", "")))
-
         _flush()
+
         worst.sort(key=lambda x: x[0], reverse=True)
         best.sort(key=lambda x: x[0])
 
-        return worst, best, titles_for_similarity, people_for_similarity
+        return worst, best, values
 
     def _print_big_table(self, title, fields, pairs):
         print(f"\n{title}")
@@ -181,12 +196,128 @@ class PerformanceSummary:
             tab.add_row([sep for _ in headers])
         print(tab)
 
+    def _normalize_base(self, s):
+        if not s:
+            return ""
+        t = unicodedata.normalize("NFKD", s)
+        t = t.encode("ascii", "ignore").decode("ascii", errors="ignore")
+        t = t.strip().lower()
+        t = " ".join(t.split())
+        return t
+
+    def _normalize_title(self, s):
+        t = self._normalize_base(s)
+        for art in ("the ", "a ", "an "):
+            if t.startswith(art):
+                t = t[len(art):]
+                break
+        return t
+
+    def _normalize_name(self, s):
+        return self._normalize_base(s)
+
+    def _entropy_per_char(self, s):
+        if not s:
+            return 0.0
+        counts = Counter(s)
+        n = float(len(s))
+        p = [c / n for c in counts.values()]
+        h = -sum(q * math.log(q + 1e-12) for q in p)
+        return h / n
+
+    def _build_uniqueness_metrics(self, values, is_title: bool):
+        n = len(values)
+        if n == 0:
+            return {}
+        norm_fn = self._normalize_title if is_title else self._normalize_name
+        keys_raw = []
+        keys_pair = []
+        lens = []
+        ents = []
+        for v in values:
+            s = v["text"] or ""
+            k = norm_fn(s)
+            y = v.get("year", None)
+            if not is_title and isinstance(y, int):
+                yk = (y // 10) * 10
+            else:
+                yk = y
+            keys_raw.append(k)
+            keys_pair.append((k, yk))
+            lens.append(len(s))
+            ents.append(self._entropy_per_char(s))
+        c_raw = Counter(keys_raw)
+        c_pair = Counter(keys_pair)
+        idf_denom = math.log(n + 1.0)
+        u_raw = np.array([1.0 / max(1, c_raw[k]) for k in keys_raw], dtype=np.float64)
+        u_idf = np.array([math.log((n + 1.0) / (c_raw[k] + 1.0)) / idf_denom for k in keys_raw], dtype=np.float64)
+        u_pair = np.array([1.0 / max(1, c_pair[kp]) for kp in keys_pair], dtype=np.float64)
+        length = np.array(lens, dtype=np.float64)
+        entropy_pc = np.array(ents, dtype=np.float64)
+        loss = np.array([v["loss"] for v in values], dtype=np.float64)
+        return {
+            "loss": loss,
+            "u_raw": u_raw,
+            "u_idf": u_idf,
+            "u_pair": u_pair,
+            "length": length,
+            "entropy_per_char": entropy_pc,
+        }
+
+    def _binned_xy(self, x, y, bins: int = 50):
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        if len(x) == 0:
+            return None, None
+        q = np.linspace(0.0, 1.0, bins + 1)
+        edges = np.unique(np.quantile(x, q))
+        if len(edges) < 3:
+            return None, None
+        idx = np.digitize(x, edges[1:-1], right=True)
+        bx = []
+        by = []
+        for b in range(len(edges) - 1):
+            mask = idx == b
+            if not np.any(mask):
+                continue
+            bx.append(np.mean(x[mask]))
+            by.append(np.mean(y[mask]))
+        if not bx:
+            return None, None
+        return np.array(bx), np.array(by)
+
+    def _scatter_with_bins(self, series_name: str, metric_name: str, x, y):
+        self.plot_dir.mkdir(parents=True, exist_ok=True)
+        fig = plt.figure()
+        plt.scatter(x, y, s=6, alpha=0.25)
+        bx, by = self._binned_xy(x, y, bins=50)
+        if bx is not None and by is not None:
+            plt.plot(bx, by, linewidth=2.0)
+        plt.xlabel(metric_name)
+        plt.ylabel("loss")
+        plt.title(f"{series_name}: loss vs {metric_name}")
+        out = self.plot_dir / f"{series_name}_{metric_name}.png"
+        fig.savefig(str(out), dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    def _make_plots(self, tag: str, metrics: dict):
+        loss = metrics["loss"]
+        for key in ("u_raw", "u_idf", "u_pair", "length", "entropy_per_char"):
+            x = metrics[key]
+            self._scatter_with_bins(tag, key, x, loss)
+
     def run(self):
-        titles_worst, titles_best, titles_list, _ = self._eval_extremes(self.m_ae)
-        people_worst, people_best, _, people_list = self._eval_extremes(self.p_ae)
+        titles_worst, titles_best, titles_vals = self._eval_extremes(self.m_ae)
+        people_worst, people_best, people_vals = self._eval_extremes(self.p_ae)
 
         self._print_big_table(f"worst titles recon (top {self.max_rows})", self.m_ae.fields, titles_worst)
         self._print_big_table(f"best titles recon (top {self.max_rows})", self.m_ae.fields, titles_best)
         self._print_big_table(f"worst people recon (top {self.max_rows})", self.p_ae.fields, people_worst)
         self._print_big_table(f"best people recon (top {self.max_rows})", self.p_ae.fields, people_best)
 
+        t_metrics = self._build_uniqueness_metrics(titles_vals, is_title=True)
+        p_metrics = self._build_uniqueness_metrics(people_vals, is_title=False)
+        if t_metrics:
+            self._make_plots("titles", t_metrics)
+        if p_metrics:
+            self._make_plots("people", p_metrics)
