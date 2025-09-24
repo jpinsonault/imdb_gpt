@@ -1,55 +1,51 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from pathlib import Path
 
 @dataclass
 class ProjectConfig:
-    project_name: str = "imdb_gpt"
-    data_dir: str = "./data/"
-    log_dir: str = "logs"
+    data_dir: str = "data"
+    db_path: str = "data/imdb.db"
     model_dir: str = "models"
-    corpus_dir: str = "./data/corpus/"
-    docker_data_dir_mount: str = "/app/imdb"
 
-    max_training_steps: int = None
+    batch_size: int = 512
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-2
+    epochs: int = 1
 
     latent_dim: int = 512
-    batch_size: int = 2048
-    learning_rate: float = 0.0005
-    weight_decay: float = 1e-4
+    people_sequence_length: int = 16
+    titles_sequence_length: int = 16
 
-    people_sequence_length: int = 10
-    latent_loss_weight: float = 0.5
-    recon_loss_weight: float = 1.0
-    latent_temperature: float = 0.03
-
-    nce_temp: float = 0.1
+    nce_temp: float = 0.07
     nce_weight: float = 1.0
 
-    refresh_batches: int = 100
-    weak_edge_boost: float = 0.0
+    save_interval: int = 500
+    flush_interval: int = 250
+    callback_interval: int = 200
+    tensorboard_dir: str = "runs"
+    log_interval: int = 50
 
-    tensorboard_dir: str = "logs"
-    log_interval: int = 20
-    callback_interval: int = 100
-    row_recon_samples: int = 3
-
-    movie_limit: int = 100000000000
-    db_path: str = "./data/imdb.db"
-
-    save_interval: int = 10000
-    flush_interval: int = 2000
-
-    use_cuda_graphs: bool = True
-    compile_trunk: bool = True
     num_workers: int = 0
-    prefetch_factor: int = 0
+    prefetch_factor: int = 2
+    max_training_steps: int | None = None
 
     use_cache: bool = True
     refresh_cache: bool = False
-    epochs: int = 100
-    input_length: int = 4096
 
-    def to_dict(self):
-        return asdict(self)
+    compile_trunk: bool = False
+
+    weak_edge_boost: float = 0.10
+    refresh_batches: int = 1000
+
+    alternate_modes: bool = True
+    min_mode_frac: float = 0.25
+    max_mode_frac: float = 0.75
+    many_to_many_warm_start: bool = False
+    many_to_many_freeze_loaded: bool = False
 
 project_config = ProjectConfig()
- 
+
+def ensure_dirs(cfg: ProjectConfig):
+    Path(cfg.model_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.tensorboard_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)

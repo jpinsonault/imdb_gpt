@@ -1,8 +1,7 @@
-# scripts/autoencoder/one_to_many/dataset.py
 import json
 import sqlite3
 from collections import OrderedDict
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Iterator
 import torch
 from torch.utils.data import IterableDataset
 from scripts.autoencoder.fields import BaseField
@@ -109,3 +108,45 @@ def collate_one_to_many(batch):
     Yp = [torch.stack(col, dim=0) for col in yp_cols]
     M = torch.stack([b[2] for b in batch], dim=0)
     return Xm, Yp, M
+
+
+class ProviderBackedOneToManyDataset(IterableDataset):
+    def __init__(
+        self,
+        provider,
+        source_fields: List[BaseField],
+        target_fields: List[BaseField],
+        seq_len: int,
+    ):
+        super().__init__()
+        self.provider = provider
+        self.source_fields = source_fields
+        self.target_fields = target_fields
+        self.seq_len = int(seq_len)
+
+    def __iter__(self) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]]:
+        for src in self.provider.iter_sources():
+            tgt_rows = self.provider.targets_for(src, self.seq_len)
+            orig_len = min(len(tgt_rows), self.seq_len)
+            if orig_len == 0:
+                continue
+            if orig_len < self.seq_len:
+                pad = [{} for _ in range(self.seq_len - orig_len)]
+                tgt_rows = tgt_rows + pad
+            else:
+                tgt_rows = tgt_rows[: self.seq_len]
+
+            x_source = [f.transform(src.get(f.name)) for f in self.source_fields]
+            y_targets: List[torch.Tensor] = []
+            for f in self.target_fields:
+                steps = []
+                for i in range(self.seq_len):
+                    if i < orig_len:
+                        steps.append(f.transform_target(tgt_rows[i].get(f.name)))
+                    else:
+                        steps.append(f.get_base_padding_value())
+                y_targets.append(torch.stack(steps, dim=0))
+
+            mask = torch.zeros(self.seq_len, dtype=torch.float32)
+            mask[:orig_len] = 1.0
+            yield x_source, y_targets, mask
