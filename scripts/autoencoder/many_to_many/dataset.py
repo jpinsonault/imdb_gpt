@@ -83,7 +83,7 @@ class ManyToManyDataset(IterableDataset):
         q = f"""
         SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
         {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? AND {people_where_clause()}
+        WHERE pr.tconst = ? AND {people_where_clause()} AND p.primaryName IS NOT NULL
         {people_group_by()}
         {people_having()}
         ORDER BY pr.ordering
@@ -130,7 +130,11 @@ class ManyToManyDataset(IterableDataset):
             steps = []
             for i in range(seq_len):
                 if i < len(rows) and rows[i] is not None:
-                    steps.append(f.transform_target(rows[i].get(f.name)))
+                    val = rows[i].get(f.name) if isinstance(rows[i], dict) else None
+                    if val is None:
+                        steps.append(f.get_base_padding_value())
+                    else:
+                        steps.append(f.transform_target(val))
                 else:
                     steps.append(f.get_base_padding_value())
             ys.append(torch.stack(steps, dim=0))
@@ -142,7 +146,11 @@ class ManyToManyDataset(IterableDataset):
             steps = []
             for i in range(seq_len):
                 if i == 0 and src_row is not None:
-                    steps.append(f.transform(src_row.get(f.name)))
+                    val = src_row.get(f.name) if isinstance(src_row, dict) else None
+                    if val is None:
+                        steps.append(f.get_base_padding_value())
+                    else:
+                        steps.append(f.transform(val))
                 else:
                     steps.append(f.get_base_padding_value())
             xs.append(torch.stack(steps, dim=0))

@@ -97,7 +97,7 @@ def train_many_to_many(
     xm0, xp0, yt0, yp0, mt0, mp0, mode0 = next(it_preview)
     xm0 = [x.to(device) for x in xm0]
     xp0 = [x.to(device) for x in xp0]
-    _ = print_model_layers_with_shapes(model, xm0)
+    _ = print_model_layers_with_shapes(model, (xm0, xp0))
 
     prefetch = CudaPrefetcher(loader, device)
     model.train()

@@ -12,7 +12,11 @@ def _infer_latent_dim_from_state_dict(sd: dict) -> int:
             return int(v.size(1))
     raise RuntimeError("could not infer latent_dim from state_dict")
 
-def load_autoencoders(config: ProjectConfig, warm_start: bool, freeze_loaded: bool) -> tuple[TitlesAutoencoder, PeopleAutoencoder]:
+def load_autoencoders(
+    config: ProjectConfig,
+    warm_start: bool,
+    freeze_loaded: bool,
+) -> tuple[TitlesAutoencoder, PeopleAutoencoder]:
     mov = TitlesAutoencoder(config)
     per = PeopleAutoencoder(config)
     mov.accumulate_stats()
@@ -42,6 +46,7 @@ def load_autoencoders(config: ProjectConfig, warm_start: bool, freeze_loaded: bo
         raise RuntimeError(f"latent_dim mismatch between checkpoints: movie={mov_dim} people={per_dim}")
 
     config.latent_dim = int(mov_dim)
+
     mov = TitlesAutoencoder(config)
     per = PeopleAutoencoder(config)
     mov.accumulate_stats()
@@ -66,4 +71,26 @@ def load_autoencoders(config: ProjectConfig, warm_start: bool, freeze_loaded: bo
         for p in per.decoder.parameters():
             p.requires_grad = False
 
+    return mov, per
+
+def _load_frozen_autoencoders(
+    config: ProjectConfig,
+) -> tuple[TitlesAutoencoder, PeopleAutoencoder]:
+    mov, per = load_autoencoders(
+        config=config,
+        warm_start=True,
+        freeze_loaded=True,
+    )
+    for p in mov.encoder.parameters():
+        p.requires_grad = False
+    for p in mov.decoder.parameters():
+        p.requires_grad = False
+    for p in per.encoder.parameters():
+        p.requires_grad = False
+    for p in per.decoder.parameters():
+        p.requires_grad = False
+    mov.encoder.eval()
+    mov.decoder.eval()
+    per.encoder.eval()
+    per.decoder.eval()
     return mov, per
