@@ -5,6 +5,7 @@ from typing import List, Tuple
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.many_to_many.dataset import ManyToManyDataset, collate_many_to_many
@@ -13,6 +14,7 @@ from scripts.autoencoder.sequence_losses import _sequence_loss_and_breakdown, _i
 from scripts.autoencoder.prefetch import CudaPrefetcher
 from scripts.autoencoder.print_model import print_model_layers_with_shapes
 from scripts.autoencoder.run_logger import build_run_logger
+from scripts.autoencoder.training_callbacks.many_to_many_reconstruction import ManyToManyReconstructionLogger
 from config import ProjectConfig
 
 def _build_models(config: ProjectConfig, warm_start: bool) -> Tuple[TitlesAutoencoder, PeopleAutoencoder]:
@@ -93,11 +95,25 @@ def train_many_to_many(
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     run_logger = build_run_logger(config)
 
+    # Preview shapes
     it_preview = iter(loader)
     xm0, xp0, yt0, yp0, mt0, mp0, mode0 = next(it_preview)
     xm0 = [x.to(device) for x in xm0]
     xp0 = [x.to(device) for x in xp0]
     _ = print_model_layers_with_shapes(model, (xm0, xp0))
+
+    # Lightweight, batch-only logger (no DB)
+    rec_logger = ManyToManyReconstructionLogger(
+        movie_ae=mov,
+        people_ae=per,
+        model=model,
+        seq_len_titles=seq_len_titles,
+        seq_len_people=seq_len_people,
+        interval_steps=int(getattr(config, "callback_interval", 200) or 200),
+        num_samples=2,
+        table_width=44,
+        seed=1234,
+    )
 
     prefetch = CudaPrefetcher(loader, device)
     model.train()
@@ -120,7 +136,9 @@ def train_many_to_many(
                         if infinite:
                             continue
                         break
+
                 xm, xp, yt, yp, mt, mp, mode = batch
+
                 with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                     preds_titles_seq, preds_people_seq, z_m2p, z_p2m = model(xm, xp)
 
@@ -129,10 +147,14 @@ def train_many_to_many(
                     rec_loss = rec_titles + rec_people
 
                     with torch.no_grad():
+                        # flatten time to encode targets for NCE
+                        B = yt[0].size(0)
+                        Tt = yt[0].size(1)
+                        Tp = yp[0].size(0) * 0 + yp[0].size(1)
                         flat_yt = [y.view(y.size(0) * y.size(1), *y.shape[2:]) for y in yt]
                         flat_yp = [y.view(y.size(0) * y.size(1), *y.shape[2:]) for y in yp]
-                        z_titles_target = mov.encoder(flat_yt).view(y.size(0), -1, latent_dim)
-                        z_people_target = per.encoder(flat_yp).view(y.size(0), -1, latent_dim)
+                        z_titles_target = mov.encoder(flat_yt).view(B, Tt, -1)
+                        z_people_target = per.encoder(flat_yp).view(B, Tp, -1)
 
                     nce_m2p = _info_nce_masked_rows(z_m2p, z_people_target, mp, temp)
                     nce_p2m = _info_nce_masked_rows(z_p2m, z_titles_target, mt, temp)
@@ -160,6 +182,13 @@ def train_many_to_many(
                     float(loss.detach().cpu().item()),
                     float(rec_loss.detach().cpu().item()),
                     float(nce_loss.detach().cpu().item()),
+                )
+
+                # pretty, batch-only reconstructions
+                rec_logger.on_batch_end(
+                    global_step=step,
+                    batch=(xm, xp, yt, yp, mt, mp),
+                    preds=(preds_titles_seq, preds_people_seq),
                 )
 
                 if save_every and step % save_every == 0:

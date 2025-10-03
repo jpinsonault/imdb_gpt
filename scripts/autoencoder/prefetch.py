@@ -10,18 +10,19 @@ class CudaPrefetcher:
         self.next_batch = None
         self._preload()
 
+    def _move_to_device(self, obj):
+        if torch.is_tensor(obj):
+            return obj.to(self.device, non_blocking=True)
+        if isinstance(obj, list):
+            return [self._move_to_device(x) for x in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._move_to_device(x) for x in obj)
+        if isinstance(obj, dict):
+            return {k: self._move_to_device(v) for k, v in obj.items()}
+        return obj
+
     def _to_device(self, batch):
-        if isinstance(batch, (list, tuple)) and len(batch) == 4:
-            xm, yp, m, k = batch
-            xm = [x.to(self.device, non_blocking=True) for x in xm]
-            yp = [y.to(self.device, non_blocking=True) for y in yp]
-            m = m.to(self.device, non_blocking=True)
-            return xm, yp, m, k
-        xm, yp, m = batch
-        xm = [x.to(self.device, non_blocking=True) for x in xm]
-        yp = [y.to(self.device, non_blocking=True) for y in yp]
-        m = m.to(self.device, non_blocking=True)
-        return xm, yp, m
+        return self._move_to_device(batch)
 
     def _preload(self):
         try:
@@ -43,3 +44,4 @@ class CudaPrefetcher:
         batch = self.next_batch
         self._preload()
         return batch
+    

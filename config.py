@@ -7,14 +7,14 @@ class ProjectConfig:
     db_path: str = "data/imdb.db"
     model_dir: str = "models"
 
-    batch_size: int = 512
+    batch_size: int = 256
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     epochs: int = 1
 
     latent_dim: int = 512
-    people_sequence_length: int = 16
-    titles_sequence_length: int = 16
+    people_sequence_length: int = 8
+    titles_sequence_length: int = 8
 
     nce_temp: float = 0.07
     nce_weight: float = 1.0
@@ -24,6 +24,8 @@ class ProjectConfig:
     callback_interval: int = 200
     tensorboard_dir: str = "runs"
     log_interval: int = 50
+
+    movie_limit: int = 100000000000
 
     num_workers: int = 0
     prefetch_factor: int = 2
