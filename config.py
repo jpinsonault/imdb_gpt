@@ -1,3 +1,4 @@
+# config.py
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,9 +17,6 @@ class ProjectConfig:
     people_sequence_length: int = 8
     titles_sequence_length: int = 8
 
-    nce_temp: float = 0.07
-    nce_weight: float = 1.0
-
     save_interval: int = 500
     flush_interval: int = 250
     callback_interval: int = 200
@@ -28,7 +26,7 @@ class ProjectConfig:
     movie_limit: int = 100000000000
 
     num_workers: int = 0
-    prefetch_factor: int = 2
+    prefetch_factor: int = 0
     max_training_steps: int | None = None
 
     use_cache: bool = True

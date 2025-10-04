@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import IterableDataset
 from scripts.autoencoder.fields import BaseField
 from scripts.sql_filters import (
-    movie_from_join, movie_where_clause, movie_group_by,
+    movie_from_join, movie_where_clause, movie_group_by, movie_having,
     people_from_join, people_where_clause, people_group_by, people_having,
 )
 
@@ -22,6 +22,7 @@ class ManyToManyDataset(IterableDataset):
         movie_limit: Optional[int] = None,
         person_limit: Optional[int] = None,
         mode_ratio: Optional[float] = None,
+        force_mode: Optional[str] = None,
     ):
         super().__init__()
         self.db_path = db_path
@@ -32,18 +33,24 @@ class ManyToManyDataset(IterableDataset):
         self.movie_limit = movie_limit
         self.person_limit = person_limit
         self._mode_ratio = mode_ratio
+        self.force_mode = force_mode
 
-    def _count_movies(self, con) -> int:
+    def count_movies(self) -> int:
+        con = sqlite3.connect(self.db_path, check_same_thread=False)
         q = f"""
         SELECT COUNT(*) FROM (
             SELECT t.tconst {movie_from_join()}
             WHERE {movie_where_clause()}
             {movie_group_by()}
+            {movie_having()}
         ) x
         """
-        return int(con.execute(q).fetchone()[0])
+        n = int(con.execute(q).fetchone()[0])
+        con.close()
+        return n
 
-    def _count_people(self, con) -> int:
+    def count_people(self) -> int:
+        con = sqlite3.connect(self.db_path, check_same_thread=False)
         q = f"""
         SELECT COUNT(*) FROM (
             SELECT p.nconst {people_from_join()}
@@ -52,7 +59,9 @@ class ManyToManyDataset(IterableDataset):
             {people_having()}
         ) x
         """
-        return int(con.execute(q).fetchone()[0])
+        n = int(con.execute(q).fetchone()[0])
+        con.close()
+        return n
 
     def _movie_rows(self, con) -> Iterator[Dict]:
         q = f"""
@@ -60,6 +69,7 @@ class ManyToManyDataset(IterableDataset):
         {movie_from_join()}
         WHERE {movie_where_clause()}
         {movie_group_by()}
+        {movie_having()}
         """
         if self.movie_limit:
             q += f" LIMIT {int(self.movie_limit)}"
@@ -165,62 +175,50 @@ class ManyToManyDataset(IterableDataset):
         con.execute("PRAGMA mmap_size=268435456;")
         con.execute("PRAGMA busy_timeout=5000;")
 
-        num_movies = self._count_movies(con)
-        num_people = self._count_people(con)
-        denom = max(1, num_movies + num_people)
-        r_movies = float(num_movies) / float(denom)
-        r_people = float(num_people) / float(denom)
-        want_movie_mode = self._mode_ratio if self._mode_ratio is not None else r_movies
-
         it_movies = self._movie_rows(con)
         it_people = self._people_rows(con)
 
-        for m_row in it_movies:
-            ppl = self._people_for_movie(con, m_row["tconst"], self.seq_len_people)
-            orig_len = min(len(ppl), self.seq_len_people)
-            if orig_len == 0:
-                continue
-            if orig_len < self.seq_len_people:
-                ppl = ppl + [{} for _ in range(self.seq_len_people - orig_len)]
-            else:
-                ppl = ppl[: self.seq_len_people]
+        if self.force_mode is None or self.force_mode == "movies":
+            for m_row in it_movies:
+                ppl = self._people_for_movie(con, m_row["tconst"], self.seq_len_people)
+                orig_len = min(len(ppl), self.seq_len_people)
+                if orig_len == 0:
+                    continue
+                if orig_len < self.seq_len_people:
+                    ppl = ppl + [{} for _ in range(self.seq_len_people - orig_len)]
+                else:
+                    ppl = ppl[: self.seq_len_people]
+                xm = self._pad_source_seq(self.movie_fields, m_row, self.seq_len_titles)
+                xp = self._pad_source_seq(self.people_fields, None, self.seq_len_people)
+                yt = self._transform_seq(self.movie_fields, [], self.seq_len_titles)
+                yp = self._transform_seq(self.people_fields, ppl, self.seq_len_people)
+                mt = torch.zeros(self.seq_len_titles, dtype=torch.float32)
+                mp = torch.zeros(self.seq_len_people, dtype=torch.float32)
+                mp[:orig_len] = 1.0
+                mode = torch.tensor(0, dtype=torch.long)
+                yield xm, xp, yt, yp, mt, mp, mode
 
-            xm = self._pad_source_seq(self.movie_fields, m_row, self.seq_len_titles)
-            xp = self._pad_source_seq(self.people_fields, None, self.seq_len_people)
-            yt = self._transform_seq(self.movie_fields, [], self.seq_len_titles)
-            yp = self._transform_seq(self.people_fields, ppl, self.seq_len_people)
-
-            mt = torch.zeros(self.seq_len_titles, dtype=torch.float32)
-            mp = torch.zeros(self.seq_len_people, dtype=torch.float32)
-            mp[:orig_len] = 1.0
-
-            mode = torch.tensor(0, dtype=torch.long)
-            yield xm, xp, yt, yp, mt, mp, mode
-
-        for p_row in it_people:
-            titles = self._titles_for_person(con, p_row["nconst"], self.seq_len_titles)
-            orig_len = min(len(titles), self.seq_len_titles)
-            if orig_len == 0:
-                continue
-            if orig_len < self.seq_len_titles:
-                titles = titles + [{} for _ in range(self.seq_len_titles - orig_len)]
-            else:
-                titles = titles[: self.seq_len_titles]
-
-            xm = self._pad_source_seq(self.movie_fields, None, self.seq_len_titles)
-            xp = self._pad_source_seq(self.people_fields, p_row, self.seq_len_people)
-            yt = self._transform_seq(self.movie_fields, titles, self.seq_len_titles)
-            yp = self._transform_seq(self.people_fields, [], self.seq_len_people)
-
-            mt = torch.zeros(self.seq_len_titles, dtype=torch.float32)
-            mp = torch.zeros(self.seq_len_people, dtype=torch.float32)
-            mt[:orig_len] = 1.0
-
-            mode = torch.tensor(1, dtype=torch.long)
-            yield xm, xp, yt, yp, mt, mp, mode
+        if self.force_mode is None or self.force_mode == "people":
+            for p_row in it_people:
+                titles = self._titles_for_person(con, p_row["nconst"], self.seq_len_titles)
+                orig_len = min(len(titles), self.seq_len_titles)
+                if orig_len == 0:
+                    continue
+                if orig_len < self.seq_len_titles:
+                    titles = titles + [{} for _ in range(self.seq_len_titles - orig_len)]
+                else:
+                    titles = titles[: self.seq_len_titles]
+                xm = self._pad_source_seq(self.movie_fields, None, self.seq_len_titles)
+                xp = self._pad_source_seq(self.people_fields, p_row, self.seq_len_people)
+                yt = self._transform_seq(self.movie_fields, titles, self.seq_len_titles)
+                yp = self._transform_seq(self.people_fields, [], self.seq_len_people)
+                mt = torch.zeros(self.seq_len_titles, dtype=torch.float32)
+                mp = torch.zeros(self.seq_len_people, dtype=torch.float32)
+                mt[:orig_len] = 1.0
+                mode = torch.tensor(1, dtype=torch.long)
+                yield xm, xp, yt, yp, mt, mp, mode
 
         con.close()
-
 
 def collate_many_to_many(batch):
     xm, xp, yt, yp, mt, mp, mode = zip(*batch)

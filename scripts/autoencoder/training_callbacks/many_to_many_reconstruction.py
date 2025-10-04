@@ -1,3 +1,4 @@
+# scripts/autoencoder/training_callbacks/many_to_many_reconstruction.py
 from __future__ import annotations
 from typing import List, Tuple, Optional
 import random
@@ -72,9 +73,9 @@ class ManyToManyReconstructionLogger:
         self._chosen_p2t: Optional[List[int]] = None
 
     @torch.no_grad()
-    def _shortcut_people_seq_from_movie_inputs(self, xm_bt_list: List[torch.Tensor]) -> torch.Tensor:
+    def _shortcut_people_seq_from_movie_inputs(self, xm_bt_list: List[torch.Tensor]) -> List[torch.Tensor]:
         device = self.m_ae.device
-        xs = [ (x[:, 0] if x.dim() >= 2 else x).to(device) for x in xm_bt_list ]
+        xs = [(x[:, 0] if x.dim() >= 2 else x).to(device) for x in xm_bt_list]
         z = self.m_ae.encoder(xs)
         z_big = self.model.pool_movies(z)
         z_tiled = z_big.unsqueeze(1).expand(z_big.size(0), self.lp, z_big.size(-1))
@@ -84,9 +85,9 @@ class ManyToManyReconstructionLogger:
         return outs_bt
 
     @torch.no_grad()
-    def _shortcut_titles_seq_from_person_inputs(self, xp_bt_list: List[torch.Tensor]) -> torch.Tensor:
+    def _shortcut_titles_seq_from_person_inputs(self, xp_bt_list: List[torch.Tensor]) -> List[torch.Tensor]:
         device = self.p_ae.device
-        xs = [ (x[:, 0] if x.dim() >= 2 else x).to(device) for x in xp_bt_list ]
+        xs = [(x[:, 0] if x.dim() >= 2 else x).to(device) for x in xp_bt_list]
         z = self.p_ae.encoder(xs)
         z_big = self.model.pool_people(z)
         z_tiled = z_big.unsqueeze(1).expand(z_big.size(0), self.lt, z_big.size(-1))
@@ -104,36 +105,48 @@ class ManyToManyReconstructionLogger:
         recon_short_bt_list: List[torch.Tensor],
         b_idx: int,
         T: int,
-        mask_bt: Optional[List[torch.Tensor]] = None,
+        mask_bt: Optional[torch.Tensor] = None,
+        delim_char: str = "=",
     ):
         print("\n" + header)
+
+        tab = PrettyTable(["t", "field", "target", "recon_seq", "recon_short"])
+        tab.align = "l"
+        tab.max_width["target"] = self.w
+        tab.max_width["recon_seq"] = self.w
+        tab.max_width["recon_short"] = self.w
+
+        shown_any = False
+        delim_row = [delim_char * 3] * 5
+
         for t in range(T):
-            tab = PrettyTable(["field", "target", "recon_seq", "recon_short"])
-            tab.align = "l"
-            for col in ["target", "recon_seq", "recon_short"]:
-                tab.max_width[col] = self.w
-            masked_flag = False
-            if mask_bt is not None and len(mask_bt) > 0:
-                m0 = mask_bt[0]
+            show = True
+            if mask_bt is not None:
                 try:
-                    masked_flag = (m0[b_idx, t].max() == 0) if m0[b_idx, t].ndim > 0 else (m0[b_idx, t] == 0)
+                    show = bool(mask_bt[b_idx, t] > 0.5)
                 except Exception:
-                    pass
+                    show = True
+            if not show:
+                continue
+
             for f, tgt_bt, rseq_bt, rsho_bt in zip(fields, targets_bt_list, recon_seq_bt_list, recon_short_bt_list):
                 tgt = tgt_bt[b_idx, t]
                 rseq = rseq_bt[b_idx, t]
                 rsho = rsho_bt[b_idx, t]
                 tab.add_row([
+                    str(t + 1),
                     f.name,
                     _fmt_field(f, tgt)[: self.w],
                     _fmt_field(f, rseq)[: self.w],
                     _fmt_field(f, rsho)[: self.w],
                 ])
-            if masked_flag:
-                print(f"\ntimestep {t+1}/{T} (pad)")
-            else:
-                print(f"\ntimestep {t+1}/{T}")
-            print(tab)
+            tab.add_row(delim_row)
+            shown_any = True
+
+        if shown_any and tab._rows and tab._rows[-1] == delim_row:
+            tab._rows.pop()
+
+        print(tab)
 
     def _maybe_choose_rows(self, B: int):
         if self._chosen_m2p is None:
@@ -145,7 +158,7 @@ class ManyToManyReconstructionLogger:
     def on_batch_end(
         self,
         global_step: int,
-        batch: Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]],
+        batch: Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor],
         preds: Tuple[List[torch.Tensor], List[torch.Tensor]],
     ):
         if (global_step + 1) % self.every != 0:
@@ -171,6 +184,7 @@ class ManyToManyReconstructionLogger:
                 b_idx=b,
                 T=self.lp,
                 mask_bt=mp,
+                delim_char="=",
             )
 
         for b in self._chosen_p2t:
@@ -185,4 +199,5 @@ class ManyToManyReconstructionLogger:
                 b_idx=b,
                 T=self.lt,
                 mask_bt=mt,
+                delim_char="=",
             )
