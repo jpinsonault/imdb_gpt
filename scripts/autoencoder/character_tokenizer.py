@@ -14,7 +14,7 @@ class CharacterTokenizer:
                 self.SPECIAL_END,
                 self.SPECIAL_SEP,
             ]
-        self.special_tokens = special_tokens
+        self.special_tokens = list(dict.fromkeys(special_tokens))
         self.char_to_index = {}
         self.index_to_char = {}
         self.alphabet = set()
@@ -33,9 +33,9 @@ class CharacterTokenizer:
     def encode(self, text):
         if not self.trained:
             raise RuntimeError("Tokenizer has not been trained. Call train(corpus) first.")
-        unk_id = self.char_to_index[self.special_tokens[0]]
-        start_id = self.char_to_index[self.special_tokens[2]]
-        end_id = self.char_to_index[self.special_tokens[3]]
+        unk_id = self.char_to_index.get(self.SPECIAL_UNK, 0)
+        start_id = self.char_to_index.get(self.SPECIAL_START, 0)
+        end_id = self.char_to_index.get(self.SPECIAL_END, 0)
         body = [self.char_to_index.get(ch, unk_id) for ch in text]
         return [start_id] + body + [end_id]
 
@@ -44,11 +44,12 @@ class CharacterTokenizer:
             raise RuntimeError("Tokenizer has not been trained. Call train(corpus) first.")
         toks = [self.index_to_char.get(int(idx), "") for idx in token_ids]
         if skip_special_tokens:
-            toks = [t for t in toks if t not in self.special_tokens]
+            specials = set(self.special_tokens)
+            toks = [t for t in toks if t not in specials]
         return "".join(toks)
 
     def token_to_id(self, token):
-        return self.char_to_index.get(token, self.char_to_index[self.special_tokens[0]])
+        return self.char_to_index.get(token, self.char_to_index.get(self.SPECIAL_UNK, 0))
 
     def id_to_token(self, token_id):
         return self.index_to_char.get(int(token_id), "?")

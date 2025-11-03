@@ -144,6 +144,7 @@ class SingleCategoryField(BaseField):
         return nn.Sequential(
             nn.Embedding(num_embeddings=max(1, len(self.category_list)), embedding_dim=max(1, emb_dim)),
             nn.Flatten(),
+            nn.Linear(max(1, emb_dim), max(1, emb_dim)),
         )
 
     def build_decoder(self, latent_dim: int) -> nn.Module:

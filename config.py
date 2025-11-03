@@ -23,6 +23,9 @@ class ProjectConfig:
     tensorboard_dir: str = "runs"
     log_interval: int = 50
 
+    nce_temp: float = 0.07
+    nce_weight: float = 1.0
+
     movie_limit: int = 100000000000
 
     num_workers: int = 0

@@ -107,7 +107,14 @@ class ScalarField(BaseField):
         return f"{v:.2f}"
 
     def build_encoder(self, latent_dim: int) -> nn.Module:
-        return nn.Identity()
+        return nn.Sequential(
+            nn.Linear(1, 8),
+            nn.GELU(),
+            nn.LayerNorm(8),
+            nn.Linear(8, 8),
+            nn.GELU(),
+            nn.LayerNorm(8),
+        )
 
     def build_decoder(self, latent_dim: int) -> nn.Module:
         return nn.Sequential(
