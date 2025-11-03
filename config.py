@@ -1,4 +1,3 @@
-# config.py
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +44,21 @@ class ProjectConfig:
     max_mode_frac: float = 0.75
     many_to_many_warm_start: bool = False
     many_to_many_freeze_loaded: bool = False
+
+    slot_people_count: int = 10
+    slot_layers: int = 2
+    slot_heads: int = 8
+    slot_ff_mult: float = 2.0
+    slot_dropout: float = 0.0
+    slot_learning_rate: float = 1e-3
+    slot_weight_decay: float = 1e-2
+    slot_epochs: int = 1
+    slot_log_interval: int = 50
+    slot_save_interval: int = 1000
+    slot_latent_align_weight: float = 0.1
+    slot_diversity_weight: float = 0.0
+
+    principals_table: str = "principals"
 
 project_config = ProjectConfig()
 
