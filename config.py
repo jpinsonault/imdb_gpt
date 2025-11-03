@@ -60,6 +60,11 @@ class ProjectConfig:
 
     principals_table: str = "principals"
 
+    slot_recon_interval: int = 20
+    slot_recon_num_samples: int = 3
+    slot_recon_show_slots: int = 3
+    slot_recon_table_width: int = 60
+
 project_config = ProjectConfig()
 
 def ensure_dirs(cfg: ProjectConfig):

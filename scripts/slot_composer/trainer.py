@@ -1,9 +1,10 @@
-import time
-from typing import List, Tuple
+import logging
+from typing import List
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from prettytable import PrettyTable
+from tqdm.auto import tqdm
 from config import ProjectConfig
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
 from scripts.slot_composer.model import SlotComposer
@@ -14,20 +15,7 @@ from scripts.slot_composer.losses import (
     latent_alignment_loss,
     diversity_penalty,
 )
-
-def _ascii_table(title: str, rows: List[Tuple[str, str]]) -> str:
-    left_w = max(len(k) for k, _ in rows + [("key", "")])
-    right_w = max(len(v) for _, v in rows + [("", "value")])
-    line = "+" + "-" * (left_w + 2) + "+" + "-" * (right_w + 2) + "+"
-    out = []
-    out.append(line)
-    hdr = f"| {'RUN':<{left_w}} | {title:<{right_w}} |"
-    out.append(hdr)
-    out.append(line)
-    for k, v in rows:
-        out.append(f"| {k:<{left_w}} | {v:<{right_w}} |")
-    out.append(line)
-    return "\n".join(out)
+from scripts.slot_composer.recon_logger import SlotComposerReconstructionLogger
 
 class SlotComposerTrainer:
     def __init__(self, config: ProjectConfig):
@@ -78,27 +66,47 @@ class SlotComposerTrainer:
 
         Path(self.cfg.model_dir).mkdir(parents=True, exist_ok=True)
 
-        rows = [
-            ("device", str(self.device)),
-            ("latent_dim", str(self.cfg.latent_dim)),
-            ("batch_size", str(self.cfg.batch_size)),
-            ("slots", str(self.cfg.slot_people_count)),
-            ("layers", str(self.cfg.slot_layers)),
-            ("heads", str(self.cfg.slot_heads)),
-            ("ff_mult", f"{self.cfg.slot_ff_mult:.2f}"),
-            ("dropout", f"{self.cfg.slot_dropout:.2f}"),
-            ("lr", f"{self.cfg.slot_learning_rate:.6f}"),
-            ("weight_decay", f"{self.cfg.slot_weight_decay:.6f}"),
-            ("align_weight", f"{self.cfg.slot_latent_align_weight:.3f}"),
-            ("div_weight", f"{self.cfg.slot_diversity_weight:.3f}"),
-            ("epochs", str(self.cfg.slot_epochs)),
-            ("workers", str(num_workers)),
-            ("prefetch", str(prefetch_factor)),
-            ("pin_memory", str(pin)),
-            ("db_path", self.cfg.db_path),
-            ("model_dir", self.cfg.model_dir),
-        ]
-        print(_ascii_table("slot-composer", rows))
+        self._print_run_table(pin, prefetch_factor, num_workers)
+
+        self.recon = SlotComposerReconstructionLogger(
+            movie_ae=self.mov_ae,
+            people_ae=self.per_ae,
+            interval_steps=self.cfg.slot_recon_interval,
+            num_samples=self.cfg.slot_recon_num_samples,
+            people_slots_to_show=self.cfg.slot_recon_show_slots,
+            table_width=self.cfg.slot_recon_table_width,
+        )
+
+    def _print_run_table(self, pin_memory: bool, prefetch_factor, num_workers: int):
+        t = PrettyTable()
+        t.field_names = ["item", "value"]
+        dev_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        params = sum(p.numel() for p in self.model.parameters())
+        t.add_row(["device", str(self.device)])
+        t.add_row(["device_name", dev_name])
+        t.add_row(["latent_dim", self.cfg.latent_dim])
+        t.add_row(["slots", self.cfg.slot_people_count])
+        t.add_row(["layers", self.cfg.slot_layers])
+        t.add_row(["heads", self.cfg.slot_heads])
+        t.add_row(["ff_mult", self.cfg.slot_ff_mult])
+        t.add_row(["dropout", self.cfg.slot_dropout])
+        t.add_row(["batch_size", self.cfg.batch_size])
+        t.add_row(["lr", self.cfg.slot_learning_rate])
+        t.add_row(["weight_decay", self.cfg.slot_weight_decay])
+        t.add_row(["epochs", self.cfg.slot_epochs])
+        t.add_row(["align_weight", self.cfg.slot_latent_align_weight])
+        t.add_row(["div_weight", self.cfg.slot_diversity_weight])
+        t.add_row(["recon_interval", self.cfg.slot_recon_interval])
+        t.add_row(["recon_samples", self.cfg.slot_recon_num_samples])
+        t.add_row(["recon_show_slots", self.cfg.slot_recon_show_slots])
+        t.add_row(["recon_table_width", self.cfg.slot_recon_table_width])
+        t.add_row(["workers", num_workers])
+        t.add_row(["prefetch_factor", prefetch_factor if prefetch_factor is not None else "None"])
+        t.add_row(["pin_memory", pin_memory])
+        t.add_row(["model_params", params])
+        t.add_row(["model_dir", self.cfg.model_dir])
+        t.add_row(["db_path", self.cfg.db_path])
+        logging.info("\n%s", t.get_string())
 
     def _encode_movie(self, Mx: List[torch.Tensor]) -> torch.Tensor:
         X = [x.to(self.device, non_blocking=True) for x in Mx]
@@ -115,48 +123,31 @@ class SlotComposerTrainer:
     def train(self):
         step = 0
         for epoch in range(self.cfg.slot_epochs):
-            it = iter(self.loader)
-            pbar = tqdm(total=None, dynamic_ncols=True)
-            pbar.set_description(f"epoch {epoch + 1}/{self.cfg.slot_epochs}")
-            while True:
-                stage = "fetch"
-                pbar.set_postfix_str(f"stage={stage}")
-                t0 = time.perf_counter()
-                try:
-                    Mx, My, Pxs, Pys, mask = next(it)
-                except StopIteration:
-                    break
-                fetch_t = time.perf_counter() - t0
-                bs = int(Mx[0].size(0)) if isinstance(Mx, list) and len(Mx) > 0 else 0
-
-                stage = "encode"
-                pbar.set_postfix_str(f"stage={stage} bs={bs}")
+            pbar = tqdm(self.loader, unit="batch", dynamic_ncols=True)
+            pbar.set_description(f"epoch {epoch+1}/{self.cfg.slot_epochs}")
+            for Mx, My, Pxs, Pys, mask in pbar:
                 Mx = [x.to(self.device, non_blocking=True) for x in Mx]
                 My = [y.to(self.device, non_blocking=True) for y in My]
                 Pxs = [px.to(self.device, non_blocking=True) for px in Pxs]
                 Pys = [py.to(self.device, non_blocking=True) for py in Pys]
                 mask = mask.to(self.device, non_blocking=True)
+
                 with torch.no_grad():
                     z_movie = self.mov_ae.encoder(Mx)
 
-                stage = "forward"
-                pbar.set_postfix_str(f"stage={stage} bs={bs}")
                 z_movie_hat, z_slots_hat = self.model(z_movie)
 
-                stage = "decode"
-                pbar.set_postfix_str(f"stage={stage} bs={bs}")
                 movie_preds = self.mov_ae.decoder(z_movie_hat)
+                loss_movie = aggregate_movie_loss(self.mov_ae.fields, movie_preds, My)
+
                 b, n, d = z_slots_hat.shape
-                flat = z_slots_hat.reshape(b * n, d)
                 people_preds_per_field = []
+                flat = z_slots_hat.reshape(b * n, d)
                 for dec in self.per_ae.decoder.decs:
                     y = dec(flat)
                     y = y.view(b, n, *y.shape[1:])
                     people_preds_per_field.append(y)
 
-                stage = "loss"
-                pbar.set_postfix_str(f"stage={stage} bs={bs}")
-                loss_movie = aggregate_movie_loss(self.mov_ae.fields, movie_preds, My)
                 loss_people = aggregate_people_loss(self.per_ae.fields, people_preds_per_field, Pys, mask)
 
                 align = 0.0
@@ -174,32 +165,38 @@ class SlotComposerTrainer:
 
                 total = loss_movie + loss_people + align + div
 
-                stage = "step"
-                pbar.set_postfix_str(f"stage={stage} bs={bs}")
                 self.optim.zero_grad(set_to_none=True)
                 total.backward()
                 self.optim.step()
 
                 step += 1
-                pbar.update(1)
                 pbar.set_postfix(
-                    {
-                        "stage": "done",
-                        "batch": step,
-                        "bs": bs,
-                        "total": f"{float(total.detach().cpu().item()):.4f}",
-                        "movie": f"{float(loss_movie.detach().cpu().item()):.4f}",
-                        "people": f"{float(loss_people.detach().cpu().item()):.4f}",
-                        "align": f"{float(align.detach().cpu().item()) if isinstance(align, torch.Tensor) else float(align):.4f}",
-                        "fetch_s": f"{fetch_t:.2f}",
-                    }
+                    loss=float(total.detach().cpu().item()),
+                    movie=float(loss_movie.detach().cpu().item()),
+                    people=float(loss_people.detach().cpu().item()),
+                    align=float(align.detach().cpu().item()) if isinstance(align, torch.Tensor) else float(align),
+                    div=float(div.detach().cpu().item()) if isinstance(div, torch.Tensor) else float(div),
+                )
+
+                self.recon.on_batch_end(
+                    global_step=step - 1,
+                    Mx=Mx,
+                    My=My,
+                    Pxs=Pxs,
+                    Pys=Pys,
+                    mask=mask,
+                    z_movie_hat=z_movie_hat,
+                    z_slots_hat=z_slots_hat,
+                    movie_preds=movie_preds,
+                    people_preds_per_field=people_preds_per_field,
                 )
 
                 if (step % self.cfg.slot_save_interval) == 0:
                     out = Path(self.cfg.model_dir) / "SlotComposer.pt"
                     torch.save(self.model.state_dict(), out)
 
-            pbar.close()
+            out = Path(self.cfg.model_dir) / f"SlotComposer_epoch{epoch+1}.pt"
+            torch.save(self.model.state_dict(), out)
 
         out = Path(self.cfg.model_dir) / "SlotComposer_final.pt"
         torch.save(self.model.state_dict(), out)
