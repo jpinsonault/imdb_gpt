@@ -98,3 +98,74 @@ def hungarian_people_loss(
             c_sum = cur if c_sum is None else c_sum + cur
         batch_costs.append(_greedy_assign(c_sum, k))
     return torch.stack(batch_costs).mean()
+
+
+import torch
+import torch.nn.functional as F
+
+def _cosine_cost(z_pred: torch.Tensor, z_true: torch.Tensor) -> torch.Tensor:
+    b, n, d = z_pred.shape
+    k = z_true.size(1)
+    zp = F.normalize(z_pred, dim=-1)
+    zt = F.normalize(z_true, dim=-1)
+    return 1.0 - torch.matmul(zp, zt.transpose(1, 2))
+
+def _greedy_assign_indices(cost: torch.Tensor, valid_k: int) -> torch.Tensor:
+    b, n, k = cost.shape
+    out = torch.full((b, n), -1, dtype=torch.long, device=cost.device)
+    if valid_k == 0:
+        return out
+    inf = torch.tensor(float("inf"), device=cost.device, dtype=cost.dtype)
+    for i in range(b):
+        c = cost[i, :, :valid_k].clone()
+        row_mask = torch.zeros(n, dtype=torch.bool, device=cost.device)
+        col_mask = torch.zeros(valid_k, dtype=torch.bool, device=cost.device)
+        steps = min(n, valid_k)
+        for _ in range(steps):
+            cm = c.masked_fill(row_mask.unsqueeze(1), inf).masked_fill(col_mask.unsqueeze(0), inf)
+            idx = torch.argmin(cm.view(-1))
+            r = int(idx.item() // valid_k)
+            cidx = int(idx.item() % valid_k)
+            v = c[r, cidx]
+            if torch.isinf(v):
+                break
+            out[i, r] = cidx
+            row_mask[r] = True
+            col_mask[cidx] = True
+    return out
+
+def _gather_true_by_assign(z_true: torch.Tensor, assign_idx: torch.Tensor) -> torch.Tensor:
+    b, n, d = assign_idx.shape[0], z_true.size(1), z_true.size(2)
+    gather_idx = assign_idx.clamp_min(0)
+    take = z_true.gather(1, gather_idx.unsqueeze(-1).expand(b, n, d))
+    mask = (assign_idx >= 0).float().unsqueeze(-1)
+    return take * mask
+
+def latent_alignment_loss_matched(z_pred: torch.Tensor, z_true: torch.Tensor, slot_mask: torch.Tensor) -> torch.Tensor:
+    b, n, d = z_pred.shape
+    k = z_true.size(1)
+    valid_k = slot_mask.sum(dim=1).clamp_max(k).to(torch.long)
+    cost = _cosine_cost(z_pred, z_true)
+    assign = _greedy_assign_indices(cost, int(k))
+    z_true_perm = _gather_true_by_assign(z_true, assign)
+    zp = F.normalize(z_pred, dim=-1)
+    zt = F.normalize(z_true_perm, dim=-1)
+    dcos = 1.0 - (zp * zt).sum(dim=-1)
+    num = (dcos * slot_mask).sum(dim=1)
+    den = slot_mask.sum(dim=1).clamp_min(1.0)
+    return (num / den).mean()
+
+def straight_path_loss_matched(z_seq: torch.Tensor, z_start: torch.Tensor, z_true: torch.Tensor, slot_mask: torch.Tensor) -> torch.Tensor:
+    b, s, n, d = z_seq.shape
+    k = z_true.size(1)
+    cost = _cosine_cost(z_seq[:, -1, :, :], z_true)
+    assign = _greedy_assign_indices(cost, int(k))
+    z_tgt = _gather_true_by_assign(z_true, assign)
+    if s <= 1:
+        return z_seq.new_zeros(())
+    ts = torch.linspace(0.0, 1.0, steps=s, device=z_seq.device).view(1, s, 1, 1)
+    lerp = z_start.unsqueeze(1) * (1.0 - ts) + z_tgt.unsqueeze(1) * ts
+    diff = (z_seq - lerp).pow(2).sum(dim=-1)
+    diff = diff * slot_mask.unsqueeze(1)
+    den = slot_mask.sum(dim=1).clamp_min(1.0).unsqueeze(1)
+    return (diff.sum(dim=(1, 2)) / den.squeeze(1)).mean()

@@ -13,8 +13,6 @@ class ProjectConfig:
     epochs: int = 10
 
     latent_dim: int = 512
-    people_sequence_length: int = 8
-    titles_sequence_length: int = 8
 
     save_interval: int = 500
     flush_interval: int = 250
@@ -39,24 +37,11 @@ class ProjectConfig:
     weak_edge_boost: float = 0.10
     refresh_batches: int = 1000
 
-    alternate_modes: bool = True
-    min_mode_frac: float = 0.25
-    max_mode_frac: float = 0.75
-    many_to_many_warm_start: bool = False
-    many_to_many_freeze_loaded: bool = False
-
     slot_people_count: int = 2
-    slot_layers: int = 2
-    slot_heads: int = 2
-    slot_ff_mult: float = 2.0
-    slot_dropout: float = 0.0
     slot_learning_rate: float = 1e-3
     slot_weight_decay: float = 1e-3
     slot_epochs: int = 10
-    slot_log_interval: int = 50
     slot_save_interval: int = 1000
-    slot_latent_align_weight: float = 0.1
-    slot_diversity_weight: float = 0.01
 
     principals_table: str = "principals"
 
@@ -64,6 +49,19 @@ class ProjectConfig:
     slot_recon_num_samples: int = 3
     slot_recon_show_slots: int = 3
     slot_recon_table_width: int = 60
+
+    slot_flow_method: str = "rk4"
+    slot_flow_steps: int = 8
+    slot_flow_t0: float = 0.0
+    slot_flow_t1: float = 1.0
+    slot_flow_noise_scale: float = 1e-3
+    slot_flow_hidden_mult: float = 4.0
+    slot_flow_layers: int = 1
+    slot_flow_fourier_dim: int = 64
+    slot_seed_from_movie: bool = True
+
+    slot_cond_width: float = 2.0
+    slot_flow_t_samples: int = 4
 
 project_config = ProjectConfig()
 

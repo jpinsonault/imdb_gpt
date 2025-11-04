@@ -32,6 +32,7 @@ class TitlePeopleIterable(IterableDataset):
         people_ae,
         num_slots: int,
         people_cache_capacity: int = 200000,
+        shuffle: bool = True,
     ):
         super().__init__()
         self.db_path = db_path
@@ -40,10 +41,26 @@ class TitlePeopleIterable(IterableDataset):
         self.people_ae = people_ae
         self.num_slots = int(num_slots)
         self.people_cache_capacity = int(people_cache_capacity)
+        self.shuffle = bool(shuffle)
 
         self._conn: Optional[sqlite3.Connection] = None
         self._cur: Optional[sqlite3.Cursor] = None
+        self._scan_cur: Optional[sqlite3.Cursor] = None
+
         self._people_cache = _LRU(self.people_cache_capacity)
+        self._movie_cache = _LRU(200000)
+
+        self._epoch_seed: int = 0
+
+        self._movie_sql = """
+        SELECT primaryTitle,startYear,endYear,runtimeMinutes,
+               averageRating,numVotes,
+               (SELECT GROUP_CONCAT(genre,',') FROM title_genres WHERE tconst = ?)
+        FROM titles WHERE tconst = ? LIMIT 1
+        """
+
+    def set_epoch_seed(self, seed: int):
+        self._epoch_seed = int(seed)
 
     def _open(self):
         if self._conn is not None:
@@ -57,6 +74,7 @@ class TitlePeopleIterable(IterableDataset):
         conn.execute("PRAGMA busy_timeout = 5000;")
         self._conn = conn
         self._cur = conn.cursor()
+        self._scan_cur = conn.cursor()
 
     def _close(self):
         if self._conn is not None:
@@ -66,6 +84,48 @@ class TitlePeopleIterable(IterableDataset):
                 pass
         self._conn = None
         self._cur = None
+        self._scan_cur = None
+
+    def _iter_tconsts(self) -> Iterator[str]:
+        if self.shuffle:
+            s = int(self._epoch_seed) & 0x7FFFFFFF
+            mul = ((s * 1103515245 + 12345) & 0x7FFFFFFF) | 1
+            add = ((s * 1664525 + 1013904223) & 0x7FFFFFFF)
+            q = """
+            SELECT tconst
+            FROM (
+              SELECT DISTINCT tconst, movie_hash
+              FROM edges
+            )
+            ORDER BY ((movie_hash * ? + ?) & 2147483647)
+            """
+            it = self._scan_cur.execute(q, (mul, add))
+        else:
+            it = self._scan_cur.execute("SELECT DISTINCT tconst FROM edges")
+        for r in it:
+            yield r[0]
+
+    def _movie_row(self, tconst: str) -> Dict:
+        r = self._movie_cache.get(tconst)
+        if r is not None:
+            return r
+        row = self._cur.execute(self._movie_sql, (tconst, tconst)).fetchone()
+        if row is None:
+            out = {"primaryTitle": None, "startYear": None, "endYear": None, "runtimeMinutes": None, "averageRating": None, "numVotes": None, "genres": []}
+            self._movie_cache.set(tconst, out)
+            return out
+        out = {
+            "tconst": tconst,
+            "primaryTitle": row[0],
+            "startYear": row[1],
+            "endYear": row[2],
+            "runtimeMinutes": row[3],
+            "averageRating": row[4],
+            "numVotes": row[5],
+            "genres": row[6].split(",") if row[6] else [],
+        }
+        self._movie_cache.set(tconst, out)
+        return out
 
     def _people_for_title(self, tconst: str) -> List[str]:
         rows = self._cur.execute(
@@ -120,7 +180,6 @@ class TitlePeopleIterable(IterableDataset):
             self._people_cache.set(nconst, row)
             out[nconst] = row
 
-        # for any missing ids (rare), fill minimal rows to avoid key errors
         for n in need:
             if n not in out:
                 row = {"primaryName": None, "birthYear": None, "deathYear": None, "professions": None}
@@ -140,14 +199,13 @@ class TitlePeopleIterable(IterableDataset):
     ]:
         self._open()
         try:
-            for row in self.movie_ae.row_generator():
-                tconst = row.get("tconst")
-                m_x = [f.transform(row.get(f.name)) for f in self.movie_ae.fields]
-                m_y = [f.transform_target(row.get(f.name)) for f in self.movie_ae.fields]
+            for tconst in self._iter_tconsts():
+                mrow = self._movie_row(tconst)
+                m_x = [f.transform(mrow.get(f.name)) for f in self.movie_ae.fields]
+                m_y = [f.transform_target(mrow.get(f.name)) for f in self.movie_ae.fields]
 
                 nconsts = self._people_for_title(tconst)
                 k = len(nconsts)
-
                 p_rows = self._bulk_people_rows(nconsts)
 
                 p_x: List[List[torch.Tensor]] = []

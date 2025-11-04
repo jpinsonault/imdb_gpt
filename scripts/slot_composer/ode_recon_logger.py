@@ -4,7 +4,7 @@ import torch
 from prettytable import PrettyTable
 from tqdm.auto import tqdm
 
-class FlowSlotComposerReconstructionLogger:
+class ODESlotReconstructionLogger:
     def __init__(
         self,
         movie_ae,
@@ -13,6 +13,7 @@ class FlowSlotComposerReconstructionLogger:
         num_samples: int,
         people_slots_to_show: int,
         table_width: int,
+        writer=None,
     ):
         self.m_ae = movie_ae
         self.p_ae = people_ae
@@ -20,6 +21,7 @@ class FlowSlotComposerReconstructionLogger:
         self.num_samples = max(1, int(num_samples))
         self.show_slots = max(1, int(people_slots_to_show))
         self.w = int(table_width)
+        self.writer = writer
 
     def _to_str(self, field, arr):
         a = np.array(arr)
@@ -43,6 +45,17 @@ class FlowSlotComposerReconstructionLogger:
         outs = self.p_ae.decoder(z)
         return [o.detach().cpu().numpy()[0] for o in outs]
 
+    @torch.no_grad()
+    def _decode_people(self, per_decoder, z_slots_hat):
+        b, n, d = z_slots_hat.shape
+        outs = []
+        flat = z_slots_hat.reshape(b * n, d)
+        for dec in per_decoder.decs:
+            y = dec(flat)
+            y = y.view(b, n, *y.shape[1:])
+            outs.append(y)
+        return outs
+
     def _movie_table(self, My, movie_preds, Mx, b_idx, title):
         tab = PrettyTable(["field", "orig", "round", title])
         tab.align = "l"
@@ -57,7 +70,7 @@ class FlowSlotComposerReconstructionLogger:
             tab.add_row([f.name, orig[: self.w], rts[: self.w], rec[: self.w]])
         return tab
 
-    def _people_table(self, Pys, people_preds_per_field, Pxs, mask, b_idx, slots_to_show, title):
+    def _people_table(self, Pys, people_preds_per_field, Pxs, mask, b_idx, title):
         tab = PrettyTable(["slot", "field", "orig", "round", title])
         tab.align = "l"
         tab.max_width["orig"] = self.w
@@ -65,7 +78,7 @@ class FlowSlotComposerReconstructionLogger:
         tab.max_width[title] = self.w
         n = mask.size(1)
         valid = [i for i in range(n) if float(mask[b_idx, i].item()) > 0.0]
-        valid = valid[:slots_to_show]
+        valid = valid[: self.show_slots]
         roundtrips = {}
         for i in valid:
             rt = self._roundtrip_person([px[b_idx, i] for px in Pxs])
@@ -80,17 +93,6 @@ class FlowSlotComposerReconstructionLogger:
                 tab.add_row([str(i), f.name, orig[: self.w], rts[: self.w], rec[: self.w]])
         return tab
 
-    @torch.no_grad()
-    def _decode_people(self, per_decoder, z_slots_hat):
-        b, n, d = z_slots_hat.shape
-        outs = []
-        flat = z_slots_hat.reshape(b * n, d)
-        for dec in per_decoder.decs:
-            y = dec(flat)
-            y = y.view(b, n, *y.shape[1:])
-            outs.append(y)
-        return outs
-
     def on_batch_end(
         self,
         global_step: int,
@@ -99,39 +101,35 @@ class FlowSlotComposerReconstructionLogger:
         Pxs: List[torch.Tensor],
         Pys: List[torch.Tensor],
         mask: torch.Tensor,
-        model,
-        steps_normal: int,
+        z_movie: torch.Tensor,
+        z_slots_final: torch.Tensor,
+        z_slots_traj: torch.Tensor | None,
     ):
         if (global_step + 1) % self.every != 0:
             return
         b = int(My[0].size(0)) if My else 0
         if b == 0:
             return
-        idxs = np.random.choice(b, size=min(self.num_samples, b), replace=False).tolist()
 
         with torch.no_grad():
-            z_movie = self.m_ae.encoder([x.to(self.m_ae.device) for x in Mx])
+            movie_preds = self.m_ae.decoder(z_movie)
 
-        z_m_n, z_s_n = model(z_movie, steps=steps_normal, return_all=False)
-        z_m_d, z_s_d = model(z_movie, steps=max(1, steps_normal * 2), return_all=False)
+        people_preds_final = self._decode_people(self.p_ae.decoder, z_slots_final)
 
-        movie_preds_n = self.m_ae.decoder(z_m_n)
-        movie_preds_d = self.m_ae.decoder(z_m_d)
-
-        people_preds_n = self._decode_people(self.p_ae.decoder, z_s_n)
-        people_preds_d = self._decode_people(self.p_ae.decoder, z_s_d)
-
+        idxs = np.random.choice(b, size=min(self.num_samples, b), replace=False).tolist()
         for j in idxs:
-            t_movie_n = self._movie_table(My, movie_preds_n, Mx, j, "recon@normal")
-            t_movie_d = self._movie_table(My, movie_preds_d, Mx, j, "recon@double")
-            tqdm.write("\n[flow slot-composer movie @ normal]")
-            tqdm.write(t_movie_n.get_string())
-            tqdm.write("\n[flow slot-composer movie @ double]")
-            tqdm.write(t_movie_d.get_string())
+            t_movie = self._movie_table(My, movie_preds, Mx, j, "recon@movie")
+            tqdm.write("\n[ode slot-composer movie]")
+            tqdm.write(t_movie.get_string())
+            t_people = self._people_table(Pys, people_preds_final, Pxs, mask, j, "recon@final")
+            tqdm.write("\n[ode slot-composer people]")
+            tqdm.write(t_people.get_string())
+            if self.writer is not None:
+                self.writer.add_text("recon/movie", "```\n" + t_movie.get_string() + "\n```", global_step=global_step + 1)
+                self.writer.add_text("recon/people", "```\n" + t_people.get_string() + "\n```", global_step=global_step + 1)
 
-            t_people_n = self._people_table(Pys, people_preds_n, Pxs, mask, j, self.show_slots, "recon@normal")
-            t_people_d = self._people_table(Pys, people_preds_d, Pxs, mask, j, self.show_slots, "recon@double")
-            tqdm.write("\n[flow slot-composer people @ normal]")
-            tqdm.write(t_people_n.get_string())
-            tqdm.write("\n[flow slot-composer people @ double]")
-            tqdm.write(t_people_d.get_string())
+        if z_slots_traj is not None:
+            with torch.no_grad():
+                v = z_slots_traj[:, 1:, :, :] - z_slots_traj[:, :-1, :, :]
+                self.writer.add_histogram("ode/velocity", v.detach().cpu(), global_step=global_step + 1)
+                self.writer.add_histogram("ode/slots_final", z_slots_final.detach().cpu(), global_step=global_step + 1)
