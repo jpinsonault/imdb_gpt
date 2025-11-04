@@ -23,17 +23,21 @@ def rectified_flow_loss(
     b = s0.size(0)
     device = s0.device
     if t is None:
-        t = _sample_t(b, device)
+        t = torch.rand(b, device=device)
     s_t = _blend(s0, z_tgt, t)
     v_star = z_tgt - s0
     v_pred = vector_field(s_t, t, z_movie)
     diff = v_pred - v_star
-    if diff.dim() == 3:
-        if mask is not None:
+    if mask is not None:
+        if diff.dim() == 3:
             num = (diff.pow(2).sum(dim=-1) * mask).sum(dim=1)
             den = mask.sum(dim=1).clamp_min(1.0)
             return (num / den).mean()
-        return diff.pow(2).mean()
+        w = mask.view(mask.size(0), -1)
+        d = diff.view(diff.size(0), -1)
+        num = (d.pow(2) * w).sum(dim=1)
+        den = w.sum(dim=1).clamp_min(1.0)
+        return (num / den).mean()
     return diff.pow(2).mean()
 
 def rectified_flow_loss_multi(
@@ -61,12 +65,11 @@ def rectified_flow_loss_multi(
     diff = v_pred - v_star.reshape_as(v_pred)
     if mask is not None:
         mask_r = mask.unsqueeze(0).expand(t_samples, b, n)
-        num = (diff.pow(2).sum(dim=-1).reshape(t_samples, b, n) * mask_r).sum(dim=2)
+        per_t = (diff.pow(2).sum(dim=-1).reshape(t_samples, b, n) * mask_r)
+        num = per_t.sum(dim=2)
         den = mask_r.sum(dim=2).clamp_min(1.0)
-        per_t = (num / den).mean(dim=1)
-        return per_t.mean()
-    per_t = diff.pow(2).reshape(t_samples, b, n, d).mean(dim=(2, 3))
-    return per_t.mean()
+        return (num / den).mean()
+    return diff.pow(2).reshape(t_samples, b, n, d).mean(dim=(0, 2, 3)).mean()
 
 def rectified_flow_loss_matched(
     vector_field,
@@ -75,12 +78,19 @@ def rectified_flow_loss_matched(
     z_true: torch.Tensor,
     mask: torch.Tensor | None = None,
     t: torch.Tensor | None = None,
+    probe_step: float = 0.1,
 ) -> torch.Tensor:
     b, n, d = s0.shape
-    k = z_true.size(1)
-    cost = _cosine_cost(s0, z_true)
-    assign = _greedy_assign_indices(cost, int(k))
-    z_tgt = _gather_true_by_assign(z_true, assign)
+    device = s0.device
+    if t is None:
+        t = _sample_t(b, device)
+    with torch.no_grad():
+        t_probe = t
+        v_probe = vector_field(s0, t_probe, z_movie)
+        s_probe = s0 + probe_step * v_probe
+        cost = _cosine_cost(s_probe, z_true)
+        assign = _greedy_assign_indices(cost, int(z_true.size(1)))
+        z_tgt = _gather_true_by_assign(z_true, assign)
     return rectified_flow_loss(vector_field, z_movie, s0, z_tgt, t=t, mask=mask)
 
 def rectified_flow_loss_matched_multi(
@@ -90,12 +100,17 @@ def rectified_flow_loss_matched_multi(
     z_true: torch.Tensor,
     mask: torch.Tensor | None = None,
     t_samples: int = 1,
+    probe_step: float = 0.1,
 ) -> torch.Tensor:
     b, n, d = s0.shape
-    k = z_true.size(1)
-    cost = _cosine_cost(s0, z_true)
-    assign = _greedy_assign_indices(cost, int(k))
-    z_tgt = _gather_true_by_assign(z_true, assign)
+    device = s0.device
+    t_for_probe = torch.rand(b, device=device)
+    with torch.no_grad():
+        v_probe = vector_field(s0, t_for_probe, z_movie)
+        s_probe = s0 + probe_step * v_probe
+        cost = _cosine_cost(s_probe, z_true)
+        assign = _greedy_assign_indices(cost, int(z_true.size(1)))
+        z_tgt = _gather_true_by_assign(z_true, assign)
     return rectified_flow_loss_multi(vector_field, z_movie, s0, z_tgt, mask=mask, t_samples=t_samples)
 
 def euler_sample(

@@ -63,6 +63,11 @@ class ProjectConfig:
     slot_cond_width: float = 2.0
     slot_flow_t_samples: int = 4
 
+    slot_loss_w_recon: float = 0.1
+    slot_loss_w_align: float = 0.1
+    slot_loss_w_div: float = 0.05
+    slot_loss_w_path: float = 0.05
+
 project_config = ProjectConfig()
 
 def ensure_dirs(cfg: ProjectConfig):

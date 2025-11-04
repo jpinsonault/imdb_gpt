@@ -1,6 +1,5 @@
-from typing import List, Dict, Tuple
+from typing import List
 import torch
-import torch.nn.functional as F
 from scripts.autoencoder.fields import (
     ScalarField,
     BooleanField,
@@ -9,6 +8,7 @@ from scripts.autoencoder.fields import (
     TextField,
     NumericDigitCategoryField,
 )
+import torch.nn.functional as F
 
 def per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     if pred.dim() == 3:
@@ -37,26 +37,18 @@ def per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torch
 
     if isinstance(field, ScalarField):
         diff = pred - tgt
-        if diff.dim() > 1:
-            return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1)
-        return diff.pow(2)
+        return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1) if diff.dim() > 1 else diff.pow(2)
 
     if isinstance(field, BooleanField):
         if getattr(field, "use_bce_loss"):
             loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
-            if loss.dim() > 1:
-                loss = loss.reshape(loss.size(0), -1).mean(dim=1)
-            return loss
+            return loss.reshape(loss.size(0), -1).mean(dim=1) if loss.dim() > 1 else loss
         diff = torch.tanh(pred) - tgt
-        if diff.dim() > 1:
-            return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1)
-        return diff.pow(2)
+        return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1) if diff.dim() > 1 else diff.pow(2)
 
     if isinstance(field, MultiCategoryField):
         loss = F.binary_cross_entropy_with_logits(pred, tgt, reduction="none")
-        if loss.dim() > 1:
-            loss = loss.reshape(loss.size(0), -1).mean(dim=1)
-        return loss
+        return loss.reshape(loss.size(0), -1).mean(dim=1) if loss.dim() > 1 else loss
 
     if isinstance(field, SingleCategoryField):
         b, c = pred.shape[0], pred.shape[-1]
@@ -64,16 +56,7 @@ def per_sample_field_loss(field, pred: torch.Tensor, tgt: torch.Tensor) -> torch
         return F.cross_entropy(pred.reshape(b, c), t.reshape(b), reduction="none")
 
     diff = pred - tgt
-    if diff.dim() > 1:
-        return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1)
-    return diff.pow(2)
-
-def aggregate_movie_loss(fields, preds: List[torch.Tensor], tgts: List[torch.Tensor]) -> torch.Tensor:
-    total = None
-    for f, p, t in zip(fields, preds, tgts):
-        ps = per_sample_field_loss(f, p, t)
-        total = ps if total is None else total + ps
-    return total.mean()
+    return diff.pow(2).reshape(diff.size(0), -1).mean(dim=1) if diff.dim() > 1 else diff.pow(2)
 
 def aggregate_people_loss(
     fields,
@@ -84,7 +67,6 @@ def aggregate_people_loss(
     b, n = slot_mask.shape
     total = torch.zeros(b, device=slot_mask.device)
     for f, p, t in zip(fields, preds_per_field, tgts_per_field):
-        cur = 0
         for i in range(n):
             ps = per_sample_field_loss(f, p[:, i, ...], t[:, i, ...])
             total = total + ps * slot_mask[:, i]

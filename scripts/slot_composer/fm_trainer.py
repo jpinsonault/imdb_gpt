@@ -23,6 +23,7 @@ from scripts.slot_composer.set_losses import (
 )
 from scripts.slot_composer.losses import aggregate_people_loss, diversity_penalty
 from scripts.slot_composer.flow_matching import rectified_flow_loss_matched_multi
+from scripts.slot_composer.flow_losses import straight_path_loss
 
 class FlowMatchingSlotComposerTrainer:
     def __init__(self, config: ProjectConfig, resume: bool = False):
@@ -146,6 +147,10 @@ class FlowMatchingSlotComposerTrainer:
         t.add_row(["recon_show_slots", self.cfg.slot_recon_show_slots])
         t.add_row(["recon_table_width", self.cfg.slot_recon_table_width])
         t.add_row(["t_samples", getattr(self.cfg, "slot_flow_t_samples", 1)])
+        t.add_row(["w_recon", getattr(self.cfg, "slot_loss_w_recon", 0.0)])
+        t.add_row(["w_align", getattr(self.cfg, "slot_loss_w_align", 0.0)])
+        t.add_row(["w_div", getattr(self.cfg, "slot_loss_w_div", 0.0)])
+        t.add_row(["w_path", getattr(self.cfg, "slot_loss_w_path", 0.0)])
         t.add_row(["model_params", params])
         t.add_row(["model_dir", self.cfg.model_dir])
         t.add_row(["db_path", self.cfg.db_path])
@@ -190,6 +195,7 @@ class FlowMatchingSlotComposerTrainer:
                     z_true = self._encode_people_slots(Pxs)
 
                 s0 = self.flow._seed(z_movie)
+
                 loss_fm = rectified_flow_loss_matched_multi(
                     vector_field=self.flow.field,
                     z_movie=z_movie,
@@ -199,16 +205,14 @@ class FlowMatchingSlotComposerTrainer:
                     t_samples=max(1, int(getattr(self.cfg, "slot_flow_t_samples", 1))),
                 )
 
-                total = loss_fm
+                w_recon = float(getattr(self.cfg, "slot_loss_w_recon", 0.0))
+                w_align = float(getattr(self.cfg, "slot_loss_w_align", 0.0))
+                w_div = float(getattr(self.cfg, "slot_loss_w_div", 0.0))
+                w_path = float(getattr(self.cfg, "slot_loss_w_path", 0.0))
 
-                self.optim.zero_grad(set_to_none=True)
-                total.backward()
-                self.optim.step()
+                sT, traj = self.flow.solver(self.flow.field, s0, z_movie, return_all=(w_path > 0.0))
 
                 with torch.no_grad():
-                    s0_inf = self.flow._seed(z_movie)
-                    sT, _ = self.flow.solver(self.flow.field, s0_inf, z_movie, return_all=False)
-
                     b, n, d = sT.shape
                     flat = sT.reshape(b * n, d)
                     people_preds = []
@@ -217,17 +221,33 @@ class FlowMatchingSlotComposerTrainer:
                         y = y.view(b, n, *y.shape[1:])
                         people_preds.append(y)
 
-                    people_recon = aggregate_people_loss(self.per_ae.fields, people_preds, Pys, mask)
-                    align = latent_alignment_loss_matched(sT, z_true, mask)
-                    div = diversity_penalty(sT)
+                loss_recon = aggregate_people_loss(self.per_ae.fields, people_preds, Pys, mask) if w_recon > 0.0 else sT.new_zeros(())
+                loss_align = latent_alignment_loss_matched(sT, z_true, mask) if w_align > 0.0 else sT.new_zeros(())
+                loss_div = diversity_penalty(sT) if w_div > 0.0 else sT.new_zeros(())
+
+                if w_path > 0.0:
+                    with torch.no_grad():
+                        cost = _cosine_cost(sT, z_true)
+                        assign = _greedy_assign_indices(cost, int(z_true.size(1)))
+                        z_tgt = _gather_true_by_assign(z_true, assign)
+                    loss_path = straight_path_loss(traj, s0, z_tgt, mask)
+                else:
+                    loss_path = s0.new_zeros(())
+
+                total = loss_fm + w_recon * loss_recon + w_align * loss_align + w_div * loss_div + w_path * loss_path
+
+                self.optim.zero_grad(set_to_none=True)
+                total.backward()
+                self.optim.step()
 
                 step += 1
                 pbar.set_postfix(
                     loss=float(total.detach().cpu().item()),
                     fm=float(loss_fm.detach().cpu().item()),
-                    ppl=float(people_recon.detach().cpu().item()),
-                    align=float(align.detach().cpu().item()),
-                    div=float(div.detach().cpu().item()),
+                    ppl=float(loss_recon.detach().cpu().item()) if w_recon > 0 else 0.0,
+                    align=float(loss_align.detach().cpu().item()) if w_align > 0 else 0.0,
+                    div=float(loss_div.detach().cpu().item()) if w_div > 0 else 0.0,
+                    path=float(loss_path.detach().cpu().item()) if w_path > 0 else 0.0,
                 )
 
                 iter_time_s = time.perf_counter() - t0
@@ -236,9 +256,10 @@ class FlowMatchingSlotComposerTrainer:
                     scalars={
                         "loss/total": float(total.detach().cpu().item()),
                         "loss/fm": float(loss_fm.detach().cpu().item()),
-                        "loss/people_recon@final": float(people_recon.detach().cpu().item()),
-                        "loss/align_matched@final": float(align.detach().cpu().item()),
-                        "loss/diversity@final": float(div.detach().cpu().item()),
+                        "loss/people_recon@final": float(loss_recon.detach().cpu().item()) if w_recon > 0 else 0.0,
+                        "loss/align_matched@final": float(loss_align.detach().cpu().item()) if w_align > 0 else 0.0,
+                        "loss/diversity@final": float(loss_div.detach().cpu().item()) if w_div > 0 else 0.0,
+                        "loss/path@traj": float(loss_path.detach().cpu().item()) if w_path > 0 else 0.0,
                         "opt/lr": float(self.optim.param_groups[0]["lr"]),
                     },
                     mask=mask,
@@ -254,8 +275,8 @@ class FlowMatchingSlotComposerTrainer:
                     Pys=Pys,
                     mask=mask,
                     z_movie=z_movie,
-                    z_slots_final=sT,
-                    z_slots_traj=None,
+                    z_slots_final=sT.detach(),
+                    z_slots_traj=None if traj is None else traj.detach(),
                 )
 
                 if (step % self.cfg.slot_save_interval) == 0:
