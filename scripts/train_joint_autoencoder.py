@@ -1,3 +1,5 @@
+# scripts/train_joint_autoencoder.py
+
 from __future__ import annotations
 import argparse
 import logging
@@ -16,8 +18,8 @@ from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler, EdgeEpochDataset
-from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 from scripts.autoencoder.run_logger import build_run_logger
+from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 from scripts.autoencoder.fields import (
     TextField,
     MultiCategoryField,
@@ -26,6 +28,7 @@ from scripts.autoencoder.fields import (
     SingleCategoryField,
     NumericDigitCategoryField,
 )
+from scripts.autoencoder.share_policy import SharePolicy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -150,17 +153,30 @@ def build_joint_trainer(
     db_path: Path,
     sampling_mode: str = "epoch",
 ):
-    movie_ae = TitlesAutoencoder(config)
-    people_ae = PeopleAutoencoder(config)
+    fresh_cfg = ProjectConfig(**vars(config))
+    fresh_cfg.use_cache = False
+    fresh_cfg.refresh_cache = True
+
+    movie_ae = TitlesAutoencoder(fresh_cfg)
+    people_ae = PeopleAutoencoder(fresh_cfg)
 
     if warm:
         raise NotImplementedError("Warm start is not implemented yet.")
     else:
         movie_ae.accumulate_stats()
-        movie_ae.finalize_stats()
-        movie_ae.build_autoencoder()
         people_ae.accumulate_stats()
+
+        policy = (
+            SharePolicy()
+            .group("text_all", TextField)
+            .group("year_digits", NumericDigitCategoryField)
+        )
+        policy.apply(movie_ae, people_ae)
+
+        movie_ae.finalize_stats()
         people_ae.finalize_stats()
+
+        movie_ae.build_autoencoder()
         people_ae.build_autoencoder()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

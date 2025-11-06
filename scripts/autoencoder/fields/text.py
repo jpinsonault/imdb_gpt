@@ -1,6 +1,6 @@
 from typing import List, Optional
 import numpy as np
-from scripts.autoencoder.fields.constants import SPECIAL_END, SPECIAL_PAD, SPECIAL_SEP, SPECIAL_START
+from scripts.autoencoder.fields.constants import SPECIAL_END, SPECIAL_PAD, SPECIAL_SEP, SPECIAL_START, SPECIAL_UNK
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,9 +12,9 @@ class TextField(BaseField):
         self,
         name: str,
         max_length: Optional[int] = None,
-        downsample_steps: int = 2,
+        downsample_steps: int = 1,
         base_size: int = 48,
-        num_blocks_per_step: List[int] = [2, 2],
+        num_blocks_per_step: List[int] = [2],
         optional: bool = False,
     ):
         super().__init__(name, optional=optional)
@@ -50,7 +50,7 @@ class TextField(BaseField):
                 self.texts.append(s)
 
     def _finalize_stats(self):
-        special_tokens = [SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
+        special_tokens = [SPECIAL_UNK, SPECIAL_PAD, SPECIAL_START, SPECIAL_END, SPECIAL_SEP]
         self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
         self.tokenizer.train(self.texts if self.texts else [])
 
@@ -84,7 +84,8 @@ class TextField(BaseField):
             self.max_length = eff
         self.max_length = max(1, self.max_length)
 
-        multiple = 2 ** self.downsample_steps
+        effective_steps = 1
+        multiple = 2 ** effective_steps
         if multiple > 1:
             adj = max(multiple, self.max_length)
             rounded = ((adj + multiple - 1) // multiple) * multiple

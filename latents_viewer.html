@@ -1,0 +1,525 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Joint Latents 3D Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+#toolbar { display: flex; gap: 8px; align-items: center; padding: 10px; border-bottom: 1px solid #ddd; flex-wrap: wrap; }
+#plot { width: 100vw; height: calc(100vh - 52px); }
+label { font-size: 14px; }
+input[type="file"] { font-size: 14px; }
+input[type="number"] { width: 120px; }
+button { padding: 6px 10px; }
+small { color: #666; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <input id="file" type="file" accept=".json">
+  <button id="reopen">Reopen</button>
+  <button id="forget">Forget</button>
+  <label>Point size <input id="psize" type="number" step="0.5" min="0.5" value="3"></label>
+  <label>Alpha <input id="alpha" type="number" step="0.05" min="0.05" max="1" value="0.85"></label>
+  <label>Max points <input id="maxpoints" type="number" step="1000" min="1000" value="1000000"></label>
+  <label>Max edges scanned <input id="edgeScan" type="number" step="100000" min="100000" value="2000000"></label>
+  <label>Max edges/node <input id="edgesPerNode" type="number" step="5" min="1" value="25"></label>
+  <label>Max edges total <input id="edgesTotal" type="number" step="10000" min="10000" value="250000"></label>
+  <button id="render">Render</button>
+  <small id="status"></small>
+</div>
+<div id="plot"></div>
+<script>
+let dataPayload = null;
+let edgesIndex = null;
+let updatingLinks = false;
+let hoverQueued = false;
+let lastHoverArgs = null;
+let lastBuilt = { key: null, xs: [], ys: [], zs: [] };
+
+const LS_KEY = "latents3d.settings.v1";
+const DB_NAME = "latents3d-viewer";
+const DB_STORE = "kv";
+const DB_FILE_KEY = "fileHandle";
+
+function safeArr(a) { return Array.isArray(a) ? a : []; }
+function safeNum(n) { return typeof n === "number" && isFinite(n) ? n : 0; }
+function inRange(i, n) { return Number.isInteger(i) && i >= 0 && i < n; }
+
+function stride(n, k) {
+  if (k <= 0) return [];
+  if (k >= n) return Array.from({length: n}, (_, i) => i);
+  const step = Math.ceil(n / k);
+  const out = [];
+  for (let i = 0; i < n && out.length < k; i += step) out.push(i);
+  while (out.length < k && out[out.length - 1] + 1 < n) out.push(out[out.length - 1] + 1);
+  return out;
+}
+
+function remapList(arr, idxs) {
+  const a = safeArr(arr);
+  const out = new Array(idxs.length);
+  for (let i = 0; i < idxs.length; i++) out[i] = a[idxs[i]];
+  return out;
+}
+
+function downsamplePoints(payload, maxPoints) {
+  const nM = safeArr(payload.coords_m).length;
+  const nP = safeArr(payload.coords_p).length;
+  const total = nM + nP;
+  if (total <= maxPoints) return {payload, idxM: null, idxP: null};
+  const keepM = Math.max(0, Math.min(nM, Math.round(maxPoints * (nM / Math.max(1, total)))));
+  const keepP = Math.max(0, Math.min(nP, maxPoints - keepM));
+  const idxM = stride(nM, keepM);
+  const idxP = stride(nP, keepP);
+  const out = {
+    coords_m: remapList(payload.coords_m, idxM),
+    coords_p: remapList(payload.coords_p, idxP),
+    labels_m: remapList(payload.labels_m, idxM),
+    labels_p: remapList(payload.labels_p, idxP),
+    colors_m: remapList(payload.colors_m, idxM),
+    colors_p: remapList(payload.colors_p, idxP),
+    edges: [],
+    meta: Object.assign({}, payload.meta || {}, { n_movies: keepM, n_people: keepP })
+  };
+  return {payload: out, idxM, idxP};
+}
+
+function remapEdges(originalEdges, idxM, idxP, limits) {
+  const maxScan = limits.maxScan;
+  const perNode = limits.perNode;
+  const maxTotal = limits.maxTotal;
+  const mapM = new Map();
+  const mapP = new Map();
+  for (let i = 0; i < idxM.length; i++) mapM.set(idxM[i], i);
+  for (let i = 0; i < idxP.length; i++) mapP.set(idxP[i], i);
+  const perM = new Uint16Array(idxM.length);
+  const perP = new Uint16Array(idxP.length);
+  const out = [];
+  const src = safeArr(originalEdges);
+  const N = Math.min(src.length, maxScan);
+  for (let i = 0; i < N; i++) {
+    const e = src[i];
+    if (!e || e.length < 2) continue;
+    const miNew = mapM.get(e[0]);
+    const piNew = mapP.get(e[1]);
+    if (miNew === undefined || piNew === undefined) continue;
+    if (perM[miNew] >= perNode) continue;
+    if (perP[piNew] >= perNode) continue;
+    out.push([miNew, piNew]);
+    perM[miNew]++; perP[piNew]++;
+    if (out.length >= maxTotal) break;
+  }
+  return out;
+}
+
+function buildEdgeIndex(nM, nP, edges) {
+  const byM = new Array(nM);
+  const byP = new Array(nP);
+  for (let i = 0; i < nM; i++) byM[i] = [];
+  for (let j = 0; j < nP; j++) byP[j] = [];
+  const E = safeArr(edges);
+  for (let k = 0; k < E.length; k++) {
+    const e = E[k];
+    if (!e || e.length < 2) continue;
+    const mi = e[0], pj = e[1];
+    if (inRange(mi, nM) && inRange(pj, nP)) {
+      byM[mi].push(pj);
+      byP[pj].push(mi);
+    }
+  }
+  return { byM, byP };
+}
+
+function attachHover(gd, edges) {
+  const m0 = gd.data && gd.data[0] ? gd.data[0] : {};
+  const p0 = gd.data && gd.data[1] ? gd.data[1] : {};
+  const coords_m = { x: safeArr(m0.x), y: safeArr(m0.y), z: safeArr(m0.z) };
+  const coords_p = { x: safeArr(p0.x), y: safeArr(p0.y), z: safeArr(p0.z) };
+  const nM = coords_m.x.length;
+  const nP = coords_p.x.length;
+  edgesIndex = buildEdgeIndex(nM, nP, edges);
+
+  function buildForMovie(mi) {
+    if (!inRange(mi, nM)) return [[], [], []];
+    const pjList = edgesIndex && edgesIndex.byM ? edgesIndex.byM[mi] : [];
+    if (!pjList || !pjList.length) return [[], [], []];
+    const xs = [], ys = [], zs = [];
+    const x0 = coords_m.x[mi], y0 = coords_m.y[mi], z0 = coords_m.z[mi];
+    for (let t = 0; t < pjList.length; t++) {
+      const pj = pjList[t];
+      if (!inRange(pj, nP)) continue;
+      xs.push(x0, coords_p.x[pj], null);
+      ys.push(y0, coords_p.y[pj], null);
+      zs.push(z0, coords_p.z[pj], null);
+    }
+    return [xs, ys, zs];
+  }
+
+  function buildForPerson(pi) {
+    if (!inRange(pi, nP)) return [[], [], []];
+    const miList = edgesIndex && edgesIndex.byP ? edgesIndex.byP[pi] : [];
+    if (!miList || !miList.length) return [[], [], []];
+    const xs = [], ys = [], zs = [];
+    const x1 = coords_p.x[pi], y1 = coords_p.y[pi], z1 = coords_p.z[pi];
+    for (let t = 0; t < miList.length; t++) {
+      const mi = miList[t];
+      if (!inRange(mi, nM)) continue;
+      xs.push(coords_m.x[mi], x1, null);
+      ys.push(coords_m.y[mi], y1, null);
+      zs.push(coords_m.z[mi], z1, null);
+    }
+    return [xs, ys, zs];
+  }
+
+  function setLinks(xs, ys, zs) {
+    if (updatingLinks) return;
+    if (!gd || !gd.data || gd.data.length < 3) return;
+    updatingLinks = true;
+    try {
+      gd.data[2].x = xs || [];
+      gd.data[2].y = ys || [];
+      gd.data[2].z = zs || [];
+      Plotly.redraw(gd);
+    } finally {
+      updatingLinks = false;
+    }
+  }
+
+  gd.on('plotly_hover', ev => {
+    if (!ev || !ev.points || ev.points.length === 0) return;
+    const p = ev.points[0];
+    const c = safeNum(p.curveNumber);
+    const i = safeNum(p.pointIndex);
+    if (c !== 0 && c !== 1) return;
+    lastHoverArgs = { curve: c, idx: i };
+    if (hoverQueued) return;
+    hoverQueued = true;
+    requestAnimationFrame(() => {
+      hoverQueued = false;
+      if (!lastHoverArgs) return;
+      const cc = lastHoverArgs.curve, ii = lastHoverArgs.idx;
+      const key = cc + ':' + ii;
+      if (lastBuilt.key !== key) {
+        let xs = [], ys = [], zs = [];
+        if (cc === 0) {
+          const seg = buildForMovie(ii);
+          xs = seg[0]; ys = seg[1]; zs = seg[2];
+        } else if (cc === 1) {
+          const seg2 = buildForPerson(ii);
+          xs = seg2[0]; ys = seg2[1]; zs = seg2[2];
+        }
+        lastBuilt = { key, xs, ys, zs };
+      }
+      setLinks(lastBuilt.xs, lastBuilt.ys, lastBuilt.zs);
+    });
+  });
+
+  gd.on('plotly_unhover', () => {
+    lastHoverArgs = null;
+    lastBuilt = { key: null, xs: [], ys: [], zs: [] };
+    setLinks([], [], []);
+  });
+
+  gd.on('plotly_relayout', ev => {
+    const cam = ev && (ev["scene.camera"] || ev["scene.camera.eye"] || ev["scene.camera.up"] || ev["scene.camera.center"]) ? gd.layout.scene.camera : null;
+    if (cam) saveCamera(cam);
+  });
+}
+
+function renderPlot(payload) {
+  const s = readSettings();
+  const ps = parseFloat(s.pointSize || payload.meta?.point_size || 3);
+  const alpha = parseFloat(s.alpha || payload.meta?.alpha || 0.85);
+
+  const cm = safeArr(payload.coords_m);
+  const cp = safeArr(payload.coords_p);
+  const lm = safeArr(payload.labels_m);
+  const lp = safeArr(payload.labels_p);
+  const colm = safeArr(payload.colors_m);
+  const colp = safeArr(payload.colors_p);
+  const edges = safeArr(payload.edges);
+
+  const elev = payload.meta && typeof payload.meta.elev === "number" ? payload.meta.elev : 20;
+  const azim = payload.meta && typeof payload.meta.azim === "number" ? payload.meta.azim : 35;
+  const camSaved = s.camera || null;
+  const cx = Math.cos(azim * Math.PI/180) * Math.cos(elev * Math.PI/180);
+  const cy = Math.sin(azim * Math.PI/180) * Math.cos(elev * Math.PI/180);
+  const cz = Math.sin(elev * Math.PI/180);
+
+  const traceM = {
+    x: cm.map(r => safeArr(r)[0]),
+    y: cm.map(r => safeArr(r)[1]),
+    z: cm.map(r => safeArr(r)[2]),
+    mode: 'markers',
+    type: 'scatter3d',
+    name: 'movies',
+    text: lm,
+    hoverinfo: 'text',
+    marker: { size: ps, opacity: alpha, color: colm },
+    customdata: cm.length ? Array(cm.length).fill(0).map((_, i) => i) : []
+  };
+
+  const traceP = {
+    x: cp.map(r => safeArr(r)[0]),
+    y: cp.map(r => safeArr(r)[1]),
+    z: cp.map(r => safeArr(r)[2]),
+    mode: 'markers',
+    type: 'scatter3d',
+    name: 'people',
+    text: lp,
+    hoverinfo: 'text',
+    marker: { symbol: 'diamond', size: ps, opacity: alpha, color: colp },
+    customdata: cp.length ? Array(cp.length).fill(0).map((_, i) => i) : []
+  };
+
+  const traceLines = {
+    x: [],
+    y: [],
+    z: [],
+    mode: 'lines',
+    type: 'scatter3d',
+    name: 'links',
+    line: { width: 2 },
+    hoverinfo: 'skip',
+    showlegend: false
+  };
+
+  Plotly.purge('plot');
+  const baseCamera = camSaved ? camSaved : {eye:{x:cx,y:cy,z:cz}};
+  Plotly.newPlot('plot', [traceM, traceP, traceLines], {
+    scene: {
+      xaxis: { title: 'PC1' },
+      yaxis: { title: 'PC2' },
+      zaxis: { title: 'PC3' },
+      camera: baseCamera,
+      dragmode: 'orbit'
+    },
+    margin: { l: 0, r: 0, t: 30, b: 0 },
+    legend: { itemsizing: 'constant' },
+    title: 'Joint Latent Space (PCA -> 3D)',
+    uirevision: 'keep'
+  }, {displaylogo: false, responsive: true}).then(gd => {
+    attachHover(gd, edges);
+  });
+}
+
+function getInputs() {
+  return {
+    pointSize: document.getElementById('psize').value,
+    alpha: document.getElementById('alpha').value,
+    maxPoints: document.getElementById('maxpoints').value,
+    edgeScan: document.getElementById('edgeScan').value,
+    edgesPerNode: document.getElementById('edgesPerNode').value,
+    edgesTotal: document.getElementById('edgesTotal').value,
+  };
+}
+
+function applyInputs(s) {
+  const f = (id, val) => { if (val != null && val !== "") document.getElementById(id).value = String(val); };
+  f('psize', s.pointSize);
+  f('alpha', s.alpha);
+  f('maxpoints', s.maxPoints);
+  f('edgeScan', s.edgeScan);
+  f('edgesPerNode', s.edgesPerNode);
+  f('edgesTotal', s.edgesTotal);
+}
+
+function readSettings() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw);
+  } catch { return {}; }
+}
+
+function writeSettings(partial) {
+  const cur = readSettings();
+  const next = Object.assign({}, cur, partial || {});
+  try { localStorage.setItem(LS_KEY, JSON.stringify(next)); } catch {}
+}
+
+function saveCamera(cam) {
+  writeSettings({ camera: cam });
+}
+
+function persistInputs() {
+  writeSettings(getInputs());
+}
+
+function setStatus(txt) {
+  document.getElementById('status').textContent = txt;
+}
+
+function supportsFS() {
+  return !!(window.showOpenFilePicker) && !!window.indexedDB;
+}
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbSet(k, v) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put(v, k);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+function idbGet(k) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readonly");
+    const req = tx.objectStore(DB_STORE).get(k);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function idbDel(k) {
+  return openDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).delete(k);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+async function rememberHandle(handle) {
+  try { await idbSet(DB_FILE_KEY, handle); } catch {}
+  writeSettings({ rememberedFileName: handle && handle.name ? handle.name : null });
+}
+
+async function forgetHandle() {
+  try { await idbDel(DB_FILE_KEY); } catch {}
+  writeSettings({ rememberedFileName: null });
+}
+
+async function readHandle() {
+  try { return await idbGet(DB_FILE_KEY); } catch { return null; }
+}
+
+async function verifyReadPermission(handle) {
+  if (!handle) return false;
+  if (await handle.queryPermission({ mode: 'read' }) === 'granted') return true;
+  if (await handle.requestPermission({ mode: 'read' }) === 'granted') return true;
+  return false;
+}
+
+async function loadFromHandle() {
+  const handle = await readHandle();
+  if (!handle) return false;
+  const ok = await verifyReadPermission(handle);
+  if (!ok) return false;
+  const file = await handle.getFile();
+  const text = await file.text();
+  try {
+    dataPayload = JSON.parse(text);
+    setStatus('Loaded ' + ((safeArr(dataPayload.coords_m).length + safeArr(dataPayload.coords_p).length)) + ' points from "' + (handle.name||'') + '"');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function onFileSelected(f) {
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      dataPayload = JSON.parse(r.result);
+      const n0 = (safeArr(dataPayload.coords_m).length + safeArr(dataPayload.coords_p).length);
+      setStatus('Loaded ' + n0 + ' points' + (f && f.name ? (' from "' + f.name + '"') : ''));
+    } catch {
+      alert('Invalid JSON');
+      dataPayload = null;
+      setStatus('');
+    }
+  };
+  r.readAsText(f);
+}
+
+document.getElementById('file').addEventListener('change', async e => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  onFileSelected(f);
+  if (supportsFS() && f.handle) {
+    await rememberHandle(f.handle);
+  } else if (supportsFS()) {
+    try {
+      const [handle] = await window.showOpenFilePicker({ multiple: false, types: [{ description: "JSON", accept: {'application/json': ['.json']}}]});
+      if (handle) await rememberHandle(handle);
+    } catch {}
+  }
+});
+
+document.getElementById('reopen').addEventListener('click', async () => {
+  if (!supportsFS()) { alert('Reopen requires a browser with the File System Access API.'); return; }
+  const ok = await loadFromHandle();
+  if (!ok) alert('No remembered file or permission denied.');
+});
+
+document.getElementById('forget').addEventListener('click', async () => {
+  await forgetHandle();
+  alert('Forgot remembered file.');
+});
+
+document.getElementById('render').addEventListener('click', () => {
+  if (!dataPayload) { alert('Load a JSON file first.'); return; }
+  persistInputs();
+  const s = readSettings();
+  const cap = parseInt(s.maxPoints || '1000000', 10);
+  const scanCap = parseInt(s.edgeScan || '2000000', 10);
+  const perNode = parseInt(s.edgesPerNode || '25', 10);
+  const maxEdges = parseInt(s.edgesTotal || '250000', 10);
+
+  setStatus('Filtering points ...');
+  const t0 = performance.now();
+  const {payload: ptsOnly, idxM, idxP} = downsamplePoints(dataPayload, cap);
+
+  if (idxM && idxP) {
+    setStatus('Remapping edges ...');
+    const edgesFiltered = remapEdges(
+      dataPayload.edges || [],
+      idxM, idxP,
+      { maxScan: scanCap, perNode: perNode, maxTotal: maxEdges }
+    );
+    ptsOnly.edges = edgesFiltered;
+  } else {
+    ptsOnly.edges = safeArr(dataPayload.edges).slice(0, maxEdges);
+  }
+
+  const n = safeArr(ptsOnly.coords_m).length + safeArr(ptsOnly.coords_p).length;
+  const dt = Math.max(1, Math.round(performance.now() - t0));
+  setStatus('Rendering ' + n + ' points; edges=' + safeArr(ptsOnly.edges).length + ' [' + dt + 'ms]');
+  renderPlot(ptsOnly);
+});
+
+['psize','alpha','maxpoints','edgeScan','edgesPerNode','edgesTotal'].forEach(id => {
+  document.getElementById(id).addEventListener('change', persistInputs);
+  document.getElementById(id).addEventListener('input', persistInputs);
+});
+
+(function boot() {
+  const s = readSettings();
+  applyInputs(s);
+  if (s.rememberedFileName) setStatus('Remembered file: "' + s.rememberedFileName + '"');
+  if (supportsFS()) {
+    loadFromHandle().then(ok => {
+      if (ok) setStatus(document.getElementById('status').textContent + ' (ready)');
+    });
+  }
+})();
+</script>
+</body>
+</html>

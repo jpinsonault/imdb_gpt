@@ -37,36 +37,34 @@ class ProjectConfig:
     weak_edge_boost: float = 0.10
     refresh_batches: int = 1000
 
-    slot_people_count: int = 2
-    slot_learning_rate: float = 1e-3
-    slot_weight_decay: float = 1e-3
-    slot_epochs: int = 10
-    slot_save_interval: int = 1000
-
     principals_table: str = "principals"
 
-    slot_recon_interval: int = 20
-    slot_recon_num_samples: int = 3
-    slot_recon_show_slots: int = 3
-    slot_recon_table_width: int = 60
+    path_siren_people_count: int = 10
+    path_siren_lr: float = 0.001
+    path_siren_weight_decay: float = 0
+    path_siren_epochs: int = 100
+    path_siren_layers: int = 10
+    path_siren_hidden_mult: float = 0.5
+    path_siren_omega0_first: float = 30.0
+    path_siren_omega0_hidden: float = 1.0
+    path_siren_callback_interval: int = 20
+    path_siren_recon_num_samples: int = 2
+    path_siren_table_width: int = 60
+    path_siren_cache_capacity: int = 200000
+    path_siren_save_interval: int = 500
 
-    slot_flow_method: str = "rk4"
-    slot_flow_steps: int = 8
-    slot_flow_t0: float = 0.0
-    slot_flow_t1: float = 1.0
-    slot_flow_noise_scale: float = 1e-3
-    slot_flow_hidden_mult: float = 4.0
-    slot_flow_layers: int = 1
-    slot_flow_fourier_dim: int = 64
-    slot_seed_from_movie: bool = True
+    path_siren_movie_limit: int | None = None
 
-    slot_cond_width: float = 2.0
-    slot_flow_t_samples: int = 4
+    path_siren_loss_w_latent: float = 1.0
+    path_siren_loss_w_title_latent: float = 1.0
+    path_siren_loss_w_title_recon: float = 1.0
+    path_siren_loss_w_latent_path: float = 1.0
+    path_siren_loss_w_straight: float = 0.5
+    path_siren_loss_w_curvature: float = 0.1
 
-    slot_loss_w_recon: float = 0.1
-    slot_loss_w_align: float = 0.1
-    slot_loss_w_div: float = 0.05
-    slot_loss_w_path: float = 0.05
+    path_siren_seed: int = 1337
+
+    path_siren_time_fourier: int = 4
 
 project_config = ProjectConfig()
 
