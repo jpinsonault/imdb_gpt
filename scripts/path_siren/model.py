@@ -1,7 +1,7 @@
 import math
 import torch
 import torch.nn as nn
-from .dyn_linear import DynLinearRowCol
+from .dyn_linear import DynLinearRowCol, _CondMLP
 
 
 class Sine(nn.Module):
@@ -13,58 +13,53 @@ class Sine(nn.Module):
         return torch.sin(self.w0 * x)
 
 
-class SirenLayer(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, w0: float, is_first: bool):
+class CondSirenLayer(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        cond_dim: int,
+        w0: float,
+        is_first: bool,
+        hidden: int,
+        scale: float = 0.1,
+    ):
         super().__init__()
-        self.lin = nn.Linear(in_dim, out_dim)
-        self.act = Sine(w0)
-        self._init(is_first, in_dim)
+        self.in_dim = int(in_dim)
+        self.out_dim = int(out_dim)
+        self.cond_dim = int(cond_dim)
+        self.scale = float(scale)
 
-    def _init(self, is_first: bool, in_dim: int):
+        self.linear = nn.Linear(self.in_dim, self.out_dim)
+        self.beta_in = _CondMLP(self.cond_dim, self.in_dim, hidden)
+        self.beta_out = _CondMLP(self.cond_dim, self.out_dim, hidden)
+        self.act = Sine(w0)
+
+        self._init_weights(is_first, self.in_dim, float(w0))
+
+    def _init_weights(self, is_first: bool, in_dim: int, w0: float):
         with torch.no_grad():
             if is_first:
-                self.lin.weight.uniform_(-1.0 / in_dim, 1.0 / in_dim)
+                self.linear.weight.uniform_(-1.0 / in_dim, 1.0 / in_dim)
             else:
-                b = math.sqrt(6.0 / in_dim) / self.act.w0
-                self.lin.weight.uniform_(-b, b)
-            self.lin.bias.zero_()
+                b = math.sqrt(6.0 / in_dim) / max(w0, 1e-8)
+                self.linear.weight.uniform_(-b, b)
+            self.linear.bias.zero_()
 
-    def forward(self, x):
-        return self.act(self.lin(x))
+    def forward(self, x, cond):
+        # x: [B, L, in_dim]
+        # cond: [B, cond_dim]
+        B, L, _ = x.shape
 
+        gamma_in = torch.tanh(self.beta_in(cond)).unsqueeze(1)
+        x_mod = x * (1.0 + self.scale * gamma_in)
 
-class FiLM(nn.Module):
-    def __init__(self, z_dim: int, hidden: int, num_layers: int, layer_widths: list[int]):
-        super().__init__()
-        self.num_layers = int(num_layers)
-        self.layer_widths = list(layer_widths)
-        self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-        )
-        total = 0
-        for w in self.layer_widths:
-            total += 2 * w
-        self.out = nn.Linear(hidden, total)
-        with torch.no_grad():
-            self.out.weight.zero_()
-            self.out.bias.zero_()
+        y = self.linear(x_mod)
 
-    def forward(self, z):
-        h = self.net(z)
-        o = self.out(h)
-        outs = []
-        idx = 0
-        for w in self.layer_widths:
-            g = o[:, idx:idx + w]
-            b = o[:, idx + w:idx + 2 * w]
-            idx += 2 * w
-            gamma = 1.0 + 0.1 * torch.tanh(g)
-            beta = 0.1 * torch.tanh(b)
-            outs.append((gamma, beta))
-        return outs
+        gamma_out = torch.tanh(self.beta_out(cond)).unsqueeze(1)
+        y = y * (1.0 + self.scale * gamma_out)
+
+        return self.act(y)
 
 
 def _mlp(in_dim: int, out_dim: int, hidden: int | None = None) -> nn.Sequential:
@@ -77,7 +72,15 @@ def _mlp(in_dim: int, out_dim: int, hidden: int | None = None) -> nn.Sequential:
 
 
 class PathSiren(nn.Module):
-    def __init__(self, latent_dim: int, hidden_mult: float, layers: int, w0_first: float, w0_hidden: float):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_mult: float,
+        layers: int,
+        w0_first: float,
+        w0_hidden: float,
+        time_fourier: int = 0,
+    ):
         super().__init__()
         d = int(latent_dim)
         L = int(max(2, layers))
@@ -89,52 +92,79 @@ class PathSiren(nn.Module):
         self.c = max(1, int(base_c * hm))
         self.h = max(1, int(base_h * hm))
         self.layers = L
+        self.t_fourier = max(0, int(time_fourier))
 
         self.proj_in = DynLinearRowCol(d, self.c, cond_dim=d, hidden=self.h)
-        siren_in = 1 + self.c
 
-        self.first = SirenLayer(siren_in, self.h, w0_first, True)
-        self.hiddens = nn.ModuleList([SirenLayer(self.h, self.h, w0_hidden, False) for _ in range(L - 2)])
+        t_feats = 1 + 2 * self.t_fourier
+        siren_in = t_feats + self.c
+
+        self.first = CondSirenLayer(
+            in_dim=siren_in,
+            out_dim=self.h,
+            cond_dim=self.c,
+            w0=float(w0_first),
+            is_first=True,
+            hidden=self.h,
+        )
+
+        self.hiddens = nn.ModuleList(
+            [
+                CondSirenLayer(
+                    in_dim=self.h,
+                    out_dim=self.h,
+                    cond_dim=self.c,
+                    w0=float(w0_hidden),
+                    is_first=False,
+                    hidden=self.h,
+                )
+                for _ in range(L - 2)
+            ]
+        )
+
         self.last = nn.Linear(self.h, d)
-        self.cond = FiLM(z_dim=self.c, hidden=self.h, num_layers=L - 1, layer_widths=[self.h] * (L - 1))
         self.proj_out = DynLinearRowCol(d, d, cond_dim=d, hidden=self.h)
 
         with torch.no_grad():
             self.last.weight.zero_()
             self.last.bias.zero_()
 
-    def _apply_film(self, x, gamma, beta):
-        return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
+    def _time_features(self, t01: torch.Tensor) -> torch.Tensor:
+        if self.t_fourier <= 0:
+            return 2.0 * t01 - 1.0
+        parts = [2.0 * t01 - 1.0]
+        two_pi = 2.0 * math.pi
+        for i in range(self.t_fourier):
+            f = float(2 ** i)
+            ang = two_pi * f * t01
+            parts.append(torch.sin(ang))
+            parts.append(torch.cos(ang))
+        return torch.cat(parts, dim=1)
 
     def forward(self, z_title: torch.Tensor, t_grid: torch.Tensor):
         B, D = z_title.shape
-        L = t_grid.size(1)
+        L = int(t_grid.size(1))
 
-        z_proj = self.proj_in(z_title, z_title)
+        z_full = z_title
+        z_proj = self.proj_in(z_full, z_full)
 
-        t = t_grid.reshape(B * L, 1)
-        t = 2.0 * t - 1.0
+        t01 = t_grid.view(B * L, 1)
+        t_feat = self._time_features(t01).view(B, L, -1)
 
-        zc = z_proj.unsqueeze(1).expand(B, L, self.c).reshape(B * L, self.c)
-        x = torch.cat([t, zc], dim=1)
+        zc = z_proj.unsqueeze(1).expand(B, L, self.c)
+        x0 = torch.cat([t_feat, zc], dim=2)
 
-        mods = self.cond(z_proj)
+        h = self.first(x0, z_proj)
+        for layer in self.hiddens:
+            h = layer(h, z_proj)
 
-        h = self.first(x)
-        g0, b0 = mods[0]
-        h = self._apply_film(h.view(B, L, -1), g0, b0).reshape(B * L, -1)
+        y_last = self.last(h)
+        y_flat = y_last.contiguous().view(B * L, D)
 
-        for i, lay in enumerate(self.hiddens):
-            h = lay(h)
-            gamma, beta = mods[i + 1]
-            h = self._apply_film(h.view(B, L, -1), gamma, beta).reshape(B * L, -1)
+        cond_out = z_full.repeat_interleave(L, dim=0)
+        y_flat = self.proj_out(y_flat, cond_out)
 
-        y = self.last(h).view(B, L, D)
-        y = y.view(B * L, D)
-        cond_flat = z_title.repeat_interleave(L, dim=0)
-        y = self.proj_out(y, cond_flat)
-        y = y.view(B, L, D)
-
+        y = y_flat.view(B, L, D)
         base = z_title.unsqueeze(1).expand(B, L, D)
         z = base + y
         return z

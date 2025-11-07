@@ -71,9 +71,12 @@ class BaseField:
 
     def transform(self, raw_value):
         if raw_value is None:
-            if not self.optional:
-                raise ValueError(f"Field '{self.name}' is not optional, but received None.")
-            return self.get_base_padding_value()
+            if self.optional:
+                return self.get_base_padding_value()
+            try:
+                return self._transform(raw_value)
+            except Exception as exc:
+                raise ValueError(f"Field '{self.name}' is not optional, but received None.") from exc
         return self._transform(raw_value)
 
     def transform_target(self, raw_value):

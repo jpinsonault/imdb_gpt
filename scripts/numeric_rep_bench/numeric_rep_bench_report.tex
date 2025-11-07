@@ -1,0 +1,354 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=black,
+    citecolor=black,
+    pdfauthor={},
+    pdftitle={Numeric Representation Benchmark Report},
+    pdfborder={0 0 0}
+}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.75em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.5em}{}
+
+\newcommand{\RunID}{RUN\_ID}
+\newcommand{\TrainRegime}{medium}
+\newcommand{\PrimaryMetric}{R$^2$ / Accuracy}
+\newcommand{\repname}[1]{\texttt{\detokenize{#1}}}
+
+\begin{document}
+
+\begin{center}
+    {\LARGE Numeric Representation Benchmark}\\[4pt]
+    {\large Scalar vs Digit Encodings}\\[6pt]
+    {\normalsize Run ID: \RunID}
+\end{center}
+
+\vspace{1em}
+
+\section{Overview}
+
+This document summarizes results from the numeric representation benchmark.
+The benchmark evaluates how different encodings of real-valued inputs affect downstream performance on simple supervised tasks, under a controlled model and training protocol.
+
+The focus is the comparison between:
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item scalar encodings with alternative scalings, and
+    \item digit-wise encodings parameterized by base and fractional resolution.
+\end{itemize}
+
+All results in this report are generated automatically from a completed benchmark run.
+
+\section{Benchmark Design}
+
+\subsection{Tasks}
+
+Each task uses low-dimensional real inputs and deterministic targets.
+
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item Addition (\texttt{add}): $y = x_0 + x_1$.
+    \item Multiplication (\texttt{mul}): $y = x_0 \cdot x_1$.
+    \item Sine (\texttt{sin}): $y = \sin(x_0)$.
+    \item Comparison (\texttt{gt}): binary label for $(x_0 > x_1)$.
+    \item Integer parity (\texttt{parity}): parity of an integer input.
+\end{itemize}
+
+Inputs are sampled from predefined numeric regimes (Section~\ref{subsec:regimes}).
+Tasks are chosen to cover linear, mildly nonlinear, periodic, and discrete structure.
+
+\subsection{Numeric Regimes}
+\label{subsec:regimes}
+
+For all tasks except parity, inputs are drawn from one of several scalar ranges:
+
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item \texttt{small}: values in a narrow neighborhood around 0.
+    \item \texttt{medium}: moderate range around 0.
+    \item \texttt{large}: wide range with larger magnitudes.
+    \item \texttt{mixed}: mixture of small and large scales.
+    \item \texttt{near\_zero}: very small-magnitude values.
+\end{itemize}
+
+Unless specified otherwise, training uses the \texttt{medium} regime,
+and evaluation is reported across all regimes to probe extrapolation.
+
+\subsection{Representations}
+
+Each real input coordinate is encoded using one of two families.
+
+\subsubsection{Scalar encodings}
+
+Scalar encodings represent each value as a single float with a fixed transformation:
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item \texttt{scalar\_none}: raw value.
+    \item \texttt{scalar\_standardize}: z-score.
+    \item \texttt{scalar\_minmax}: min-max scaling.
+    \item \texttt{scalar\_log}: $\log(1+x)$ for non-negative ranges.
+\end{itemize}
+
+\subsubsection{Digit encodings}
+
+Digit encodings represent each value as a sequence of discrete symbols:
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item base $b \in \{2,4,5,10,16\}$,
+    \item optional fractional digits,
+    \item optional sign / NaN channels.
+\end{itemize}
+
+Configurations follow the \texttt{digits\_bX\_fY} naming used in code.
+These encodings mirror the \texttt{NumericDigitCategoryField} design used for tabular models.
+
+\section{Experimental Protocol}
+
+\subsection{Model}
+
+For each task--representation pair:
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item Inputs are encoded by the chosen numeric representation.
+    \item Encoded inputs are mapped into a fixed-dimensional vector (``representation layer'').
+    \item A small MLP head predicts task outputs.
+\end{itemize}
+
+The architecture and capacity are held constant across representations.
+Differences in performance are therefore attributed to the encoding.
+
+\subsection{Training Setup}
+
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item Train/val/test sizes and batch size follow the benchmark defaults.
+    \item Optimizer: AdamW with shared hyperparameters across runs.
+    \item Training epochs: fixed for all configurations.
+    \item Multiple seeds per configuration; results are averaged.
+    \item Primary metric:
+        \begin{itemize}[noitemsep]
+            \item regression: R$^2$ on the test split,
+            \item classification: accuracy.
+        \end{itemize}
+\end{itemize}
+
+All runs for this report completed successfully and are tracked via the status file.
+Only finished runs contribute to the aggregates.
+
+\section{Results}
+
+\subsection{Global Comparison}
+
+Figure~\ref{fig:matrix-summary} summarizes average downstream performance across all tasks and representations.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.98\linewidth]{plots/matrix_summary.png}
+    \caption{
+        Average primary metric across tasks and representations.
+        Rows correspond to tasks; columns correspond to representations.
+        Each cell shows the mean over seeds for training on the default regime
+        and evaluating on the corresponding task distribution.
+    }
+    \label{fig:matrix-summary}
+\end{figure}
+
+\subsection{Per-Task Summaries}
+
+For each task, performance is broken down by representation.
+Figures~\ref{fig:add-per-rep}--\ref{fig:parity-per-rep} show per-task bars,
+ordered from best to worst representation.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/add_R2_per_rep.png}
+    \caption{
+        Addition: downstream performance per representation.
+    }
+    \label{fig:add-per-rep}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/mul_R2_per_rep.png}
+    \caption{
+        Multiplication: downstream performance per representation.
+    }
+    \label{fig:mul-per-rep}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/sin_R2_per_rep.png}
+    \caption{
+        Sine: downstream performance per representation.
+    }
+    \label{fig:sin-per-rep}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/gt_accuracy_per_rep.png}
+    \caption{
+        Comparison (x$>$y): accuracy per representation.
+    }
+    \label{fig:gt-per-rep}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.85\linewidth]{plots/parity_accuracy_per_rep.png}
+    \caption{
+        Integer parity: accuracy per representation.
+    }
+    \label{fig:parity-per-rep}
+\end{figure}
+
+\subsection{Scalar vs Digit Encodings}
+
+Figures~\ref{fig:scalar-vs-digits-summary} and~\ref{fig:scalar-vs-digits-regimes}
+present direct comparisons between scalar and digit-based encodings.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/scalar_vs_digits_overall.png}
+    \caption{
+        Overall comparison between scalar and digit encodings.
+        Bars show mean primary metric across tasks for each family.
+    }
+    \label{fig:scalar-vs-digits-summary}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/scalar_vs_digits_by_task.png}
+    \caption{
+        Relative performance of scalar vs digit encodings for each task.
+        Values are normalized per task to highlight preference for one family.
+    }
+    \label{fig:scalar-vs-digits-by-task}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/scalar_vs_digits_by_regime.png}
+    \caption{
+        Regime-wise comparison between scalar and digit encodings.
+        For each regime, the figure reports average primary metric across tasks.
+    }
+    \label{fig:scalar-vs-digits-regimes}
+\end{figure}
+
+\subsection{Regime Generalization Views}
+
+This section focuses on how encodings behave when evaluated on regimes
+different from the training distribution.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/per_rep_regime_heatmap.png}
+    \caption{
+        Heatmap of representation performance across evaluation regimes.
+        Each row is a representation; each column is a regime.
+    }
+    \label{fig:per-rep-regime-heatmap}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.9\linewidth]{plots/per_rep_regime_lines.png}
+    \caption{
+        Line view of regime robustness for selected scalar and digit encodings.
+        Each line corresponds to a representation, showing its metric across regimes.
+    }
+    \label{fig:per-rep-regime-lines}
+\end{figure}
+
+\section{Summary Tables}
+
+\subsection{Primary Metrics by Task and Representation}
+
+Table~\ref{tab:primary-metric} summarizes the main numbers used in plots.
+Values are aggregated over seeds for the primary train regime.
+
+\begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{l l c c}
+        \toprule
+        Task & Representation & Metric & Value \\
+        \midrule
+        % Example rows (safe syntax):
+        % add    & \repname{scalar_standardize} & R$^2$    & 0.9990 \\
+        % add    & \repname{digits_b10_f0}      & R$^2$    & 0.9907 \\
+        % gt     & \repname{digits_b10_f0}      & accuracy & 0.9850 \\
+        \bottomrule
+    \end{tabular}
+    \caption{
+        Primary metric per (task, representation) for the main training regime.
+        Use \texttt{\textbackslash repname\{...\}} for any identifier with underscores.
+    }
+    \label{tab:primary-metric}
+\end{table}
+
+\subsection{Family-Level Aggregates}
+
+\begin{table}[h]
+    \centering
+    \small
+    \begin{tabular}{l c c}
+        \toprule
+        Family & Mean primary metric & Std across tasks \\
+        \midrule
+        % scalar & 0.9980 & 0.0015 \\
+        % digits & 0.9920 & 0.0030 \\
+        \bottomrule
+    \end{tabular}
+    \caption{
+        Aggregated comparison of scalar vs digit encoding families.
+    }
+    \label{tab:family-aggregates}
+\end{table}
+
+\section{Implementation Notes}
+
+\subsection{Code and Artifacts}
+
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item Benchmark implementation: \texttt{scripts/numeric\_rep\_bench/}.
+    \item Experiment runner: \texttt{run\_numeric\_rep\_bench.py}.
+    \item Status tracking and results: \texttt{status.json}, per-run samples, and logs.
+    \item Plots directory: \texttt{runs/numeric\_rep\_bench/\RunID/plots/}.
+\end{itemize}
+
+The report is generated after all configured experiments finish.
+All numbers and figures are derived directly from recorded metrics.
+
+\subsection{Reproducibility}
+
+\begin{itemize}[noitemsep,topsep=2pt]
+    \item Fixed random seeds per run and per configuration.
+    \item Shared optimizer, epochs, and model capacity across representations.
+    \item Consistent samplers for each regime.
+\end{itemize}
+
+\section{Context}
+
+The benchmark is motivated by representation choices in tabular and relational models,
+including autoencoders over structured datasets.
+The design is standalone and applicable beyond a specific dataset.
+
+\end{document}

@@ -1,3 +1,5 @@
+# config.py
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -7,12 +9,12 @@ class ProjectConfig:
     db_path: str = "data/imdb.db"
     model_dir: str = "models"
 
-    batch_size: int = 256
+    batch_size: int = 512
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
-    epochs: int = 10
+    epochs: int = 3
 
-    latent_dim: int = 512
+    latent_dim: int = 64
 
     save_interval: int = 500
     flush_interval: int = 250
@@ -22,6 +24,9 @@ class ProjectConfig:
 
     nce_temp: float = 0.07
     nce_weight: float = 1.0
+
+    # encourages latents to carry "title vs person" info in a linearly separable way
+    latent_type_loss_weight: float = 0.1
 
     movie_limit: int = 100000000000
 
@@ -39,12 +44,17 @@ class ProjectConfig:
 
     principals_table: str = "principals"
 
+    lr_schedule: str = "cosine"
+    lr_warmup_steps: int = 0
+    lr_warmup_ratio: float = 0.05
+    lr_min_factor: float = 0.05
+
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
     path_siren_weight_decay: float = 0
     path_siren_epochs: int = 100
     path_siren_layers: int = 10
-    path_siren_hidden_mult: float = 0.5
+    path_siren_hidden_mult: float = 1.0
     path_siren_omega0_first: float = 30.0
     path_siren_omega0_hidden: float = 1.0
     path_siren_callback_interval: int = 20

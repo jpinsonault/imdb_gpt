@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 
 from config import ProjectConfig
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
+from scripts.autoencoder.print_model import print_model_summary
 from scripts.path_siren.model import PathSiren
 from scripts.path_siren.dataset import TitlePathIterable, collate_batch
 from scripts.path_siren.recon_logger import PathSirenReconstructionLogger
@@ -61,6 +62,11 @@ class PathSirenTrainer:
             pin_memory=False,
             persistent_workers=False,
         )
+
+        Mx, My, Zt, Z_lat_tgts, Yp_tgts, t_grid, time_mask = next(iter(self.loader))
+        Zt = Zt.to(self.device)
+        t_grid = t_grid.to(self.device)
+        print_model_summary(self.model, [Zt, t_grid])
 
         self.writer = TensorBoardPerBatchLogger(
             log_dir=str(self.cfg.tensorboard_dir),

@@ -11,6 +11,9 @@ class _CondMLP(nn.Module):
             nn.GELU(),
             nn.Linear(h, out_dim),
         )
+        with torch.no_grad():
+            self.net[-1].weight.zero_()
+            self.net[-1].bias.zero_()
 
     def forward(self, z):
         return self.net(z)

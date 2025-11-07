@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import logging
+import math
 import signal
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from scripts.autoencoder.joint_edge_sampler import make_edge_sampler, EdgeEpochDataset
+from scripts.autoencoder.print_model import print_model_summary
 from scripts.autoencoder.run_logger import build_run_logger
 from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger, RowReconstructionLogger
 from scripts.autoencoder.fields import (
@@ -47,6 +49,65 @@ def info_nce_components(movie_z: torch.Tensor, person_z: torch.Tensor, temperatu
     nce_per = 0.5 * (row_ce + col_ce)
     nce_mean = nce_per.mean()
     return nce_mean, nce_per
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int | None,
+    schedule: str,
+    warmup_steps: int,
+    warmup_ratio: float,
+    min_factor: float,
+):
+    if total_steps is None:
+        return None
+
+    total_steps = max(1, int(total_steps))
+    schedule = (schedule or "").lower()
+    if schedule not in ("cosine", "linear"):
+        return None
+
+    base_warmup = max(0, int(warmup_steps))
+    ratio = float(warmup_ratio)
+    if ratio > 0.0:
+        frac_warmup = int(total_steps * ratio)
+    else:
+        frac_warmup = 0
+
+    w_steps = max(base_warmup, frac_warmup)
+    w_steps = min(w_steps, total_steps - 1) if total_steps > 1 else 0
+    min_factor = float(min_factor)
+
+    def cosine_lambda(step: int) -> float:
+        s = int(step)
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
+        t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
+        decay = 0.5 * (1.0 + math.cos(math.pi * t))
+        return min_factor + (1.0 - min_factor) * decay
+
+    def linear_lambda(step: int) -> float:
+        s = int(step)
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
+        t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
+        return max(min_factor, 1.0 - (1.0 - min_factor) * t)
+
+    if schedule == "cosine":
+        lr_lambda = cosine_lambda
+    else:
+        lr_lambda = linear_lambda
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 class _EdgeIterable(IterableDataset):
@@ -293,15 +354,43 @@ def main(config: ProjectConfig):
     db_path = data_dir / "imdb.db"
 
     joint_model, loader, logger, mov_ae, per_ae, total_edges, sampling_mode = build_joint_trainer(
-        config, args.warm, db_path, sampling_mode=args.sampling_mode
+        config=config,
+        warm=args.warm,
+        db_path=db_path,
+        sampling_mode=args.sampling_mode,
     )
 
+    M_sample, P_sample, _ = next(iter(loader))
+    M_sample = [m.to(joint_model.movie_ae.device) for m in M_sample]
+    P_sample = [p.to(joint_model.person_ae.device) for p in P_sample]
+    print_model_summary(joint_model, [M_sample, P_sample])
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     opt = torch.optim.AdamW(
         joint_model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+
+    if sampling_mode == "epoch":
+        steps_per_epoch = (total_edges + config.batch_size - 1) // config.batch_size
+        total_steps = int(config.epochs) * int(max(1, steps_per_epoch))
+    else:
+        if config.max_training_steps is not None:
+            total_steps = int(config.max_training_steps)
+        else:
+            total_steps = None
+
+    sched = make_lr_scheduler(
+        optimizer=opt,
+        total_steps=total_steps,
+        schedule=config.lr_schedule,
+        warmup_steps=config.lr_warmup_steps,
+        warmup_ratio=config.lr_warmup_ratio,
+        min_factor=config.lr_min_factor,
+    )
+
     temperature = config.nce_temp
     nce_weight = config.nce_weight
     save_interval = config.save_interval
@@ -344,17 +433,26 @@ def main(config: ProjectConfig):
             pbar = tqdm(loader, unit="batch", dynamic_ncols=True)
             pbar.set_description(f"epoch {epoch+1}/{epochs}")
             for M, P, eids in pbar:
-                t_fetch0 = time.perf_counter()
                 M = [m.to(device, non_blocking=True) for m in M]
                 P = [p.to(device, non_blocking=True) for p in P]
                 eids = eids.to(device)
-                _ = time.perf_counter() - t_fetch0
 
-                t_step0 = time.perf_counter()
                 total_val, rec_val, nce_val, batch_min, batch_max, field_losses_movie, field_losses_person = _train_step(
-                    joint_model, M, P, eids, mov_ae, per_ae, opt, logger, temperature, nce_weight, device
+                    joint_model=joint_model,
+                    M=M,
+                    P=P,
+                    eids=eids,
+                    mov_ae=mov_ae,
+                    per_ae=per_ae,
+                    opt=opt,
+                    logger=logger,
+                    temperature=temperature,
+                    nce_weight=nce_weight,
+                    device=device,
                 )
-                _ = time.perf_counter() - t_step0
+
+                if sched is not None:
+                    sched.step()
 
                 run_logger.add_scalars(total_val, rec_val, nce_val, 0.0, opt)
                 run_logger.add_field_losses("loss/movie", field_losses_movie)
@@ -364,6 +462,7 @@ def main(config: ProjectConfig):
 
                 edges_seen += eids.size(0)
                 global_step += 1
+
                 pbar.set_postfix(
                     edges=f"{min(edges_seen, total_edges)}/{total_edges}",
                     loss=f"{total_val:.4f}",
@@ -371,14 +470,15 @@ def main(config: ProjectConfig):
                     nce=f"{nce_val:.4f}",
                     min=f"{batch_min:.4f}",
                     max=f"{batch_max:.4f}",
+                    lr=f"{opt.param_groups[0]['lr']:.2e}",
                 )
 
                 JointReconstructionLogger.on_batch_end(joint_recon, global_step - 1)
 
-                if (global_step) % flush_interval == 0:
+                if (global_step % flush_interval) == 0:
                     logger.flush()
 
-                if (global_step) % save_interval == 0:
+                if (global_step % save_interval) == 0:
                     mov_ae.save_model()
                     per_ae.save_model()
                     logging.info(f"checkpoint saved at step {global_step}")
@@ -392,29 +492,43 @@ def main(config: ProjectConfig):
         data_iter = iter(loader)
         with tqdm(unit="batch", dynamic_ncols=True) as pbar:
             while True:
-                t_fetch0 = time.perf_counter()
-                M, P, eids = next(data_iter)
-                _ = time.perf_counter() - t_fetch0
+                try:
+                    M, P, eids = next(data_iter)
+                except StopIteration:
+                    break
 
                 M = [m.to(device, non_blocking=True) for m in M]
                 P = [p.to(device, non_blocking=True) for p in P]
                 eids = eids.to(device)
 
-                t_step0 = time.perf_counter()
                 total_val, rec_val, nce_val, batch_min, batch_max, field_losses_movie, field_losses_person = _train_step(
-                    joint_model, M, P, eids, mov_ae, per_ae, opt, logger, temperature, nce_weight, device
+                    joint_model=joint_model,
+                    M=M,
+                    P=P,
+                    eids=eids,
+                    mov_ae=mov_ae,
+                    per_ae=per_ae,
+                    opt=opt,
+                    logger=logger,
+                    temperature=temperature,
+                    nce_weight=nce_weight,
+                    device=device,
                 )
-                iter_time = (time.perf_counter() - t_fetch0) + (time.perf_counter() - t_step0)
 
-                run_logger.add_scalars(total_val, rec_val, nce_val, iter_time, opt)
+                if sched is not None:
+                    sched.step()
+
+                run_logger.add_scalars(total_val, rec_val, nce_val, 0.0, opt)
                 run_logger.add_field_losses("loss/movie", field_losses_movie)
                 run_logger.add_field_losses("loss/person", field_losses_person)
                 run_logger.add_extremes(batch_min, batch_max)
                 run_logger.tick(total_val, rec_val, nce_val)
 
                 edges_seen += batch_size
+                global_step += 1
+
                 pbar.update(1)
-                pbar.set_description(f"batches {global_step + 1}")
+                pbar.set_description(f"batches {global_step}")
                 pbar.set_postfix(
                     edges=f"{edges_seen}",
                     loss=f"{total_val:.4f}",
@@ -422,19 +536,19 @@ def main(config: ProjectConfig):
                     nce=f"{nce_val:.4f}",
                     min=f"{batch_min:.4f}",
                     max=f"{batch_max:.4f}",
+                    lr=f"{opt.param_groups[0]['lr']:.2e}",
                 )
 
-                JointReconstructionLogger.on_batch_end(joint_recon, global_step)
+                JointReconstructionLogger.on_batch_end(joint_recon, global_step - 1)
 
-                if (global_step + 1) % flush_interval == 0:
+                if (global_step % flush_interval) == 0:
                     logger.flush()
 
-                if (global_step + 1) % save_interval == 0:
+                if (global_step % save_interval) == 0:
                     mov_ae.save_model()
                     per_ae.save_model()
-                    logging.info(f"checkpoint saved at step {global_step+1}")
+                    logging.info(f"checkpoint saved at step {global_step}")
 
-                global_step += 1
                 if stop_flag["stop"]:
                     break
 
