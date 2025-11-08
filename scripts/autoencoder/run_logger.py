@@ -35,7 +35,7 @@ class RunLogger:
         self.writer = _TBWriter(log_dir=self.run_dir) if self.enabled else None
         self.step = 0
         self.log_every = int(config.log_interval)
-        self.batch_size = config.batch_size
+        self.batch_size = int(config.batch_size)
         self.last_log_t = time.perf_counter()
         if self.writer:
             self._write_config(config)
@@ -43,6 +43,7 @@ class RunLogger:
 
     def _write_config(self, config):
         from dataclasses import is_dataclass, asdict
+
         if isinstance(config, dict):
             node = config
         elif hasattr(config, "to_dict"):
@@ -51,14 +52,17 @@ class RunLogger:
             node = asdict(config)
         else:
             node = dict(vars(config))
+
         txt = json.dumps(node, indent=2, sort_keys=True)
         self.writer.add_text("config/json", f"<pre>{html.escape(txt)}</pre>", 0)
+
         if self.run_dir:
             try:
                 with open(os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8") as f:
                     f.write(txt)
             except Exception:
                 pass
+
         flat = {}
         stack = [("", node)]
         while stack:
@@ -69,6 +73,7 @@ class RunLogger:
                     stack.append((key, v))
             else:
                 flat[prefix] = cur
+
         nums = {k: float(v) for k, v in flat.items() if isinstance(v, (int, float))}
         try:
             self.writer.add_hparams(nums, {})
@@ -85,17 +90,26 @@ class RunLogger:
                 pass
         self.writer.add_text("env/hardware", "\n".join(lines), 0)
 
-    def add_scalars(self, total: float, rec: float, nce: float, iter_time: float, opt):
+    def add_scalars(
+        self,
+        total: float,
+        rec: float,
+        nce: float,
+        type_cls: float,
+        iter_time: float,
+        opt,
+    ):
         if not self.writer:
             return
         s = self.step
         self.writer.add_scalar("loss/total", float(total), s)
         self.writer.add_scalar("loss/reconstruction", float(rec), s)
         self.writer.add_scalar("loss/nce", float(nce), s)
+        self.writer.add_scalar("loss/type_cls", float(type_cls), s)
         self.writer.add_scalar("time/iter_sec", float(iter_time), s)
         try:
             for i, g in enumerate(opt.param_groups):
-                self.writer.add_scalar(f"lr/group_{i}", float(g["lr"]), s)
+                self.writer.add_scalar(f"lr/group_{i}", float(g.get("lr", 0.0)), s)
         except Exception:
             pass
 
@@ -113,7 +127,14 @@ class RunLogger:
         self.writer.add_scalar("loss/batch_min", float(batch_min), s)
         self.writer.add_scalar("loss/batch_max", float(batch_max), s)
 
-    def tick(self, total: float | None = None, rec: float | None = None, nce: float | None = None):
+    def tick(
+        self,
+        total: float | None = None,
+        rec: float | None = None,
+        nce: float | None = None,
+        type_cls: float | None = None,
+        iter_time: float | None = None,
+    ):
         self.step += 1
         if self.step % self.log_every != 0:
             return

@@ -20,4 +20,6 @@ dependencies = [
     "matplotlib>=3.10.6",
     "plotly>=6.3.1",
     "scikit-learn>=1.7.2",
+    "mlx-lm>=0.28.3",
+    "huggingface-hub>=0.34.1",
 ]

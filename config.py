@@ -1,7 +1,6 @@
-# config.py
-
 from dataclasses import dataclass
 from pathlib import Path
+
 
 @dataclass
 class ProjectConfig:
@@ -12,7 +11,7 @@ class ProjectConfig:
     batch_size: int = 512
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
-    epochs: int = 3
+    epochs: int = 4
 
     latent_dim: int = 64
 
@@ -25,7 +24,6 @@ class ProjectConfig:
     nce_temp: float = 0.07
     nce_weight: float = 1.0
 
-    # encourages latents to carry "title vs person" info in a linearly separable way
     latent_type_loss_weight: float = 0.1
 
     movie_limit: int = 100000000000
@@ -34,7 +32,7 @@ class ProjectConfig:
     prefetch_factor: int = 0
     max_training_steps: int | None = None
 
-    use_cache: bool = True
+    use_cache: bool = False
     refresh_cache: bool = False
 
     compile_trunk: bool = False
@@ -54,7 +52,7 @@ class ProjectConfig:
     path_siren_weight_decay: float = 0
     path_siren_epochs: int = 100
     path_siren_layers: int = 10
-    path_siren_hidden_mult: float = 1.0
+    path_siren_hidden_mult: float = 4.0
     path_siren_omega0_first: float = 30.0
     path_siren_omega0_hidden: float = 1.0
     path_siren_callback_interval: int = 20
@@ -76,9 +74,26 @@ class ProjectConfig:
 
     path_siren_time_fourier: int = 4
 
+    image_ae_data_dir: str = "data/image_autoencoder"
+    image_ae_runs_dir: str = "runs/image_autoencoder"
+    image_ae_image_size: int = 128
+    image_ae_in_channels: int = 3
+    image_ae_base_channels: int = 32
+    image_ae_latent_dim: int = 128
+    image_ae_batch_size: int = 64
+    image_ae_learning_rate: float = 1e-3
+    image_ae_epochs: int = 50
+    image_ae_num_workers: int = 4
+    image_ae_recon_every: int = 1
+    image_ae_max_recon_samples: int = 8
+
+
 project_config = ProjectConfig()
+
 
 def ensure_dirs(cfg: ProjectConfig):
     Path(cfg.model_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.tensorboard_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.image_ae_data_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.image_ae_runs_dir).mkdir(parents=True, exist_ok=True)

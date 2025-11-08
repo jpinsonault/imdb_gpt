@@ -1,96 +1,117 @@
+# scripts/autoencoder/ae_loader.py
+
+import logging
 from pathlib import Path
+
 import torch
-from config import ProjectConfig
+
+from config import ProjectConfig, project_config
 from .imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+from .fields import TextField, NumericDigitCategoryField
+from .share_policy import SharePolicy
+from scripts.train_joint_autoencoder import JointAutoencoder
 
-def _infer_latent_dim_from_state_dict(sd: dict) -> int:
-    w = sd.get("field_embed")
-    if isinstance(w, torch.Tensor) and w.dim() == 2:
-        return int(w.size(1))
-    for k, v in sd.items():
-        if k.endswith("field_embed") and isinstance(v, torch.Tensor) and v.dim() == 2:
-            return int(v.size(1))
-    raise RuntimeError("could not infer latent_dim from state_dict")
 
-def load_autoencoders(
-    config: ProjectConfig,
-    warm_start: bool,
-    freeze_loaded: bool,
-) -> tuple[TitlesAutoencoder, PeopleAutoencoder]:
-    mov = TitlesAutoencoder(config)
-    per = PeopleAutoencoder(config)
-    mov.accumulate_stats()
-    mov.finalize_stats()
-    per.accumulate_stats()
-    per.finalize_stats()
-    mov.build_autoencoder()
-    per.build_autoencoder()
+class AutoencoderLoadError(RuntimeError):
+    pass
 
-    if not warm_start:
-        return mov, per
 
-    model_dir = Path(config.model_dir)
-    me = model_dir / "TitlesAutoencoder_encoder.pt"
-    md = model_dir / "TitlesAutoencoder_decoder.pt"
-    pe = model_dir / "PeopleAutoencoder_encoder.pt"
-    pd = model_dir / "PeopleAutoencoder_decoder.pt"
+def _build_joint_style_autoencoders(cfg: ProjectConfig):
+    """
+    Rebuild TitlesAutoencoder & PeopleAutoencoder *exactly* in the way
+    train_joint_autoencoder.py does before constructing JointAutoencoder:
 
-    if not (me.exists() and md.exists() and pe.exists() and pd.exists()):
-        return mov, per
+        - fresh config
+        - accumulate_stats() on both
+        - apply SharePolicy (text + year digits)
+        - finalize_stats() on both
+        - build_autoencoder() on both
+    """
+    fresh_cfg = ProjectConfig(**vars(cfg))
+    # We want a clean recompute; ignore any legacy caches.
+    fresh_cfg.use_cache = False
+    fresh_cfg.refresh_cache = True
 
-    me_sd = torch.load(me, map_location="cpu")
-    pe_sd = torch.load(pe, map_location="cpu")
-    mov_dim = _infer_latent_dim_from_state_dict(me_sd)
-    per_dim = _infer_latent_dim_from_state_dict(pe_sd)
-    if mov_dim != per_dim:
-        raise RuntimeError(f"latent_dim mismatch between checkpoints: movie={mov_dim} people={per_dim}")
+    mov_ae = TitlesAutoencoder(fresh_cfg)
+    per_ae = PeopleAutoencoder(fresh_cfg)
 
-    config.latent_dim = int(mov_dim)
+    # Same order as build_joint_trainer
+    mov_ae.accumulate_stats()
+    per_ae.accumulate_stats()
 
-    mov = TitlesAutoencoder(config)
-    per = PeopleAutoencoder(config)
-    mov.accumulate_stats()
-    mov.finalize_stats()
-    per.accumulate_stats()
-    per.finalize_stats()
-    mov.build_autoencoder()
-    per.build_autoencoder()
-
-    mov.encoder.load_state_dict(me_sd, strict=True)
-    mov.decoder.load_state_dict(torch.load(md, map_location="cpu"), strict=True)
-    per.encoder.load_state_dict(pe_sd, strict=True)
-    per.decoder.load_state_dict(torch.load(pd, map_location="cpu"), strict=True)
-
-    if freeze_loaded:
-        for p in mov.encoder.parameters():
-            p.requires_grad = False
-        for p in mov.decoder.parameters():
-            p.requires_grad = False
-        for p in per.encoder.parameters():
-            p.requires_grad = False
-        for p in per.decoder.parameters():
-            p.requires_grad = False
-
-    return mov, per
-
-def _load_frozen_autoencoders(
-    config: ProjectConfig,
-) -> tuple[TitlesAutoencoder, PeopleAutoencoder]:
-    mov, per = load_autoencoders(
-        config=config,
-        warm_start=True,
-        freeze_loaded=True,
+    policy = (
+        SharePolicy()
+        .group("text_all", TextField)
+        .group("year_digits", NumericDigitCategoryField)
     )
-    for p in mov.encoder.parameters():
-        p.requires_grad = False
-    for p in mov.decoder.parameters():
-        p.requires_grad = False
-    for p in per.encoder.parameters():
-        p.requires_grad = False
-    for p in per.decoder.parameters():
-        p.requires_grad = False
-    mov.encoder.eval()
-    mov.decoder.eval()
-    per.encoder.eval()
-    per.decoder.eval()
-    return mov, per
+    policy.apply(mov_ae, per_ae)
+
+    mov_ae.finalize_stats()
+    per_ae.finalize_stats()
+
+    mov_ae.build_autoencoder()
+    per_ae.build_autoencoder()
+
+    return mov_ae, per_ae
+
+
+def _freeze_autoencoder(ae, device: torch.device):
+    ae.encoder.to(device).eval()
+    ae.decoder.to(device).eval()
+    for p in ae.encoder.parameters():
+        p.requires_grad_(False)
+    for p in ae.decoder.parameters():
+        p.requires_grad_(False)
+
+
+def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
+    """
+    Load joint-trained encoders/decoders for use by PathSiren.
+
+    Assumptions:
+      - JointMoviePersonAE_final.pt was produced by scripts.train_joint_autoencoder
+        using the same ProjectConfig (including SharePolicy).
+      - We do NOT trust any standalone per-table autoencoder checkpoints or caches.
+    """
+    if cfg is None:
+        cfg = project_config
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt_path = Path(cfg.model_dir) / "JointMoviePersonAE_final.pt"
+    if not ckpt_path.exists():
+        raise AutoencoderLoadError(
+            f"[path-siren] joint checkpoint not found at {ckpt_path}. "
+            f"Run scripts.train_joint_autoencoder first."
+        )
+
+    # Rebuild AEs in the exact "joint-training" style
+    try:
+        mov_ae, per_ae = _build_joint_style_autoencoders(cfg)
+    except Exception as exc:
+        raise AutoencoderLoadError(
+            f"[path-siren] failed to rebuild joint-style autoencoders: {exc}"
+        ) from exc
+
+    # Wrap in JointAutoencoder skeleton and load weights
+    joint = JointAutoencoder(mov_ae, per_ae)
+    try:
+        state = torch.load(ckpt_path, map_location=device)
+        joint.load_state_dict(state, strict=True)
+    except Exception as exc:
+        raise AutoencoderLoadError(
+            f"[path-siren] failed to load joint weights from {ckpt_path}: {exc}"
+        ) from exc
+
+    # After this, mov_ae.encoder / per_ae.encoder are TypedEncoders that
+    # output post-FiLM latents; decoders match; everything is consistent.
+    _freeze_autoencoder(mov_ae, device)
+    _freeze_autoencoder(per_ae, device)
+
+    logging.info(
+        "[path-siren] loaded frozen joint autoencoders from %s on %s",
+        ckpt_path,
+        device,
+    )
+
+    return mov_ae, per_ae

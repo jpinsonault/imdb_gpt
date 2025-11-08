@@ -1,3 +1,5 @@
+# scripts/path_siren/model.py
+
 import math
 import torch
 import torch.nn as nn
@@ -47,9 +49,7 @@ class CondSirenLayer(nn.Module):
             self.linear.bias.zero_()
 
     def forward(self, x, cond):
-        # x: [B, L, in_dim]
-        # cond: [B, cond_dim]
-        B, L, _ = x.shape
+        b, l, _ = x.shape
 
         gamma_in = torch.tanh(self.beta_in(cond)).unsqueeze(1)
         x_mod = x * (1.0 + self.scale * gamma_in)
@@ -60,15 +60,6 @@ class CondSirenLayer(nn.Module):
         y = y * (1.0 + self.scale * gamma_out)
 
         return self.act(y)
-
-
-def _mlp(in_dim: int, out_dim: int, hidden: int | None = None) -> nn.Sequential:
-    h = hidden if hidden is not None else max(in_dim, out_dim)
-    return nn.Sequential(
-        nn.Linear(in_dim, h),
-        nn.GELU(),
-        nn.Linear(h, out_dim),
-    )
 
 
 class PathSiren(nn.Module):
@@ -82,16 +73,18 @@ class PathSiren(nn.Module):
         time_fourier: int = 0,
     ):
         super().__init__()
+
         d = int(latent_dim)
-        L = int(max(2, layers))
+        l = int(max(2, layers))
         hm = float(hidden_mult)
 
+        trunk = max(1, int(d * hm))
+        cond = max(1, int(d * hm))
+
         self.d = d
-        base_c = max(1, d // 4)
-        base_h = max(1, d // 2)
-        self.c = max(1, int(base_c * hm))
-        self.h = max(1, int(base_h * hm))
-        self.layers = L
+        self.c = cond
+        self.h = trunk
+        self.layers = l
         self.t_fourier = max(0, int(time_fourier))
 
         self.proj_in = DynLinearRowCol(d, self.c, cond_dim=d, hidden=self.h)
@@ -118,7 +111,7 @@ class PathSiren(nn.Module):
                     is_first=False,
                     hidden=self.h,
                 )
-                for _ in range(L - 2)
+                for _ in range(l - 2)
             ]
         )
 
@@ -142,16 +135,16 @@ class PathSiren(nn.Module):
         return torch.cat(parts, dim=1)
 
     def forward(self, z_title: torch.Tensor, t_grid: torch.Tensor):
-        B, D = z_title.shape
-        L = int(t_grid.size(1))
+        b, d = z_title.shape
+        l = int(t_grid.size(1))
 
         z_full = z_title
         z_proj = self.proj_in(z_full, z_full)
 
-        t01 = t_grid.view(B * L, 1)
-        t_feat = self._time_features(t01).view(B, L, -1)
+        t01 = t_grid.view(b * l, 1)
+        t_feat = self._time_features(t01).view(b, l, -1)
 
-        zc = z_proj.unsqueeze(1).expand(B, L, self.c)
+        zc = z_proj.unsqueeze(1).expand(b, l, self.c)
         x0 = torch.cat([t_feat, zc], dim=2)
 
         h = self.first(x0, z_proj)
@@ -159,12 +152,12 @@ class PathSiren(nn.Module):
             h = layer(h, z_proj)
 
         y_last = self.last(h)
-        y_flat = y_last.contiguous().view(B * L, D)
+        y_flat = y_last.contiguous().view(b * l, d)
 
-        cond_out = z_full.repeat_interleave(L, dim=0)
+        cond_out = z_full.repeat_interleave(l, dim=0)
         y_flat = self.proj_out(y_flat, cond_out)
 
-        y = y_flat.view(B, L, D)
-        base = z_title.unsqueeze(1).expand(B, L, D)
+        y = y_flat.view(b, l, d)
+        base = z_title.unsqueeze(1).expand(b, l, d)
         z = base + y
         return z
