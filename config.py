@@ -80,11 +80,10 @@ class ProjectConfig:
     image_ae_in_channels: int = 3
     image_ae_base_channels: int = 32
     image_ae_latent_dim: int = 128
-    image_ae_batch_size: int = 64
+    image_ae_batch_size: int = 1
     image_ae_learning_rate: float = 1e-3
-    image_ae_epochs: int = 50
-    image_ae_num_workers: int = 4
-    image_ae_recon_every: int = 1
+    image_ae_epochs: int = 100
+    image_ae_recon_every: int = 2
     image_ae_max_recon_samples: int = 8
 
 
