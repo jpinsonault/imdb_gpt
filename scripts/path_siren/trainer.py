@@ -20,19 +20,28 @@ class PathSirenTrainer:
     def __init__(self, config: ProjectConfig):
         self.cfg = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        log = logging.getLogger("path_siren")
 
-        try:
-            self.mov_ae, self.per_ae = _load_frozen_autoencoders(self.cfg)
-        except AutoencoderLoadError as exc:
-            raise SystemExit(
-                f"[path-siren] failed to load frozen joint autoencoders: {exc}"
-            ) from exc
-
+        # --- Load frozen autoencoders ---
+        self.mov_ae, self.per_ae = _load_frozen_autoencoders(self.cfg)
         self.mov_ae.encoder.to(self.device).eval()
         self.mov_ae.decoder.to(self.device).eval()
         self.per_ae.encoder.to(self.device).eval()
         self.per_ae.decoder.to(self.device).eval()
 
+        # --- Path-Siren cache path (MUST match precompute script) ---
+        cache_file = Path(self.cfg.data_dir) / "path_siren_cache.pt"
+
+        if not cache_file.exists():
+            # Being explicit here avoids silently hammering the DB again.
+            raise FileNotFoundError(
+                f"[path-siren] precomputed cache not found at {cache_file}.\n"
+                f"Run `python -m scripts.precompute_path_siren_cache` first."
+            )
+
+        log.info(f"[path-siren] using precomputed cache at {cache_file}")
+
+        # --- Model ---
         self.model = PathSiren(
             latent_dim=self.cfg.latent_dim,
             hidden_mult=float(self.cfg.path_siren_hidden_mult),
@@ -42,12 +51,16 @@ class PathSirenTrainer:
             time_fourier=int(self.cfg.path_siren_time_fourier),
         ).to(self.device)
 
+        # --- Optimizer ---
         self.optim = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.cfg.path_siren_lr),
             weight_decay=float(self.cfg.path_siren_weight_decay),
         )
 
+        # --- Dataset / DataLoader ---
+        # TitlePathIterable MUST short-circuit to the cache when `path_siren_cache_path`
+        # is provided and exists, otherwise fall back to DB mode.
         self.dataset = TitlePathIterable(
             db_path=self.cfg.db_path,
             principals_table=self.cfg.principals_table,
@@ -59,6 +72,7 @@ class PathSirenTrainer:
             cache_capacity_people=int(self.cfg.path_siren_cache_capacity * 2),
             movie_limit=self.cfg.path_siren_movie_limit,
             seed=int(self.cfg.path_siren_seed),
+            path_siren_cache_path=str(cache_file),
         )
 
         self.loader = DataLoader(
@@ -70,11 +84,13 @@ class PathSirenTrainer:
             persistent_workers=False,
         )
 
+        # --- Sanity check: run 1 batch through model & print summary ---
         Mx, My, Zt, Z_lat_tgts, Yp_tgts, t_grid, time_mask = next(iter(self.loader))
         Zt = Zt.to(self.device)
         t_grid = t_grid.to(self.device)
         print_model_summary(self.model, [Zt, t_grid])
 
+        # --- Logging / callbacks ---
         self.writer = TensorBoardPerBatchLogger(
             log_dir=str(self.cfg.tensorboard_dir),
             run_prefix="path_siren",
@@ -131,14 +147,17 @@ class PathSirenTrainer:
             for f in getattr(ae, "fields", []):
                 tok = getattr(f, "tokenizer", None)
                 if tok is not None and getattr(tok, "trained", False):
-                    vocab_size = tok.get_vocab_size() if hasattr(tok, "get_vocab_size") else len(getattr(tok, "char_to_index", {}))
+                    if hasattr(tok, "get_vocab_size"):
+                        vocab_size = tok.get_vocab_size()
+                    else:
+                        vocab_size = len(getattr(tok, "char_to_index", {}))
                     msg_lines.append(
-                        f"  {ae_name}.{f.name}: vocab_size={vocab_size} "
+                        f"  {ae_name}.{f.name}: "
+                        f"vocab_size={vocab_size} "
                         f"max_length={getattr(f, 'max_length', None)} "
                         f"dynamic_max_len={getattr(f, 'dynamic_max_len', None)}"
                     )
 
-        # Short sanity summary to spot mismatches quickly
         same_latent = (
             getattr(self.mov_ae, "latent_dim", None) == self.cfg.latent_dim
             == getattr(self.per_ae, "latent_dim", None)
@@ -156,6 +175,8 @@ class PathSirenTrainer:
 
         if self.writer and self.writer.writer:
             self.writer.writer.add_text("debug/model_and_vocab", f"```\n{text}\n```", 0)
+
+    # ---- Losses (unchanged) ----
 
     def _people_loss_all_steps(
         self,
@@ -379,9 +400,7 @@ class PathSirenTrainer:
         denom = mask1.sum().clamp_min(1.0)
         loss_latent = (diff_lat * mask1).sum() / denom
 
-        preds = []
-        for dec in self.per_ae.decoder.decs:
-            preds.append(dec(z_first))
+        preds = [dec(z_first) for dec in self.per_ae.decoder.decs]
 
         total = z_seq.new_zeros((b,))
         for pred, tgt, field in zip(preds, tgts_per_field, self.per_ae.fields):
@@ -460,6 +479,7 @@ class PathSirenTrainer:
 
                 z_seq = self.model(Zt, t_grid)
 
+                # movie at t=0
                 z0 = z_seq[:, 0, :]
                 preds_movie: List[torch.Tensor] = [
                     dec(z0) for dec in self.mov_ae.decoder.decs
@@ -468,6 +488,7 @@ class PathSirenTrainer:
                 loss_movie_t0 = self._movie_loss_at_t0(preds_movie, My)
                 loss_latent_t0 = torch.nn.functional.mse_loss(z0, Zt)
 
+                # people over path
                 loss_people = self._people_loss_all_steps(z_seq, Yp_tgts, time_mask)
                 loss_latent_path = self._latent_path_loss(
                     z_seq,
@@ -477,6 +498,7 @@ class PathSirenTrainer:
                 loss_straight = self._straightness_loss(z_seq, t_grid, time_mask)
                 loss_curv = self._curvature_loss(z_seq, time_mask)
 
+                # first-person diagnostics
                 loss_first_latent, loss_first_recon = self._first_person_losses(
                     z_seq=z_seq,
                     z_targets=Z_lat_tgts,
@@ -485,11 +507,13 @@ class PathSirenTrainer:
                 )
                 loss_first_total = loss_first_latent + loss_first_recon
 
+                # title loss for logging
                 loss_title = (
                     w_title_latent * loss_latent_t0
                     + w_title_recon * loss_movie_t0
                 )
 
+                # total loss
                 loss = (
                     loss_people
                     + w_latent_path * loss_latent_path

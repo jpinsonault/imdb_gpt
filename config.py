@@ -8,7 +8,7 @@ class ProjectConfig:
     db_path: str = "data/imdb.db"
     model_dir: str = "models"
 
-    batch_size: int = 512
+    batch_size: int = 2048  
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     epochs: int = 4
@@ -32,7 +32,7 @@ class ProjectConfig:
     prefetch_factor: int = 0
     max_training_steps: int | None = None
 
-    use_cache: bool = False
+    use_cache: bool = True
     refresh_cache: bool = False
 
     compile_trunk: bool = False
