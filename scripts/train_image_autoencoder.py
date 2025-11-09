@@ -41,6 +41,39 @@ def build_tensorboard_writer(cfg, run_dir):
     return writer
 
 
+def gradient_loss(pred, target):
+    dx_pred = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    dy_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+
+    dx_tgt = target[:, :, :, 1:] - target[:, :, :, :-1]
+    dy_tgt = target[:, :, 1:, :] - target[:, :, :-1, :]
+
+    loss_x = F.l1_loss(dx_pred, dx_tgt)
+    loss_y = F.l1_loss(dy_pred, dy_tgt)
+    return loss_x + loss_y
+
+
+def laplacian_loss(pred, target):
+    k = torch.tensor(
+        [[0.0, -1.0, 0.0],
+         [-1.0, 4.0, -1.0],
+         [0.0, -1.0, 0.0]],
+        dtype=pred.dtype,
+        device=pred.device,
+    ).view(1, 1, 3, 3)
+    c = pred.size(1)
+    weight = k.expand(c, 1, 3, 3)
+    pred_lap = F.conv2d(pred, weight, padding=1, groups=c)
+    tgt_lap = F.conv2d(target, weight, padding=1, groups=c)
+    return F.l1_loss(pred_lap, tgt_lap)
+
+
+def total_variation(x):
+    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+    return dx.abs().mean() + dy.abs().mean()
+
+
 def main():
     cfg = project_config
     ensure_dirs(cfg)
@@ -117,7 +150,11 @@ def main():
     epochs = int(cfg.image_ae_epochs)
     global_step = 0
 
-    latent_reg_weight = 0.0
+    w_l1 = float(getattr(cfg, "image_ae_loss_w_l1", 1.0))
+    w_grad = float(getattr(cfg, "image_ae_loss_w_grad", 0.0))
+    w_tv = float(getattr(cfg, "image_ae_loss_w_tv", 0.0))
+    w_lap = float(getattr(cfg, "image_ae_loss_w_laplace", 0.0))
+    latent_reg_weight = float(getattr(cfg, "image_ae_latent_reg_weight", 0.0))
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -138,15 +175,33 @@ def main():
                 logits = model(batch)
                 recon = torch.sigmoid(logits)
 
-                rec_loss = F.l1_loss(recon, batch)
+                loss_l1 = F.l1_loss(recon, batch)
+
+                if w_grad != 0.0:
+                    loss_grad = gradient_loss(recon, batch)
+                else:
+                    loss_grad = recon.new_zeros(())
+
+                if w_lap != 0.0:
+                    loss_lap = laplacian_loss(recon, batch)
+                else:
+                    loss_lap = recon.new_zeros(())
+
+                if w_tv != 0.0:
+                    loss_tv = total_variation(recon)
+                else:
+                    loss_tv = recon.new_zeros(())
+
+                loss = (
+                    w_l1 * loss_l1
+                    + w_grad * loss_grad
+                    + w_lap * loss_lap
+                    + w_tv * loss_tv
+                )
 
                 if latent_reg_weight > 0.0:
-                    with torch.no_grad():
-                        z = model.encode(batch)
-                    z_loss = (z.pow(2).mean())
-                    loss = rec_loss + latent_reg_weight * z_loss
-                else:
-                    loss = rec_loss
+                    z = model.encode(batch)
+                    loss = loss + latent_reg_weight * z.pow(2).mean()
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -177,7 +232,7 @@ def main():
 
         recon_saver.maybe_save(epoch, model, device)
 
-        ckpt_path = os.path.join(run_dir, f"model_epoch_{epoch:04d}.pt")
+        ckpt_path = os.path.join(run_dir, f"model_epoch.pt")
         torch.save(
             {
                 "epoch": epoch,
