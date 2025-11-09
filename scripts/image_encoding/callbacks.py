@@ -10,7 +10,7 @@ class ReconstructionSaver:
         self,
         output_dir: str,
         sample_batch: torch.Tensor,
-        every_n_epochs: int = 1,
+        every_n_epochs: int = 10,
         max_samples: int = 8,
     ):
         os.makedirs(output_dir, exist_ok=True)

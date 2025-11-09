@@ -1,3 +1,5 @@
+# scripts/image_encoding/autoencoder.py
+
 import math
 import torch
 import torch.nn as nn
@@ -20,10 +22,7 @@ class ConvBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
         self.gn2 = _make_gn(out_ch)
 
-        if in_ch != out_ch or True:
-            self.res_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0)
-        else:
-            self.res_conv = None
+        self.res_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, padding=0)
 
         self.act2 = nn.ReLU(inplace=True)
 
@@ -37,8 +36,7 @@ class ConvBlock(nn.Module):
         x = self.conv2(x)
         x = self.gn2(x)
 
-        if self.res_conv is not None:
-            identity = self.res_conv(identity)
+        identity = self.res_conv(identity)
 
         x = x + identity
         x = self.act2(x)
@@ -51,56 +49,40 @@ class DeconvBlock(nn.Module):
         self.final = bool(final)
 
         if self.final:
-            self.deconv = nn.ConvTranspose2d(
-                in_ch,
-                out_ch,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            )
+            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+            self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
         else:
-            self.deconv1 = nn.ConvTranspose2d(
-                in_ch,
-                out_ch,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            )
+            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+
+            self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
             self.gn1 = _make_gn(out_ch)
             self.act1 = nn.ReLU(inplace=True)
 
-            self.conv2 = nn.Conv2d(
-                out_ch,
-                out_ch,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-            )
+            self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
             self.gn2 = _make_gn(out_ch)
 
-            self.res = nn.ConvTranspose2d(
-                in_ch,
-                out_ch,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-            )
+            self.res_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, padding=0)
+
             self.act2 = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.final:
-            return self.deconv(x)
+            x = self.up(x)
+            x = self.conv(x)
+            return x
 
         identity = x
 
-        x = self.deconv1(x)
+        x = self.up(x)
+        x = self.conv1(x)
         x = self.gn1(x)
         x = self.act1(x)
 
         x = self.conv2(x)
         x = self.gn2(x)
 
-        identity = self.res(identity)
+        identity = self.up(identity)
+        identity = self.res_conv(identity)
 
         x = x + identity
         x = self.act2(x)
@@ -123,6 +105,8 @@ class ConvAutoencoder(nn.Module):
         self.image_size = int(image_size)
 
         assert self.image_size > 0
+        assert (self.image_size & (self.image_size - 1)) == 0
+
         num_down = int(math.log2(self.image_size)) - 4
         if num_down < 2:
             num_down = 2
@@ -161,14 +145,13 @@ class ConvAutoencoder(nn.Module):
                 final=True,
             )
         )
-
         self.dec_blocks = nn.ModuleList(dec_blocks)
 
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
