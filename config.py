@@ -8,7 +8,7 @@ class ProjectConfig:
     db_path: str = "data/imdb.db"
     model_dir: str = "models"
 
-    batch_size: int = 2048  
+    batch_size: int = 2048
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     epochs: int = 4
@@ -49,7 +49,7 @@ class ProjectConfig:
 
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
-    path_siren_weight_decay: float = 0
+    path_siren_weight_decay: float = 0.0
     path_siren_epochs: int = 100
     path_siren_layers: int = 10
     path_siren_hidden_mult: float = 4.0
@@ -63,15 +63,23 @@ class ProjectConfig:
 
     path_siren_movie_limit: int | None = None
 
-    path_siren_loss_w_latent: float = 1.0
+    # title-level
     path_siren_loss_w_title_latent: float = 1.0
     path_siren_loss_w_title_recon: float = 1.0
+
+    # people reconstruction along the path
+    path_siren_loss_w_people: float = 1.0
+
+    # main path supervision:
+    #  - with Z_spline: ||z_seq - Z_spline||
+    #  - without:       ||z_seq - Z_lat_tgts||
     path_siren_loss_w_latent_path: float = 1.0
-    path_siren_loss_w_straight: float = 0.5
-    path_siren_loss_w_curvature: float = 0.1
+
+    # optional priors used only when no Z_spline is provided
+    path_siren_loss_w_straight: float = 0.0
+    path_siren_loss_w_curvature: float = 0.0
 
     path_siren_seed: int = 1337
-
     path_siren_time_fourier: int = 0
 
     image_ae_data_dir: str = "data/image_autoencoder"
