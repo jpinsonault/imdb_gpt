@@ -1,3 +1,5 @@
+# scripts/path_siren/dataset.py
+
 import os
 import sqlite3
 from collections import OrderedDict
@@ -38,10 +40,11 @@ class TitlePathIterable(IterableDataset):
         Mx: list[Tensor]           movie inputs per field
         My: list[Tensor]           movie targets per field
         movie_latent: Tensor       (D,) movie latent
-        Z_lat_tgts: Tensor         (L,D) latent trajectory (title + people)
+        Z_lat_tgts: Tensor         (L,D) latent trajectory (title + people, padded)
+        Z_spline: Tensor           (L,D) canonical spline trajectory along t_grid
         Yp_tgts: list[Tensor]      per-person-field target sequences, each (L,...)
         t_grid: Tensor             (L,) time positions
-        time_mask: Tensor          (L,) 1 for valid positions
+        time_mask: Tensor          (L,) 1 for valid anchor positions
     """
 
     def __init__(
@@ -77,7 +80,6 @@ class TitlePathIterable(IterableDataset):
             cache_file = path_siren_cache_path
 
         if cache_file is None:
-            # default to the shared precompute target
             cache_file = str(Path(project_config.data_dir) / "path_siren_cache.pt")
 
         self.cache_file = cache_file
@@ -87,10 +89,10 @@ class TitlePathIterable(IterableDataset):
             print(f"[path-siren] using precomputed cache: {self.cache_file}")
             obj = torch.load(self.cache_file, map_location="cpu")
 
-            # support {"samples": [...]} or raw list/tuple
             if isinstance(obj, dict) and "samples" in obj:
                 self._precomputed = list(obj["samples"])
             elif isinstance(obj, (list, tuple)):
+                # legacy format: list of tuples
                 self._precomputed = list(obj)
             else:
                 raise ValueError(
@@ -139,29 +141,36 @@ class TitlePathIterable(IterableDataset):
             for i in idxs:
                 s = self._precomputed[i]
 
-                # Normalization: accept both dict samples and legacy 7-tuples
+                # Normalize formats:
+                #  - new: dict with keys
+                #  - legacy: 7-tuple (Mx, My, Zt, Z_lat_tgts, Yp_tgts, t_grid, time_mask)
                 if isinstance(s, dict):
-                    sample = s
+                    sample = dict(s)
                 else:
-                    # Expect: (Mx, My, Zt, Z_lat_tgts, Yp_tgts, t_grid, time_mask)
                     if not isinstance(s, (list, tuple)) or len(s) != 7:
                         raise ValueError(
-                            f"[path-siren] Bad sample format in cache: index {i}, type={type(s)}, len={getattr(s, 'len', None)}"
+                            f"[path-siren] Bad sample format in cache at index {i}: "
+                            f"type={type(s)}, len={getattr(s, 'len', None)}"
                         )
                     Mx, My, Zt, Z_lat_tgts, Yp_tgts, t_grid, time_mask = s
                     sample = {
                         "Mx": Mx,
                         "My": My,
-                        "movie_latent": Zt,
+                        "Zt": Zt,
                         "Z_lat_tgts": Z_lat_tgts,
                         "Yp_tgts": Yp_tgts,
                         "t_grid": t_grid,
                         "time_mask": time_mask,
                     }
 
-                # Ensure movie_latent key exists if older cache used "Zt"
-                if "movie_latent" not in sample and "Zt" in sample:
-                    sample["movie_latent"] = sample["Zt"]
+                # Ensure movie_latent key
+                if "movie_latent" not in sample:
+                    if "Zt" in sample:
+                        sample["movie_latent"] = sample["Zt"]
+                    elif "Z_lat_tgts" in sample:
+                        # fallback: first step
+                        z0 = sample["Z_lat_tgts"][0]
+                        sample["movie_latent"] = z0
 
                 yield sample
 
@@ -322,10 +331,12 @@ class TitlePathIterable(IterableDataset):
         return X, z
 
     def _build_sample_for_tconst(self, tconst: str) -> Dict[str, Any]:
-        # movie enc
+        """
+        Online mode (no precomputed cache):
+        build minimal-compat sample without canonical spline.
+        """
         Mx, My, z_title = self._encode_movie(tconst)
 
-        # people encs
         nconsts = self._people_for_title(tconst)
         L = self.num_people + 1  # title + up to N people
         t_grid = torch.linspace(0.0, 1.0, steps=L)
@@ -350,7 +361,6 @@ class TitlePathIterable(IterableDataset):
         time_mask = torch.zeros(L, dtype=torch.float32)
         time_mask[:valid_len] = 1.0
 
-        # prepend dummy + pad for each people field
         Yp_tgts: List[torch.Tensor] = []
         for fi, f in enumerate(self.people_ae.fields):
             dummy0 = f.get_base_padding_value()
@@ -360,7 +370,6 @@ class TitlePathIterable(IterableDataset):
                 seq += [dummy0] * pad_needed
             Yp_tgts.append(torch.stack(seq, dim=0))
 
-        # pad z_steps by repeating last
         if len(z_steps) < L:
             last = z_steps[-1]
             z_steps += [last] * (L - len(z_steps))
@@ -374,6 +383,7 @@ class TitlePathIterable(IterableDataset):
             "Yp_tgts": Yp_tgts,
             "t_grid": t_grid,
             "time_mask": time_mask,
+            # no Z_spline in online mode; trainer will fall back
         }
         return sample
 
@@ -388,10 +398,11 @@ def collate_batch(batch: List[Dict[str, Any]]):
         Mx_batched: list[Tensor]          movie inputs per field, each (B, ...)
         My_batched: list[Tensor]          movie targets per field, each (B, ...)
         Zt: Tensor                        (B,D) movie latents
-        Z_lat_tgts: Tensor                (B,L,D)
+        Z_lat_tgts: Tensor                (B,L,D) anchor latents (title+people)
         Yp_tgts_batched: list[Tensor]     per-person-field targets, each (B,L,...)
         t_grid: Tensor                    (B,L)
         time_mask: Tensor                 (B,L)
+        Z_spline: Tensor | None           (B,L,D) canonical spline targets if present
     """
     if len(batch) == 0:
         raise ValueError("Empty batch passed to collate_batch")
@@ -408,9 +419,17 @@ def collate_batch(batch: List[Dict[str, Any]]):
         My_batched.append(torch.stack(ys, dim=0))
 
     # movie latents
-    Zt = torch.stack([b["movie_latent"] for b in batch], dim=0)
+    Zt_list = []
+    for b in batch:
+        if "movie_latent" in b:
+            Zt_list.append(b["movie_latent"])
+        elif "Zt" in b:
+            Zt_list.append(b["Zt"])
+        else:
+            Zt_list.append(b["Z_lat_tgts"][0])
+    Zt = torch.stack(Zt_list, dim=0)
 
-    # latent trajectories
+    # latent trajectories (anchors)
     Z_lat_tgts = torch.stack([b["Z_lat_tgts"] for b in batch], dim=0)
 
     # per-person fields
@@ -424,4 +443,11 @@ def collate_batch(batch: List[Dict[str, Any]]):
     t_grid = torch.stack([b["t_grid"] for b in batch], dim=0)
     time_mask = torch.stack([b["time_mask"] for b in batch], dim=0)
 
-    return Mx_batched, My_batched, Zt, Z_lat_tgts, Yp_tgts_batched, t_grid, time_mask
+    # canonical spline, if present
+    has_spline = "Z_spline" in batch[0]
+    if has_spline:
+        Z_spline = torch.stack([b["Z_spline"] for b in batch], dim=0)
+    else:
+        Z_spline = None
+
+    return Mx_batched, My_batched, Zt, Z_lat_tgts, Yp_tgts_batched, t_grid, time_mask, Z_spline

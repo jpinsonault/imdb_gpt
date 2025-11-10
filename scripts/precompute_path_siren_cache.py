@@ -20,21 +20,19 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     Open SQLite in read-only mode, using pragmas that are safe under concurrency.
     No write-mode PRAGMAs here to avoid 'database is locked' issues.
     """
-    # URI read-only; cache=shared lets multiple readers coexist.
     uri = f"file:{db_path}?mode=ro&cache=shared"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
 
     cur = conn.cursor()
     pragmas = [
-        "PRAGMA query_only = ON;",     # enforce read-only at connection level
-        "PRAGMA temp_store = MEMORY;", # keep temp tables in RAM
-        "PRAGMA cache_size = -200000;" # ~200k pages in memory (negative = KB)
+        "PRAGMA query_only = ON;",
+        "PRAGMA temp_store = MEMORY;",
+        "PRAGMA cache_size = -200000;",
     ]
     for p in pragmas:
         try:
             cur.execute(p)
         except sqlite3.OperationalError:
-            # Some pragmas may be unavailable under certain builds / modes; ignore.
             pass
     cur.close()
     return conn
@@ -65,7 +63,7 @@ def _get_tconsts(cur, cfg):
 
 def _batched(iterable, batch_size):
     for i in range(0, len(iterable), batch_size):
-        yield iterable[i : i + batch_size]
+        yield iterable[i: i + batch_size]
 
 
 def _load_movies(cur, tconsts):
@@ -118,9 +116,7 @@ def _load_movies(cur, tconsts):
         ).fetchall()
         for tconst, genres_str in rows:
             if tconst in movies:
-                movies[tconst]["genres"] = (
-                    genres_str.split(",") if genres_str else []
-                )
+                movies[tconst]["genres"] = genres_str.split(",") if genres_str else []
 
     return movies
 
@@ -169,7 +165,7 @@ def _load_people(cur, nconsts):
     """
     people = {}
 
-    # Base data
+    # Base
     for batch in _batched(list(nconsts), 50_000):
         q_marks = ",".join("?" for _ in batch)
         rows = cur.execute(
@@ -289,6 +285,9 @@ def _encode_people(people_ae, device, people_rows):
             per_field_X[fi].append(x)
         per_person_targets.append(ys)
 
+    if not nconsts:
+        return {}, {}
+
     X_batch = [torch.stack(xs, dim=0).to(device) for xs in per_field_X]
     Z_batch = people_ae.encoder(X_batch).detach().cpu()
 
@@ -299,6 +298,101 @@ def _encode_people(people_ae, device, people_rows):
         Yp[nconst] = per_person_targets[i]
 
     return Zp, Yp
+
+
+# ---------- canonical spline helpers ----------
+
+def _natural_cubic_spline_m(x: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """
+    Compute natural cubic spline second derivatives at knots.
+
+    x: (N,) strictly increasing
+    Y: (N,D)
+    returns m: (N,D)
+    """
+    N = x.shape[0]
+    D = Y.shape[1]
+    if N <= 2:
+        return torch.zeros((N, D), dtype=Y.dtype)
+
+    h = x[1:] - x[:-1]  # (N-1,)
+    # guard
+    h = torch.clamp(h, min=1e-8)
+
+    alpha = torch.zeros((N, D), dtype=Y.dtype)
+    for i in range(1, N - 1):
+        alpha[i] = (
+            3.0 / h[i] * (Y[i + 1] - Y[i])
+            - 3.0 / h[i - 1] * (Y[i] - Y[i - 1])
+        )
+
+    l = torch.ones(N, dtype=Y.dtype)
+    mu = torch.zeros(N, dtype=Y.dtype)
+    z = torch.zeros((N, D), dtype=Y.dtype)
+
+    for i in range(1, N - 1):
+        l[i] = 2.0 * (x[i + 1] - x[i - 1]) - h[i - 1] * mu[i - 1]
+        l[i] = torch.clamp(l[i], min=1e-8)
+        mu[i] = h[i] / l[i]
+        z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i]
+
+    m = torch.zeros((N, D), dtype=Y.dtype)
+    # m[N-1] already zero for natural BC
+    for j in range(N - 2, -1, -1):
+        m[j] = z[j] - mu[j] * m[j + 1]
+
+    return m
+
+
+def _eval_spline_on_grid(x: torch.Tensor, Y: torch.Tensor, m: torch.Tensor, t_grid: torch.Tensor) -> torch.Tensor:
+    """
+    Evaluate natural cubic spline defined by (x, Y, m) at all t in t_grid.
+
+    x: (N,)
+    Y: (N,D)
+    m: (N,D) second derivatives
+    t_grid: (L,)
+    returns: (L,D)
+    """
+    N = x.shape[0]
+    D = Y.shape[1]
+    L = t_grid.shape[0]
+
+    Z = torch.empty((L, D), dtype=Y.dtype)
+
+    x0 = float(x[0].item())
+    xN = float(x[-1].item())
+
+    for li in range(L):
+        t = float(t_grid[li].item())
+
+        if t <= x0:
+            Z[li] = Y[0]
+            continue
+        if t >= xN:
+            Z[li] = Y[-1]
+            continue
+
+        # find segment i with x[i] <= t <= x[i+1]
+        # N is tiny (<= 11), so linear scan is fine
+        i = 0
+        while i < N - 2 and t > float(x[i + 1].item()):
+            i += 1
+
+        xi = float(x[i].item())
+        xip1 = float(x[i + 1].item())
+        h = max(xip1 - xi, 1e-8)
+
+        A = (xip1 - t) / h
+        B = (t - xi) / h
+
+        Z[li] = (
+            A * Y[i]
+            + B * Y[i + 1]
+            + ((A ** 3 - A) * m[i] + (B ** 3 - B) * m[i + 1]) * (h ** 2) / 6.0
+        )
+
+    return Z
 
 
 def _build_samples_for_chunk(
@@ -314,6 +408,15 @@ def _build_samples_for_chunk(
 ):
     """
     Assemble final samples for this chunk using precomputed latents and targets.
+
+    For each title we produce:
+      - Mx, My
+      - Zt (movie latent)
+      - Z_lat_tgts: (L,D) anchors (title + selected people + padded)
+      - Z_spline:  (L,D) canonical natural cubic spline along t_grid
+      - Yp_tgts:   list[ (L,...) ] people targets per field
+      - t_grid:    (L,)
+      - time_mask: (L,) 1 for positions with real anchors (title/people)
     """
     samples = []
     L = num_people + 1
@@ -328,6 +431,8 @@ def _build_samples_for_chunk(
         Zt = Zt_dict[tconst]
 
         people = title_to_people.get(tconst, [])
+
+        # collect anchor latents & per-person targets
         steps = [Zt]
         per_field_seq = [[] for _ in people_fields]
 
@@ -340,13 +445,15 @@ def _build_samples_for_chunk(
             for fi, y in enumerate(ys):
                 per_field_seq[fi].append(y)
 
-        people_k = len(steps) - 1
+        # valid anchors: title + actual people (capped by num_people)
+        people_k = len(steps) - 1  # may be 0
         valid_len = min(people_k + 1, L)
 
         t_grid = torch.linspace(0.0, 1.0, steps=L)
         time_mask = torch.zeros(L, dtype=torch.float32)
         time_mask[:valid_len] = 1.0
 
+        # build Yp_tgts with dummy slot 0 + people + pad
         Yp_tgts = []
         for fi, f in enumerate(people_fields):
             dummy0 = f.get_base_padding_value()
@@ -357,12 +464,26 @@ def _build_samples_for_chunk(
                 seq = seq[:L]
             Yp_tgts.append(torch.stack(seq, dim=0))
 
+        # pad or truncate steps to length L for Z_lat_tgts
         if len(steps) < L:
             last = steps[-1]
-            steps += [last] * (L - len(steps))
+            steps = steps + [last] * (L - len(steps))
         else:
             steps = steps[:L]
+
         Z_lat_tgts = torch.stack(steps, dim=0)
+
+        # ----- canonical spline over the *valid* anchors -----
+        # If we have at least 2 anchors, build a natural cubic spline
+        # that passes exactly through those latents, then evaluate on t_grid.
+        if valid_len >= 2:
+            knots_t = t_grid[:valid_len]
+            knots_z = Z_lat_tgts[:valid_len]  # (valid_len, D)
+            m = _natural_cubic_spline_m(knots_t, knots_z)
+            Z_spline = _eval_spline_on_grid(knots_t, knots_z, m, t_grid)
+        else:
+            # Degenerate: no people anchors → constant path at title latent
+            Z_spline = Z_lat_tgts.clone()
 
         samples.append(
             {
@@ -370,6 +491,7 @@ def _build_samples_for_chunk(
                 "My": My_i,
                 "Zt": Zt.clone(),
                 "Z_lat_tgts": Z_lat_tgts.clone(),
+                "Z_spline": Z_spline.clone(),
                 "Yp_tgts": [t.clone() for t in Yp_tgts],
                 "t_grid": t_grid.clone(),
                 "time_mask": time_mask.clone(),
@@ -425,7 +547,9 @@ def main():
 
         if unique_people:
             people_rows = _load_people(cur, unique_people)
-            people_rows = {n: row for n, row in people_rows.items() if n in unique_people}
+            people_rows = {
+                n: row for n, row in people_rows.items() if n in unique_people
+            }
             Zp, Yp = _encode_people(people_ae, device, people_rows)
         else:
             Zp, Yp = {}, {}

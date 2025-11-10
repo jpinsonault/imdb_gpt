@@ -72,7 +72,7 @@ class ProjectConfig:
 
     path_siren_seed: int = 1337
 
-    path_siren_time_fourier: int = 4
+    path_siren_time_fourier: int = 0
 
     image_ae_data_dir: str = "data/image_autoencoder"
     image_ae_runs_dir: str = "runs/image_autoencoder"
