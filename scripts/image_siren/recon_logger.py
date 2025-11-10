@@ -27,6 +27,20 @@ class ImageSirenReconstructionSaver:
         self.sample_ae = sample_ae
         self.sample_target = sample_target
 
+    def _best_nrow(self, num_pairs: int) -> int:
+        n = max(2 * int(num_pairs), 2)
+        best_nrow = 2
+        best_score = None
+
+        for nrow in range(2, n + 1, 2):
+            rows = (n + nrow - 1) // nrow
+            score = abs(rows - nrow)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_nrow = nrow
+
+        return best_nrow
+
     @torch.no_grad()
     def maybe_save(
         self,
@@ -71,8 +85,10 @@ class ImageSirenReconstructionSaver:
             stacked.append(recon[i])
 
         grid = torch.stack(stacked, dim=0)
+        nrow = self._best_nrow(b)
+
         path = os.path.join(self.output_dir, f"image_siren_epoch_{epoch:04d}.png")
-        save_image(grid, path, nrow=2)
+        save_image(grid, path, nrow=nrow)
 
         encoder.train()
         siren.train()

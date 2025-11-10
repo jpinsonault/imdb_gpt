@@ -655,6 +655,19 @@ wheels = [
 ]
 
 [[package]]
+name = "imageio"
+version = "2.37.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/6f/606be632e37bf8d05b253e8626c2291d74c691ddc7bcdf7d6aaf33b32f6a/imageio-2.37.2.tar.gz", hash = "sha256:0212ef2727ac9caa5ca4b2c75ae89454312f440a756fcfc8ef1993e718f50f8a", size = 389600 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fb/fe/301e0936b79bcab4cacc7548bf2853fc28dced0a578bab1f7ef53c9aa75b/imageio-2.37.2-py3-none-any.whl", hash = "sha256:ad9adfb20335d718c03de457358ed69f141021a333c40a53e57273d8a5bd0b9b", size = 317646 },
+]
+
+[[package]]
 name = "imdb-gpt-2"
 version = "0.1.0"
 source = { virtual = "." }
@@ -663,6 +676,7 @@ dependencies = [
     { name = "flask" },
     { name = "flask-cors" },
     { name = "huggingface-hub" },
+    { name = "imageio" },
     { name = "matplotlib" },
     { name = "mlx-lm" },
     { name = "openai" },
@@ -684,6 +698,7 @@ requires-dist = [
     { name = "flask", specifier = ">=3.1.0" },
     { name = "flask-cors", specifier = ">=5.0.1" },
     { name = "huggingface-hub", specifier = ">=0.34.1" },
+    { name = "imageio", specifier = ">=2.37.2" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "mlx-lm", specifier = ">=0.28.3" },
     { name = "openai" },
