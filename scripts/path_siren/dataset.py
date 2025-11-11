@@ -33,18 +33,6 @@ class _LRU:
 
 
 class TitlePathIterable(IterableDataset):
-    """
-    Each yielded sample is a dict with keys:
-        Mx: list[Tensor]           movie inputs per field
-        My: list[Tensor]           movie targets per field
-        movie_latent: Tensor       (D,) movie latent (condition)
-        Z_lat_tgts: Tensor         (L,D) ordered people latents (+pad)
-        Z_spline: Tensor           (L,D) canonical spline along t_grid (if present)
-        Yp_tgts: list[Tensor]      per-person-field targets, each (L,...)
-        t_grid: Tensor             (L,) time positions in [0,1]
-        time_mask: Tensor          (L,) 1 for valid person anchors
-    """
-
     def __init__(
         self,
         db_path: str,
@@ -144,12 +132,14 @@ class TitlePathIterable(IterableDataset):
                     sample = {
                         "Mx": Mx,
                         "My": My,
+                        "movie_latent": Zt,
                         "Z_lat_tgts": Z_lat_tgts,
                         "Yp_tgts": Yp_tgts,
                         "t_grid": t_grid,
                         "time_mask": time_mask,
-                        "movie_latent": Zt,
                     }
+
+                sample.pop("Z_spline", None)
 
                 if "movie_latent" not in sample:
                     if "Zt" in sample:
@@ -157,7 +147,15 @@ class TitlePathIterable(IterableDataset):
                     elif "Z_lat_tgts" in sample and sample["Z_lat_tgts"].numel() > 0:
                         sample["movie_latent"] = sample["Z_lat_tgts"][0]
 
-                yield sample
+                yield {
+                    "Mx": sample["Mx"],
+                    "My": sample["My"],
+                    "movie_latent": sample["movie_latent"],
+                    "Z_lat_tgts": sample["Z_lat_tgts"],
+                    "Yp_tgts": sample["Yp_tgts"],
+                    "t_grid": sample["t_grid"],
+                    "time_mask": sample["time_mask"],
+                }
 
             return
 
@@ -273,10 +271,7 @@ class TitlePathIterable(IterableDataset):
         ).fetchall()
         return [r[0] for r in rows]
 
-    def _encode_movie(
-        self,
-        tconst: str,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+    def _encode_movie(self, tconst: str) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         cached = self._z_movie_cache.get(tconst)
         if cached is not None:
             return cached
@@ -425,10 +420,4 @@ def collate_batch(batch: List[Dict[str, Any]]):
     t_grid = torch.stack([b["t_grid"] for b in batch], dim=0)
     time_mask = torch.stack([b["time_mask"] for b in batch], dim=0)
 
-    has_spline = "Z_spline" in batch[0]
-    if has_spline:
-        Z_spline = torch.stack([b["Z_spline"] for b in batch], dim=0)
-    else:
-        Z_spline = None
-
-    return Mx_batched, My_batched, Zt, Z_lat_tgts, Yp_tgts_batched, t_grid, time_mask, Z_spline
+    return Mx_batched, My_batched, Zt, Z_lat_tgts, Yp_tgts_batched, t_grid, time_mask

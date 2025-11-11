@@ -41,8 +41,8 @@ class PathSirenReconstructionLogger:
         outs = []
         for dec in self.m_ae.decoder.decs:
             y = dec(z_title_batch)
-            outs.append(y)
-        return [o.detach().cpu().numpy() for o in outs]
+            outs.append(y.detach().cpu().numpy())
+        return outs
 
     @torch.no_grad()
     def _decode_people_latents(self, z_slots_hat: torch.Tensor):
@@ -170,7 +170,6 @@ class PathSirenReconstructionLogger:
         mask: torch.Tensor,
         Yp_tgts: Optional[List[torch.Tensor]] = None,
         Z_lat_tgts: Optional[torch.Tensor] = None,
-        Z_spline: Optional[torch.Tensor] = None,
     ):
         if (global_step + 1) % self.every != 0:
             return
@@ -184,7 +183,6 @@ class PathSirenReconstructionLogger:
             if z_seq.dim() != 3:
                 return
 
-            # Movie comes from the conditioning latent Z, not from the path slots.
             movie_recon_fields = self._decode_movie_latent(Z)
 
             people_recon_fields = None
@@ -251,7 +249,7 @@ class PathSirenReconstructionLogger:
                     total_slots=total_slots,
                 )
 
-                tqdm.write("\n[path-siren people along spline]")
+                tqdm.write("\n[path-siren people along path]")
                 tqdm.write(t_people_tab.get_string())
 
                 if self.writer is not None:

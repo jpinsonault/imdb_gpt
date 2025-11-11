@@ -32,7 +32,7 @@ class ProjectConfig:
     prefetch_factor: int = 0
     max_training_steps: int | None = None
 
-    use_cache: bool = True
+    use_cache: bool = False
     refresh_cache: bool = False
 
     compile_trunk: bool = False
