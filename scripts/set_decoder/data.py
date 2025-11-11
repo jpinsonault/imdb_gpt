@@ -1,10 +1,35 @@
 import sqlite3
 from typing import Dict, List, Tuple
+from collections import OrderedDict
 
 import torch
 from torch.utils.data import Dataset
 
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
+
+
+class _LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = int(max(0, capacity))
+        self.data = OrderedDict()
+
+    def get(self, key):
+        if self.capacity <= 0:
+            return None
+        if key not in self.data:
+            return None
+        value = self.data.pop(key)
+        self.data[key] = value
+        return value
+
+    def put(self, key, value):
+        if self.capacity <= 0:
+            return
+        if key in self.data:
+            self.data.pop(key)
+        self.data[key] = value
+        if len(self.data) > self.capacity:
+            self.data.popitem(last=False)
 
 
 class TitlePeopleSetDataset(Dataset):
@@ -38,50 +63,43 @@ class TitlePeopleSetDataset(Dataset):
         FROM people WHERE nconst = ? LIMIT 1
         """
 
-        self.movie_to_people: Dict[str, List[str]] = {}
-        self._build_index(movie_limit=movie_limit)
+        self.movies = self._load_movies(movie_limit)
 
         self.movie_cache: Dict[str, Dict] = {}
         self.person_cache: Dict[str, Dict] = {}
 
-    def _build_index(self, movie_limit: int | None):
-        q = "SELECT tconst, nconst FROM edges ORDER BY tconst"
-        rows = self.cur.execute(q)
+        people_lru_cap = min(len(self.movies), 200000) if self.movies else 0
+        movie_latent_cap = min(len(self.movies), 200000) if self.movies else 0
+        person_latent_cap = min(len(self.movies) * self.num_slots, 500000) if self.movies else 0
 
-        last_t = None
-        people: List[str] = []
-        titles: List[str] = []
+        self.people_for_movie_cache = _LRUCache(people_lru_cap)
+        self.movie_latent_cache = _LRUCache(movie_latent_cap)
+        self.person_latent_cache = _LRUCache(person_latent_cap)
 
-        for tconst, nconst in rows:
-            tconst = str(tconst)
-            nconst = str(nconst)
-            if tconst != last_t and last_t is not None:
-                unique = []
-                seen = set()
-                for n in people:
-                    if n not in seen:
-                        seen.add(n)
-                        unique.append(n)
-                if unique:
-                    self.movie_to_people[last_t] = unique
-                    titles.append(last_t)
-                    if movie_limit is not None and len(titles) >= movie_limit:
-                        break
-                people = []
-            last_t = tconst
-            people.append(nconst)
-
-        if last_t is not None and people:
-            unique = []
-            seen = set()
-            for n in people:
-                if n not in seen:
-                    seen.add(n)
-                    unique.append(n)
-            if unique:
-                self.movie_to_people[last_t] = unique
-
-        self.movies = [t for t in self.movie_to_people.keys() if self.movie_to_people[t]]
+    def _load_movies(self, movie_limit: int | None) -> List[str]:
+        if movie_limit is not None and movie_limit > 0:
+            rows = self.cur.execute(
+                """
+                SELECT tconst
+                FROM edges
+                GROUP BY tconst
+                HAVING COUNT(*) > 0
+                ORDER BY tconst
+                LIMIT ?
+                """,
+                (int(movie_limit),),
+            ).fetchall()
+        else:
+            rows = self.cur.execute(
+                """
+                SELECT tconst
+                FROM edges
+                GROUP BY tconst
+                HAVING COUNT(*) > 0
+                ORDER BY tconst
+                """,
+            ).fetchall()
+        return [str(r[0]) for r in rows]
 
     def __len__(self):
         return len(self.movies)
@@ -136,7 +154,26 @@ class TitlePeopleSetDataset(Dataset):
         self.person_cache[nconst] = row
         return row
 
+    def _people_for_movie(self, tconst: str) -> List[str]:
+        cached = self.people_for_movie_cache.get(tconst)
+        if cached is not None:
+            return cached
+        rows = self.cur.execute(
+            """
+            SELECT DISTINCT nconst
+            FROM edges
+            WHERE tconst = ?
+            """,
+            (tconst,),
+        ).fetchall()
+        people = [str(r[0]) for r in rows]
+        self.people_for_movie_cache.put(tconst, people)
+        return people
+
     def _encode_movie_latent(self, tconst: str) -> torch.Tensor:
+        cached = self.movie_latent_cache.get(tconst)
+        if cached is not None:
+            return cached
         row = self._movie_row(tconst)
         xs = []
         for f in self.movie_ae.fields:
@@ -145,12 +182,17 @@ class TitlePeopleSetDataset(Dataset):
         xs = [x.cpu() for x in xs]
         with torch.no_grad():
             z = self.movie_ae.encoder(xs)
-        return z.squeeze(0).cpu()
+        z = z.squeeze(0).cpu()
+        self.movie_latent_cache.put(tconst, z)
+        return z
 
     def _encode_person_latent_and_targets(
         self,
         nconst: str,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        cached = self.person_latent_cache.get(nconst)
+        if cached is not None:
+            return cached
         row = self._person_row(nconst)
         xs = []
         ys = []
@@ -164,27 +206,34 @@ class TitlePeopleSetDataset(Dataset):
             z = self.people_ae.encoder(xs)
         z = z.squeeze(0).cpu()
         ys = [y.cpu() for y in ys]
-        return z, ys
+        out = (z, ys)
+        self.person_latent_cache.put(nconst, out)
+        return out
 
     def __getitem__(self, idx: int):
         tconst = self.movies[int(idx)]
 
         z_movie = self._encode_movie_latent(tconst)
 
-        nconsts = self.movie_to_people[tconst][: self.num_slots]
+        nconsts = self._people_for_movie(tconst)
+        nconsts = nconsts[: self.num_slots]
         k = len(nconsts)
 
         latent_dim = z_movie.size(-1)
         Z_gt = torch.zeros(self.num_slots, latent_dim, dtype=torch.float32)
-
         mask = torch.zeros(self.num_slots, dtype=torch.float32)
 
         num_fields = len(self.people_ae.fields)
         Y_fields: List[torch.Tensor] = []
         for f in self.people_ae.fields:
             base = f.get_base_padding_value()
-            base = base if isinstance(base, torch.Tensor) else torch.tensor(base)
-            base = base.to(dtype=torch.long if base.dtype == torch.long else torch.float32)
+            if not isinstance(base, torch.Tensor):
+                base = torch.tensor(base)
+            if base.dtype == torch.long:
+                dtype = torch.long
+            else:
+                dtype = torch.float32
+            base = base.to(dtype=dtype)
             Y_fields.append(torch.stack([base.clone() for _ in range(self.num_slots)], dim=0))
 
         for j, nconst in enumerate(nconsts):

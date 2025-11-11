@@ -279,12 +279,9 @@ def build_joint_trainer(
     warm: bool,
     db_path: Path,
 ):
-    fresh_cfg = ProjectConfig(**vars(config))
-    fresh_cfg.use_cache = False
-    fresh_cfg.refresh_cache = True
 
-    movie_ae = TitlesAutoencoder(fresh_cfg)
-    people_ae = PeopleAutoencoder(fresh_cfg)
+    movie_ae = TitlesAutoencoder(config)
+    people_ae = PeopleAutoencoder(config)
 
     if warm:
         raise NotImplementedError("Warm start is not implemented yet.")
