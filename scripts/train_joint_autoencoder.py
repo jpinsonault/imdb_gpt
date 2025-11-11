@@ -30,7 +30,6 @@ from scripts.autoencoder.fields import (
     SingleCategoryField,
     NumericDigitCategoryField,
 )
-from scripts.autoencoder.share_policy import SharePolicy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -288,13 +287,6 @@ def build_joint_trainer(
     else:
         movie_ae.accumulate_stats()
         people_ae.accumulate_stats()
-
-        policy = (
-            SharePolicy()
-            .group("text_all", TextField)
-            .group("year_digits", NumericDigitCategoryField)
-        )
-        policy.apply(movie_ae, people_ae)
 
         movie_ae.finalize_stats()
         people_ae.finalize_stats()

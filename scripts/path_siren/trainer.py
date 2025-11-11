@@ -1,7 +1,7 @@
 import time
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -99,13 +99,12 @@ class PathSirenTrainer:
             interval_steps=int(self.cfg.path_siren_callback_interval),
             num_samples=int(self.cfg.path_siren_recon_num_samples),
             table_width=int(self.cfg.path_siren_table_width),
-            writer=self.writer.writer,
             n_slots_show=int(self.cfg.path_siren_people_count),
         )
 
         self._log_model_and_vocab_info()
 
-    def _count_params(self, module: torch.nn.Module) -> tuple[int, int]:
+    def _count_params(self, module: torch.nn.Module) -> Tuple[int, int]:
         total = 0
         trainable = 0
         for p in module.parameters():
@@ -188,18 +187,38 @@ class PathSirenTrainer:
             prev = cur
         return torch.cat(outs, dim=1)
 
+    def _time_weights(self, time_mask: torch.Tensor) -> torch.Tensor:
+        b, L = time_mask.shape
+        if L == 0:
+            return time_mask
+        idx = torch.arange(L, device=time_mask.device, dtype=torch.float32).view(1, L)
+        counts = time_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        frac = idx / counts
+        w = 1.0 - 0.5 * frac
+        w = w * time_mask
+        w_sum = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        w = w / w_sum
+        return w
+
     def _people_loss_all_steps(
         self,
         z_seq: torch.Tensor,
         tgts_per_field: List[torch.Tensor],
         time_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        return_first_last: bool = False,
+    ):
         b, L, d = z_seq.shape
         if L <= 0:
+            if return_first_last:
+                z = z_seq.new_zeros(())
+                return z, z, z
             return z_seq.new_zeros(())
 
         mask_t = time_mask[:, :L].float().clamp(0.0, 1.0)
         if mask_t.sum() <= 0:
+            if return_first_last:
+                z = z_seq.new_zeros(())
+                return z, z, z
             return z_seq.new_zeros(())
 
         flat = z_seq.reshape(b * L, d)
@@ -209,7 +228,7 @@ class PathSirenTrainer:
             y = y.reshape(b, L, *y.shape[1:])
             preds_per_field.append(y)
 
-        total = z_seq.new_zeros((b,), device=z_seq.device)
+        loss_steps = z_seq.new_zeros((b, L), device=z_seq.device)
 
         for pred, tgt, field in zip(preds_per_field, tgts_per_field, self.per_ae.fields):
             tgt_t = tgt[:, :L, ...]
@@ -232,8 +251,7 @@ class PathSirenTrainer:
                 tok_denom = tok_mask.sum(dim=2).clamp_min(1.0)
                 loss_time = (loss_tok * tok_mask).sum(dim=2) / tok_denom
 
-                time_denom = mask_t.sum(dim=1).clamp_min(1.0)
-                total = total + ((loss_time * mask_t).sum(dim=1) / time_denom)
+                loss_steps = loss_steps + loss_time
 
             elif pred.dim() == 4 and hasattr(field, "base"):
                 bs, tlen, pos, vocab = pred.shape
@@ -247,16 +265,33 @@ class PathSirenTrainer:
                 )
                 loss_pos = loss_flat.reshape(bs, tlen, pos).mean(dim=2)
 
-                time_denom = mask_t.sum(dim=1).clamp_min(1.0)
-                total = total + ((loss_pos * mask_t).sum(dim=1) / time_denom)
+                loss_steps = loss_steps + loss_pos
 
             else:
                 diff = pred - tgt_t
                 loss_feat = diff.pow(2).reshape(b, L, -1).mean(dim=2)
-                time_denom = mask_t.sum(dim=1).clamp_min(1.0)
-                total = total + ((loss_feat * mask_t).sum(dim=1) / time_denom)
+                loss_steps = loss_steps + loss_feat
 
-        return total.mean()
+        w = self._time_weights(mask_t)
+        per_sample = (loss_steps * w).sum(dim=1)
+        loss = per_sample.mean()
+
+        if not return_first_last:
+            return loss
+
+        arange = torch.arange(b, device=z_seq.device)
+
+        first_idx = torch.zeros(b, dtype=torch.long, device=z_seq.device)
+        first_loss = loss_steps[arange, first_idx]
+
+        valid_counts = mask_t.sum(dim=1).clamp_min(1.0)
+        last_idx = (valid_counts - 1).long().clamp_min(0).clamp_max(L - 1)
+        last_loss = loss_steps[arange, last_idx]
+
+        first_mean = first_loss.mean()
+        last_mean = last_loss.mean()
+
+        return loss, first_mean, last_mean
 
     def _delta_path_loss(
         self,
@@ -328,10 +363,11 @@ class PathSirenTrainer:
                 z_delta = self.model(Zt, t_grid)
                 z_seq = self._build_z_seq_from_deltas(Zt, z_delta)
 
-                loss_people = self._people_loss_all_steps(
+                people_loss_all, people_loss_first, people_loss_last = self._people_loss_all_steps(
                     z_seq=z_seq,
                     tgts_per_field=Yp_tgts,
                     time_mask=time_mask,
+                    return_first_last=True,
                 )
 
                 loss_delta_path = self._delta_path_loss(
@@ -342,7 +378,7 @@ class PathSirenTrainer:
                 )
 
                 loss = (
-                    w_people * loss_people
+                    w_people * people_loss_all
                     + w_latent_path * loss_delta_path
                 )
 
@@ -358,8 +394,10 @@ class PathSirenTrainer:
                     step,
                     {
                         "loss/total": float(loss.detach().cpu().item()),
-                        "loss/people": float(loss_people.detach().cpu().item()),
+                        "loss/people": float(people_loss_all.detach().cpu().item()),
                         "loss/path_delta": float(loss_delta_path.detach().cpu().item()),
+                        "loss/people_first": float(people_loss_first.detach().cpu().item()),
+                        "loss/people_last": float(people_loss_last.detach().cpu().item()),
                         "time/iter_s": float(iter_time),
                         "opt/lr": lr,
                     },
@@ -367,7 +405,9 @@ class PathSirenTrainer:
 
                 pbar.set_postfix(
                     loss=f"{float(loss.detach().cpu().item()):.4f}",
-                    ppl=f"{float(loss_people.detach().cpu().item()):.4f}",
+                    ppl=f"{float(people_loss_all.detach().cpu().item()):.4f}",
+                    ppl_f=f"{float(people_loss_first.detach().cpu().item()):.4f}",
+                    ppl_l=f"{float(people_loss_last.detach().cpu().item()):.4f}",
                     path_d=f"{float(loss_delta_path.detach().cpu().item()):.4f}",
                     it_s=f"{iter_time:.3f}",
                 )

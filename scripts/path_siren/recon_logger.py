@@ -15,7 +15,6 @@ class PathSirenReconstructionLogger:
         interval_steps: int = 200,
         num_samples: int = 2,
         table_width: int = 60,
-        writer=None,
         n_slots_show: int = 1,
     ):
         self.m_ae = movie_ae
@@ -24,7 +23,6 @@ class PathSirenReconstructionLogger:
         self.every = max(1, int(interval_steps))
         self.num_samples = max(1, int(num_samples))
         self.w = int(table_width)
-        self.writer = writer
         self.n_slots_show = int(max(1, n_slots_show))
 
     def _to_str(self, field, arr):
@@ -91,7 +89,7 @@ class PathSirenReconstructionLogger:
         b_idx: int,
         t_row,
         valid_people: int,
-        total_slots: int,
+        decoded_slots: int,
     ):
         tab = PrettyTable(["slot", "t", "field", "orig", "recon"])
         tab.align = "l"
@@ -102,7 +100,7 @@ class PathSirenReconstructionLogger:
             return tab
 
         n_pred = int(people_recon_fields[0].shape[1])
-        show = max(0, min(self.n_slots_show, n_pred))
+        show = max(0, min(self.n_slots_show, n_pred, decoded_slots))
 
         for i in range(show):
             t_val = float(t_row[i]) if i < len(t_row) else 0.0
@@ -177,21 +175,17 @@ class PathSirenReconstructionLogger:
         if not My or My[0].size(0) == 0:
             return
 
+        if z_seq.dim() != 3:
+            return
+
         b = int(My[0].size(0))
 
         with torch.no_grad():
-            if z_seq.dim() != 3:
-                return
-
             movie_recon_fields = self._decode_movie_latent(Z)
 
             people_recon_fields = None
             t_people = None
-            max_valid_people = 0
-
-            if mask is not None and mask.numel() > 0:
-                valid_counts = mask.sum(dim=1).to(torch.long).clamp_min(0)
-                max_valid_people = int(valid_counts.max().item())
+            decoded_slots = 0
 
             total_slots = int(t_grid.size(1)) if t_grid is not None else 0
 
@@ -201,6 +195,8 @@ class PathSirenReconstructionLogger:
                     z_people = z_seq[:, :take, :]
                     t_people = t_grid[:, :take]
                     people_recon_fields = self._decode_people_latents(z_people)
+                    if people_recon_fields:
+                        decoded_slots = int(people_recon_fields[0].shape[1])
 
         if movie_recon_fields is None:
             return
@@ -229,44 +225,26 @@ class PathSirenReconstructionLogger:
             if (
                 people_recon_fields is not None
                 and t_people is not None
-                and total_slots > 0
+                and decoded_slots > 0
+                and mask is not None
+                and mask.size(1) > 0
             ):
-                valid_people_j = 0
-                if mask is not None and mask.size(1) > 0:
-                    vc = float(mask[j].sum().item())
-                    valid_people_j = int(vc)
+                mask_row = mask[j, :decoded_slots].float().cpu()
+                valid_people_j = int(mask_row.sum().item())
 
                 t_row = [
                     float(x)
                     for x in t_people[j].detach().cpu().tolist()
                 ]
+
                 t_people_tab = self._people_table(
                     tgts_per_field=Yp_tgts,
                     people_recon_fields=people_recon_fields,
                     b_idx=j,
                     t_row=t_row,
                     valid_people=valid_people_j,
-                    total_slots=total_slots,
+                    decoded_slots=decoded_slots,
                 )
 
                 tqdm.write("\n[path-siren people along path]")
                 tqdm.write(t_people_tab.get_string())
-
-                if self.writer is not None:
-                    self.writer.add_text(
-                        "recon/path_siren_title",
-                        "```\n" + t_movie.get_string() + "\n```",
-                        global_step=global_step + 1,
-                    )
-                    self.writer.add_text(
-                        "recon/path_siren_people",
-                        "```\n" + t_people_tab.get_string() + "\n```",
-                        global_step=global_step + 1,
-                    )
-            else:
-                if self.writer is not None:
-                    self.writer.add_text(
-                        "recon/path_siren_title",
-                        "```\n" + t_movie.get_string() + "\n```",
-                        global_step=global_step + 1,
-                    )

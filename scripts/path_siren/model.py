@@ -171,6 +171,4 @@ class PathSiren(nn.Module):
         y_mod = self.proj_out(y_flat, cond_out)
         y_mod = y_mod.view(b, l, d)
 
-        base = z_title.unsqueeze(1).expand(b, l, d)
-        z = base + y_mod
-        return z
+        return y_mod
