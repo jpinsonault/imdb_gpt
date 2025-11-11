@@ -27,13 +27,8 @@ def _build_joint_style_autoencoders(cfg: ProjectConfig):
         - finalize_stats() on both
         - build_autoencoder() on both
     """
-    fresh_cfg = ProjectConfig(**vars(cfg))
-    # We want a clean recompute; ignore any legacy caches.
-    fresh_cfg.use_cache = False
-    fresh_cfg.refresh_cache = True
-
-    mov_ae = TitlesAutoencoder(fresh_cfg)
-    per_ae = PeopleAutoencoder(fresh_cfg)
+    mov_ae = TitlesAutoencoder(cfg)
+    per_ae = PeopleAutoencoder(cfg)
 
     # Same order as build_joint_trainer
     mov_ae.accumulate_stats()

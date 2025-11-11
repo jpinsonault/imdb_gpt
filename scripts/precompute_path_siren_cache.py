@@ -407,19 +407,18 @@ def _build_samples_for_chunk(
     people_fields,
 ):
     """
-    Assemble final samples for this chunk using precomputed latents and targets.
+    Build samples where the supervised path is the ordered curve over people only.
 
-    For each title we produce:
-      - Mx, My
-      - Zt (movie latent)
-      - Z_lat_tgts: (L,D) anchors (title + selected people + padded)
-      - Z_spline:  (L,D) canonical natural cubic spline along t_grid
-      - Yp_tgts:   list[ (L,...) ] people targets per field
-      - t_grid:    (L,)
-      - time_mask: (L,) 1 for positions with real anchors (title/people)
+    For each title:
+      - movie_latent: Zt (condition)
+      - Z_lat_tgts: (L,D) people latents (ordered by principals, padded)
+      - Z_spline:   (L,D) natural cubic spline through valid people anchors
+      - Yp_tgts:    list of (L,...) targets for people fields
+      - t_grid:     (L,) in [0,1]
+      - time_mask:  (L,) 1 for valid people anchors
     """
     samples = []
-    L = num_people + 1
+    L = num_people
 
     idx_for_tconst = {t: i for i, t in enumerate(tconsts)}
 
@@ -430,60 +429,70 @@ def _build_samples_for_chunk(
         My_i = [y.clone() for y in movie_My[i]]
         Zt = Zt_dict[tconst]
 
-        people = title_to_people.get(tconst, [])
+        people = title_to_people.get(tconst, [])[:num_people]
 
-        # collect anchor latents & per-person targets
-        steps = [Zt]
+        z_steps = []
         per_field_seq = [[] for _ in people_fields]
 
-        for nconst in people[:num_people]:
+        for nconst in people:
             z_p = Zp.get(nconst)
             ys = Yp.get(nconst)
             if z_p is None or ys is None:
                 continue
-            steps.append(z_p)
+            z_steps.append(z_p)
             for fi, y in enumerate(ys):
                 per_field_seq[fi].append(y)
 
-        # valid anchors: title + actual people (capped by num_people)
-        people_k = len(steps) - 1  # may be 0
-        valid_len = min(people_k + 1, L)
+        people_k = len(z_steps)
 
-        t_grid = torch.linspace(0.0, 1.0, steps=L)
-        time_mask = torch.zeros(L, dtype=torch.float32)
-        time_mask[:valid_len] = 1.0
-
-        # build Yp_tgts with dummy slot 0 + people + pad
-        Yp_tgts = []
-        for fi, f in enumerate(people_fields):
-            dummy0 = f.get_base_padding_value()
-            seq = [dummy0] + per_field_seq[fi]
-            if len(seq) < L:
-                seq += [dummy0] * (L - len(seq))
-            else:
-                seq = seq[:L]
-            Yp_tgts.append(torch.stack(seq, dim=0))
-
-        # pad or truncate steps to length L for Z_lat_tgts
-        if len(steps) < L:
-            last = steps[-1]
-            steps = steps + [last] * (L - len(steps))
-        else:
-            steps = steps[:L]
-
-        Z_lat_tgts = torch.stack(steps, dim=0)
-
-        # ----- canonical spline over the *valid* anchors -----
-        # If we have at least 2 anchors, build a natural cubic spline
-        # that passes exactly through those latents, then evaluate on t_grid.
-        if valid_len >= 2:
-            knots_t = t_grid[:valid_len]
-            knots_z = Z_lat_tgts[:valid_len]  # (valid_len, D)
-            m = _natural_cubic_spline_m(knots_t, knots_z)
-            Z_spline = _eval_spline_on_grid(knots_t, knots_z, m, t_grid)
-        else:
-            # Degenerate: no people anchors → constant path at title latent
+        if L <= 0:
+            t_grid = torch.zeros(0, dtype=torch.float32)
+            time_mask = torch.zeros(0, dtype=torch.float32)
+            Z_lat_tgts = torch.zeros(0, Zt.shape[0])
+            Yp_tgts = [
+                torch.zeros(
+                    0,
+                    *f.get_base_padding_value().shape,
+                    dtype=f.get_base_padding_value().dtype,
+                )
+                for f in people_fields
+            ]
             Z_spline = Z_lat_tgts.clone()
+        else:
+            t_grid = torch.linspace(0.0, 1.0, steps=L)
+
+            valid_len = min(people_k, L)
+            time_mask = torch.zeros(L, dtype=torch.float32)
+            if valid_len > 0:
+                time_mask[:valid_len] = 1.0
+
+            Yp_tgts = []
+            for fi, f in enumerate(people_fields):
+                dummy = f.get_base_padding_value()
+                seq = per_field_seq[fi][:valid_len]
+                if len(seq) < L:
+                    seq += [dummy] * (L - len(seq))
+                if seq:
+                    Yp_tgts.append(torch.stack(seq, dim=0))
+                else:
+                    Yp_tgts.append(torch.stack([dummy] * L, dim=0))
+
+            if people_k == 0:
+                Z_lat_tgts = Zt.unsqueeze(0).expand(L, -1)
+                Z_spline = Z_lat_tgts.clone()
+            else:
+                if len(z_steps) < L:
+                    last = z_steps[-1]
+                    z_steps += [last] * (L - len(z_steps))
+                Z_lat_tgts = torch.stack(z_steps, dim=0)
+
+                if valid_len >= 2:
+                    knots_t = t_grid[:valid_len]
+                    knots_z = Z_lat_tgts[:valid_len]
+                    m = _natural_cubic_spline_m(knots_t, knots_z)
+                    Z_spline = _eval_spline_on_grid(knots_t, knots_z, m, t_grid)
+                else:
+                    Z_spline = Z_lat_tgts.clone()
 
         samples.append(
             {
@@ -499,6 +508,7 @@ def _build_samples_for_chunk(
         )
 
     return samples
+
 
 
 @torch.no_grad()

@@ -47,6 +47,7 @@ class ProjectConfig:
     lr_warmup_ratio: float = 0.05
     lr_min_factor: float = 0.05
 
+    # Path Siren
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
     path_siren_weight_decay: float = 0.0
@@ -63,25 +64,19 @@ class ProjectConfig:
 
     path_siren_movie_limit: int | None = None
 
-    # title-level
+    # title-level: if you keep these nonzero, they should be used
+    # only against the separate movie latent (not path slots).
     path_siren_loss_w_title_latent: float = 1.0
     path_siren_loss_w_title_recon: float = 1.0
 
-    # people reconstruction along the path
+    # people + path supervision
     path_siren_loss_w_people: float = 1.0
-
-    # main path supervision:
-    #  - with Z_spline: ||z_seq - Z_spline||
-    #  - without:       ||z_seq - Z_lat_tgts||
     path_siren_loss_w_latent_path: float = 1.0
-
-    # optional priors used only when no Z_spline is provided
-    path_siren_loss_w_straight: float = 0.0
-    path_siren_loss_w_curvature: float = 0.0
 
     path_siren_seed: int = 1337
     path_siren_time_fourier: int = 0
 
+    # Image AE / Image Siren (unchanged)
     image_ae_data_dir: str = "data/image_autoencoder"
     image_ae_runs_dir: str = "runs/image_autoencoder"
     image_ae_image_size: int = 128

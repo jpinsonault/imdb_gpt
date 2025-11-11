@@ -1,5 +1,3 @@
-# scripts/path_siren/trainer.py
-
 import time
 import logging
 from pathlib import Path
@@ -182,17 +180,16 @@ class PathSirenTrainer:
         time_mask: torch.Tensor,
     ) -> torch.Tensor:
         b, L, d = z_seq.shape
-        if L <= 1:
+        if L <= 0:
             return z_seq.new_zeros(())
 
-        z_people = z_seq[:, 1:, :]
-        T = z_people.size(1)
-        mask_t = time_mask[:, 1:].float().clamp(0.0, 1.0)
+        T = L
+        mask_t = time_mask[:, :T].float().clamp(0.0, 1.0)
 
         if T <= 0 or mask_t.sum() <= 0:
             return z_seq.new_zeros(())
 
-        flat = z_people.reshape(b * T, d)
+        flat = z_seq.reshape(b * T, d)
         preds_per_field = []
         for dec in self.per_ae.decoder.decs:
             y = dec(flat)
@@ -202,7 +199,7 @@ class PathSirenTrainer:
         total = z_seq.new_zeros((b,), device=z_seq.device)
 
         for pred, tgt, field in zip(preds_per_field, tgts_per_field, self.per_ae.fields):
-            tgt_t = tgt[:, 1:, ...]
+            tgt_t = tgt[:, :T, ...]
 
             if pred.dim() == 4 and hasattr(field, "tokenizer"):
                 bs, tlen, slen, vocab = pred.shape
@@ -255,9 +252,11 @@ class PathSirenTrainer:
         time_mask: torch.Tensor,
     ) -> torch.Tensor:
         b, L, d = z_seq.shape
-        if L <= 1:
+        if L <= 0:
             return z_seq.new_zeros(())
         mask = time_mask.float()
+        if mask.sum() <= 0:
+            return z_seq.new_zeros(())
         mse = (z_seq - z_targets).pow(2).mean(dim=2)
         denom = mask.sum(dim=1).clamp_min(1.0)
         per_sample = (mse * mask).sum(dim=1) / denom
@@ -284,179 +283,11 @@ class PathSirenTrainer:
         per_sample = (diff * mask).sum(dim=1) / denom
         return per_sample.mean()
 
-    def _movie_loss_at_t0(
-        self,
-        preds_per_field: List[torch.Tensor],
-        movie_targets: List[torch.Tensor],
-    ) -> torch.Tensor:
-        total = preds_per_field[0].new_zeros((preds_per_field[0].size(0),))
-
-        for pred, tgt, field in zip(preds_per_field, movie_targets, self.mov_ae.fields):
-            b = pred.size(0)
-
-            if pred.dim() == 3 and hasattr(field, "tokenizer"):
-                l, v = pred.shape[-2], pred.shape[-1]
-                pad_id = int(getattr(field, "pad_token_id", 0))
-
-                loss_flat = torch.nn.functional.cross_entropy(
-                    pred.reshape(b * l, v),
-                    tgt.reshape(b * l),
-                    ignore_index=pad_id,
-                    reduction="none",
-                )
-                total = total + loss_flat.reshape(b, l).mean(dim=1)
-
-            elif pred.dim() == 3 and hasattr(field, "base"):
-                p, v = pred.shape[-2], pred.shape[-1]
-                loss_flat = torch.nn.functional.cross_entropy(
-                    pred.reshape(b * p, v),
-                    tgt.reshape(b * p).long(),
-                    reduction="none",
-                )
-                total = total + loss_flat.reshape(b, p).mean(dim=1)
-
-            else:
-                mse = (
-                    torch.nn.functional.mse_loss(
-                        pred,
-                        tgt,
-                        reduction="none",
-                    )
-                    .reshape(b, -1)
-                    .mean(dim=1)
-                )
-                total = total + mse
-
-        return total.mean()
-
-    def _straightness_loss(
-        self,
-        z_seq: torch.Tensor,
-        t_grid: torch.Tensor,
-        time_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        b, L, d = z_seq.shape
-        if L <= 1:
-            return z_seq.new_zeros(())
-
-        idx_last = time_mask.sum(dim=1).long().clamp(min=1) - 1
-        arange_b = torch.arange(b, device=z_seq.device)
-
-        z0 = z_seq[:, 0, :]
-        zend = z_seq[arange_b, idx_last, :]
-
-        t_last = t_grid[arange_b, idx_last].clamp_min(1e-6).unsqueeze(1)
-        u = (t_grid / t_last).clamp_max(1.0)
-
-        line = z0.unsqueeze(1) + u.unsqueeze(2) * (zend - z0).unsqueeze(1)
-        diffsq = (z_seq - line).pow(2).mean(dim=2)
-
-        m0 = torch.zeros_like(time_mask[:, :1], dtype=torch.float32)
-        m1 = time_mask[:, 1:].float()
-        mask = torch.cat([m0, m1], dim=1)
-
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        per_sample = (diffsq * mask).sum(dim=1) / denom
-        return per_sample.mean()
-
-    def _curvature_loss(
-        self,
-        z_seq: torch.Tensor,
-        time_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        b, L, d = z_seq.shape
-        if L < 3:
-            return z_seq.new_zeros(())
-
-        z_prev = z_seq[:, 0:L - 2, :]
-        z_cur = z_seq[:, 1:L - 1, :]
-        z_next = z_seq[:, 2:L, :]
-
-        d2 = z_prev - 2.0 * z_cur + z_next
-        curv = d2.pow(2).mean(dim=2)
-
-        mask_mid = (
-            time_mask[:, 0:L - 2]
-            * time_mask[:, 1:L - 1]
-            * time_mask[:, 2:L]
-        ).float()
-
-        denom = mask_mid.sum(dim=1).clamp_min(1.0)
-        per_sample = (curv * mask_mid).sum(dim=1) / denom
-        return per_sample.mean()
-
-    def _first_person_losses(
-        self,
-        z_seq: torch.Tensor,
-        z_targets: torch.Tensor,
-        tgts_per_field: List[torch.Tensor],
-        time_mask: torch.Tensor,
-    ):
-        b, L, d = z_seq.shape
-        if L <= 1:
-            zero = z_seq.new_zeros(())
-            return zero, zero
-
-        mask1 = time_mask[:, 1].float()
-        if mask1.sum() <= 0:
-            zero = z_seq.new_zeros(())
-            return zero, zero
-
-        z_first = z_seq[:, 1, :]
-        z_tgt_first = z_targets[:, 1, :]
-
-        diff_lat = (z_first - z_tgt_first).pow(2).mean(dim=1)
-        denom = mask1.sum().clamp_min(1.0)
-        loss_latent = (diff_lat * mask1).sum() / denom
-
-        preds = [dec(z_first) for dec in self.per_ae.decoder.decs]
-
-        total = z_seq.new_zeros((b,), device=z_seq.device)
-        for pred, tgt, field in zip(preds, tgts_per_field, self.per_ae.fields):
-            tgt1 = tgt[:, 1, ...]
-
-            if pred.dim() == 3 and hasattr(field, "tokenizer"):
-                bs, slen, vocab = pred.shape
-                pad_id = int(getattr(field, "pad_token_id", 0))
-
-                loss_flat = torch.nn.functional.cross_entropy(
-                    pred.reshape(bs * slen, vocab),
-                    tgt1.reshape(bs * slen),
-                    ignore_index=pad_id,
-                    reduction="none",
-                )
-                loss_tok = loss_flat.reshape(bs, slen)
-                tok_mask = (tgt1 != pad_id).float()
-                tok_denom = tok_mask.sum(dim=1).clamp_min(1.0)
-                loss_seq = (loss_tok * tok_mask).sum(dim=1) / tok_denom
-
-            elif pred.dim() == 3 and hasattr(field, "base"):
-                bs, pos, vocab = pred.shape
-                loss_flat = torch.nn.functional.cross_entropy(
-                    pred.reshape(bs * pos, vocab),
-                    tgt1.reshape(bs * pos).long(),
-                    reduction="none",
-                )
-                loss_seq = loss_flat.reshape(bs, pos).mean(dim=1)
-
-            else:
-                diff_f = pred - tgt1
-                loss_seq = diff_f.pow(2).reshape(b, -1).mean(dim=1)
-
-            total = total + loss_seq
-
-        loss_recon = (total * mask1).sum() / denom
-        return loss_latent, loss_recon
-
     def train(self):
         epochs = int(self.cfg.path_siren_epochs)
         save_every = int(self.cfg.path_siren_save_interval)
-        w_title_latent = float(self.cfg.path_siren_loss_w_title_latent)
-        w_title_recon = float(self.cfg.path_siren_loss_w_title_recon)
         w_people = float(self.cfg.path_siren_loss_w_people)
         w_latent_path = float(self.cfg.path_siren_loss_w_latent_path)
-        w_straight = float(self.cfg.path_siren_loss_w_straight)
-        w_curv = float(self.cfg.path_siren_loss_w_curvature)
         flush_every = int(self.cfg.flush_interval)
 
         step = 0
@@ -491,11 +322,6 @@ class PathSirenTrainer:
 
                 z_seq = self.model(Zt, t_grid)
 
-                z0 = z_seq[:, 0, :]
-                preds_movie = [dec(z0) for dec in self.mov_ae.decoder.decs]
-                loss_movie_t0 = self._movie_loss_at_t0(preds_movie, My)
-                loss_latent_t0 = torch.nn.functional.mse_loss(z0, Zt)
-
                 loss_people = self._people_loss_all_steps(z_seq, Yp_tgts, time_mask)
 
                 if Z_spline is not None:
@@ -510,8 +336,6 @@ class PathSirenTrainer:
                         time_mask=time_mask,
                     )
                     loss_latent_path = loss_spline_path
-                    loss_straight_val = z_seq.new_zeros(())
-                    loss_curv_val = z_seq.new_zeros(())
                 else:
                     loss_spline_path = z_seq.new_zeros(())
                     loss_anchor_path = self._latent_path_loss(
@@ -520,37 +344,10 @@ class PathSirenTrainer:
                         time_mask=time_mask,
                     )
                     loss_latent_path = loss_anchor_path
-                    loss_straight_val = (
-                        self._straightness_loss(z_seq, t_grid, time_mask)
-                        if w_straight > 0.0
-                        else z_seq.new_zeros(())
-                    )
-                    loss_curv_val = (
-                        self._curvature_loss(z_seq, time_mask)
-                        if w_curv > 0.0
-                        else z_seq.new_zeros(())
-                    )
-
-                loss_first_latent, loss_first_recon = self._first_person_losses(
-                    z_seq=z_seq,
-                    z_targets=Z_lat_tgts,
-                    tgts_per_field=Yp_tgts,
-                    time_mask=time_mask,
-                )
-                loss_first_total = loss_first_latent + loss_first_recon
-
-                loss_title = (
-                    w_title_latent * loss_latent_t0
-                    + w_title_recon * loss_movie_t0
-                )
 
                 loss = (
                     w_people * loss_people
                     + w_latent_path * loss_latent_path
-                    + w_title_latent * loss_latent_t0
-                    + w_title_recon * loss_movie_t0
-                    + w_straight * loss_straight_val
-                    + w_curv * loss_curv_val
                 )
 
                 self.optim.zero_grad(set_to_none=True)
@@ -567,14 +364,6 @@ class PathSirenTrainer:
                         "loss/total": float(loss.detach().cpu().item()),
                         "loss/people": float(loss_people.detach().cpu().item()),
                         "loss/path": float(loss_latent_path.detach().cpu().item()),
-                        "loss/title_latent_t0": float(loss_latent_t0.detach().cpu().item()),
-                        "loss/title_recon_t0": float(loss_movie_t0.detach().cpu().item()),
-                        "loss/title_total": float(loss_title.detach().cpu().item()),
-                        "loss/straight": float(loss_straight_val.detach().cpu().item()),
-                        "loss/curvature": float(loss_curv_val.detach().cpu().item()),
-                        "loss/first_person_latent": float(loss_first_latent.detach().cpu().item()),
-                        "loss/first_person_recon": float(loss_first_recon.detach().cpu().item()),
-                        "loss/first_person_total": float(loss_first_total.detach().cpu().item()),
                         "debug/path_spline": float(loss_spline_path.detach().cpu().item()),
                         "debug/path_anchors": float(loss_anchor_path.detach().cpu().item()),
                         "time/iter_s": float(iter_time),
@@ -586,11 +375,6 @@ class PathSirenTrainer:
                     loss=f"{float(loss.detach().cpu().item()):.4f}",
                     ppl=f"{float(loss_people.detach().cpu().item()):.4f}",
                     path=f"{float(loss_latent_path.detach().cpu().item()):.4f}",
-                    t_lat=f"{float(loss_latent_t0.detach().cpu().item()):.4f}",
-                    t_rec=f"{float(loss_movie_t0.detach().cpu().item()):.4f}",
-                    fp=f"{float(loss_first_total.detach().cpu().item()):.4f}",
-                    strt=f"{float(loss_straight_val.detach().cpu().item()):.4f}",
-                    curv=f"{float(loss_curv_val.detach().cpu().item()):.4f}",
                     it_s=f"{iter_time:.3f}",
                 )
 
@@ -603,6 +387,8 @@ class PathSirenTrainer:
                     z_seq=z_seq.detach(),
                     mask=time_mask,
                     Yp_tgts=Yp_tgts,
+                    Z_lat_tgts=Z_lat_tgts,
+                    Z_spline=Z_spline,
                 )
 
                 step += 1

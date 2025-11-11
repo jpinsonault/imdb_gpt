@@ -62,12 +62,11 @@ class PathSirenReconstructionLogger:
         My: List[torch.Tensor],
         movie_recon_fields,
         b_idx: int,
-        t0: float,
     ):
-        tab = PrettyTable(["t", "field", "orig", "recon@t"])
+        tab = PrettyTable(["field", "orig", "recon"])
         tab.align = "l"
         tab.max_width["orig"] = self.w
-        tab.max_width["recon@t"] = self.w
+        tab.max_width["recon"] = self.w
 
         for f, y_tgt_b, y_rec_b in zip(
             self.m_ae.fields,
@@ -78,7 +77,6 @@ class PathSirenReconstructionLogger:
             recs = self._to_str(f, y_rec_b)
             tab.add_row(
                 [
-                    f"{float(t0):.3f}",
                     f.name,
                     orig[: self.w],
                     recs[: self.w],
@@ -104,7 +102,7 @@ class PathSirenReconstructionLogger:
             return tab
 
         n_pred = int(people_recon_fields[0].shape[1])
-        show = max(0, min(self.n_slots_show, n_pred, max(0, total_slots - 1)))
+        show = max(0, min(self.n_slots_show, n_pred))
 
         for i in range(show):
             t_val = float(t_row[i]) if i < len(t_row) else 0.0
@@ -131,9 +129,9 @@ class PathSirenReconstructionLogger:
                     tgts_per_field is not None
                     and f_idx < len(tgts_per_field)
                     and tgts_per_field[f_idx].dim() >= 2
-                    and tgts_per_field[f_idx].size(1) > i + 1
+                    and tgts_per_field[f_idx].size(1) > i
                 ):
-                    tgt_row = tgts_per_field[f_idx][b_idx, i + 1]
+                    tgt_row = tgts_per_field[f_idx][b_idx, i]
                     orig = self._to_str(f, tgt_row.detach().cpu().numpy())
 
                 tab.add_row(
@@ -186,26 +184,24 @@ class PathSirenReconstructionLogger:
             if z_seq.dim() != 3:
                 return
 
-            z_t0 = z_seq[:, 0, :]
-            movie_recon_fields = self._decode_movie_latent(z_t0)
+            # Movie comes from the conditioning latent Z, not from the path slots.
+            movie_recon_fields = self._decode_movie_latent(Z)
 
             people_recon_fields = None
             t_people = None
             max_valid_people = 0
 
             if mask is not None and mask.numel() > 0:
-                valid_counts = mask.sum(dim=1).to(torch.long).clamp_min(1)
-                max_valid_people = int(
-                    (valid_counts.max() - 1).clamp_min(0).item()
-                )
+                valid_counts = mask.sum(dim=1).to(torch.long).clamp_min(0)
+                max_valid_people = int(valid_counts.max().item())
 
             total_slots = int(t_grid.size(1)) if t_grid is not None else 0
 
-            if total_slots > 1:
-                take = min(self.n_slots_show, total_slots - 1)
+            if total_slots > 0:
+                take = min(self.n_slots_show, total_slots)
                 if take > 0:
-                    z_people = z_seq[:, 1 : 1 + take, :]
-                    t_people = t_grid[:, 1 : 1 + take]
+                    z_people = z_seq[:, :take, :]
+                    t_people = t_grid[:, :take]
                     people_recon_fields = self._decode_people_latents(z_people)
 
         if movie_recon_fields is None:
@@ -218,8 +214,6 @@ class PathSirenReconstructionLogger:
         ).tolist()
 
         for j in idxs:
-            t0 = float(t_grid[j, 0].item()) if t_grid is not None else 0.0
-
             try:
                 title_header = self._title_string_from_recon(
                     [y[j] for y in movie_recon_fields]
@@ -227,9 +221,9 @@ class PathSirenReconstructionLogger:
             except Exception:
                 title_header = ""
 
-            t_movie = self._movie_table(My, movie_recon_fields, j, t0)
+            t_movie = self._movie_table(My, movie_recon_fields, j)
 
-            tqdm.write("\n[path-siren title @ t=0]")
+            tqdm.write("\n[path-siren title (conditioning latent)]")
             if title_header:
                 tqdm.write(f"title: {title_header[: self.w]}")
             tqdm.write(t_movie.get_string())
@@ -237,12 +231,12 @@ class PathSirenReconstructionLogger:
             if (
                 people_recon_fields is not None
                 and t_people is not None
-                and total_slots > 1
+                and total_slots > 0
             ):
                 valid_people_j = 0
                 if mask is not None and mask.size(1) > 0:
-                    vc = int(mask[j].sum().item())
-                    valid_people_j = max(0, vc - 1)
+                    vc = float(mask[j].sum().item())
+                    valid_people_j = int(vc)
 
                 t_row = [
                     float(x)
@@ -257,9 +251,7 @@ class PathSirenReconstructionLogger:
                     total_slots=total_slots,
                 )
 
-                tqdm.write(
-                    f"\n[path-siren people @ fixed Δt=1/{max(1, total_slots - 1)}]"
-                )
+                tqdm.write("\n[path-siren people along spline]")
                 tqdm.write(t_people_tab.get_string())
 
                 if self.writer is not None:
