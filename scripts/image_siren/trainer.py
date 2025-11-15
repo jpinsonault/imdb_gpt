@@ -1,4 +1,5 @@
 import os
+import math
 import json
 from datetime import datetime
 from typing import Optional, Tuple
@@ -15,6 +16,23 @@ from scripts.image_siren.dataset import ImagePairDataset
 from scripts.image_siren.model import ImageCondSiren
 from scripts.image_siren.recon_logger import ImageSirenReconstructionSaver
 from scripts.image_siren.video_export import make_recon_video
+
+
+class SinLRScheduler:
+    def __init__(self, optimizer, base_lr: float, min_lr: float, total_steps: int):
+        self.optimizer = optimizer
+        self.base_lr = float(base_lr)
+        self.min_lr = float(min_lr)
+        self.total_steps = max(1, int(total_steps))
+        self.i = 0
+
+    def step(self) -> float:
+        t = min(self.i, self.total_steps)
+        lr = self.min_lr + (self.base_lr - self.min_lr) * math.sin(math.pi * t / self.total_steps)
+        for g in self.optimizer.param_groups:
+            g["lr"] = lr
+        self.i += 1
+        return lr
 
 
 def get_device() -> torch.device:
@@ -76,12 +94,27 @@ class ImageSirenTrainer:
         if self.image_repeats < 1:
             self.image_repeats = 1
 
+        train_root = cfg.image_ae_data_dir
+        eval_root = getattr(cfg, "image_siren_eval_data_dir", None)
+
         self.dataset = ImagePairDataset(
-            root=cfg.image_ae_data_dir,
+            root=train_root,
             ae_size=ae_size,
             siren_size=siren_size,
             density_alpha=self.density_alpha,
         )
+
+        self.eval_dataset = None
+        if isinstance(eval_root, str) and os.path.isdir(eval_root):
+            try:
+                self.eval_dataset = ImagePairDataset(
+                    root=eval_root,
+                    ae_size=ae_size,
+                    siren_size=siren_size,
+                    density_alpha=self.density_alpha,
+                )
+            except Exception:
+                self.eval_dataset = None
 
         if len(self.dataset) == 0:
             raise RuntimeError("image_ae_data_dir is empty or has no valid images")
@@ -97,6 +130,17 @@ class ImageSirenTrainer:
             pin_memory=torch.cuda.is_available(),
             drop_last=drop_last,
         )
+
+        self.eval_loader = None
+        if self.eval_dataset is not None and len(self.eval_dataset) > 0:
+            self.eval_loader = DataLoader(
+                self.eval_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=int(getattr(cfg, "num_workers", 0) or 0),
+                pin_memory=torch.cuda.is_available(),
+                drop_last=False,
+            )
 
         self.encoder = ConvAutoencoder(
             in_channels=cfg.image_ae_in_channels,
@@ -141,20 +185,39 @@ class ImageSirenTrainer:
             num_workers=0,
             drop_last=False,
         )
-        sample_ae, sample_tgt, _ = next(iter(sample_loader))
+        sample_ae_t, sample_tgt_t, _ = next(iter(sample_loader))
+
+        samples = {"train": (sample_ae_t, sample_tgt_t)}
+
+        if self.eval_dataset is not None and len(self.eval_dataset) > 0:
+            eval_bs = min(
+                int(getattr(cfg, "image_siren_eval_max_samples", cfg.image_siren_max_recon_samples)),
+                len(self.eval_dataset),
+            )
+            eval_loader = DataLoader(
+                self.eval_dataset,
+                batch_size=eval_bs,
+                shuffle=True,
+                num_workers=0,
+                drop_last=False,
+            )
+            sample_ae_e, sample_tgt_e, _ = next(iter(eval_loader))
+            samples["eval"] = (sample_ae_e, sample_tgt_e)
 
         self.recon_saver = ImageSirenReconstructionSaver(
             output_dir=self.run_dir,
-            sample_ae=sample_ae,
-            sample_target=sample_tgt,
-            every_n_epochs=cfg.image_siren_recon_every,
+            samples=samples,
+            every_n_epochs=int(getattr(cfg, "image_siren_eval_recon_every", cfg.image_siren_recon_every)),
             max_samples=cfg.image_siren_max_recon_samples,
             image_size=cfg.image_siren_image_size,
         )
 
+        self.lr_initial = float(cfg.image_siren_lr)
+        self.lr_min = self.lr_initial / 10.0
+
         self.optimizer = torch.optim.Adam(
             self.siren.parameters(),
-            lr=float(cfg.image_siren_lr),
+            lr=self.lr_initial,
         )
 
         self.w_l1 = float(cfg.image_siren_loss_w_l1)
@@ -387,6 +450,42 @@ class ImageSirenTrainer:
 
         return loss
 
+    @torch.no_grad()
+    def _eval_epoch_full(self) -> dict[str, float]:
+        if self.eval_loader is None:
+            return {}
+
+        self.siren.eval()
+        total_l1 = 0.0
+        total_mse = 0.0
+        total_pix = 0
+
+        for imgs_ae, imgs_siren, _ in self.eval_loader:
+            b, c, h, w = imgs_siren.shape
+            imgs_ae = imgs_ae.to(self.device, non_blocking=True)
+            imgs_siren = imgs_siren.to(self.device, non_blocking=True)
+
+            z = self.encoder.encode(imgs_ae)
+
+            coords = self.coord_grid.unsqueeze(0).repeat(b, 1, 1).to(self.device)
+            logits = self.siren(coords, z)
+            pred = torch.sigmoid(logits)
+            pred = pred.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+
+            diff = (pred - imgs_siren).abs()
+            diff2 = (pred - imgs_siren).pow(2)
+
+            total_l1 += float(diff.sum().detach().cpu())
+            total_mse += float(diff2.sum().detach().cpu())
+            total_pix += int(b * c * h * w)
+
+        if total_pix <= 0:
+            return {}
+
+        avg_l1 = total_l1 / total_pix
+        avg_mse = total_mse / total_pix
+        return {"eval_l1": avg_l1, "eval_mse": avg_mse}
+
     def train(self):
         epochs = int(self.cfg.image_siren_epochs)
         global_step = 0
@@ -394,6 +493,9 @@ class ImageSirenTrainer:
         print(f"device: {self.device}")
         print(f"dataset root: {self.cfg.image_ae_data_dir}")
         print(f"dataset size: {len(self.dataset)} images")
+        if self.eval_dataset is not None:
+            print(f"eval dataset root: {getattr(self.cfg, 'image_siren_eval_data_dir', None)}")
+            print(f"eval dataset size: {len(self.eval_dataset)} images")
         print(f"batch size: {self.cfg.image_siren_batch_size}")
         print(f"siren target size: {self.cfg.image_siren_image_size}")
         print(f"samples per image: {self.samples_per_image}")
@@ -403,6 +505,15 @@ class ImageSirenTrainer:
         print(f"run dir: {self.run_dir}")
         print("siren model:")
         print(self.siren)
+
+        steps_per_epoch = self.image_repeats * max(1, len(self.loader))
+        total_steps = max(1, epochs * steps_per_epoch)
+        scheduler = SinLRScheduler(
+            optimizer=self.optimizer,
+            base_lr=self.lr_initial,
+            min_lr=self.lr_min,
+            total_steps=total_steps,
+        )
 
         for epoch in range(1, epochs + 1):
             self.siren.train()
@@ -418,6 +529,8 @@ class ImageSirenTrainer:
                 )
 
                 for imgs_ae, imgs_siren, densities in pbar:
+                    lr_now = scheduler.step()
+
                     imgs_ae = imgs_ae.to(self.device, non_blocking=True)
                     imgs_siren = imgs_siren.to(self.device, non_blocking=True)
 
@@ -433,10 +546,11 @@ class ImageSirenTrainer:
                     total_batches += 1
                     global_step += 1
 
-                    pbar.set_postfix(loss=f"{loss_val:.6f}")
+                    pbar.set_postfix(loss=f"{loss_val:.6f}", lr=f"{lr_now:.6e}")
 
                     if self.writer is not None:
                         self.writer.add_scalar("train/loss_step", loss_val, global_step)
+                        self.writer.add_scalar("train/lr_step", lr_now, global_step)
 
             if total_batches == 0:
                 raise RuntimeError("No batches produced. Check dataset and batch size.")
@@ -455,7 +569,13 @@ class ImageSirenTrainer:
                 coord_grid=self.coord_grid,
             )
 
-            ckpt_path = os.path.join(self.run_dir, f"image_siren_epoch_{epoch:04d}.pt")
+            if self.eval_loader is not None:
+                eval_stats = self._eval_epoch_full()
+                if eval_stats and self.writer is not None:
+                    for k, v in eval_stats.items():
+                        self.writer.add_scalar(f"{k}", v, epoch)
+
+            ckpt_path = os.path.join(self.run_dir, f"image_siren.pt")
             torch.save(
                 {
                     "epoch": epoch,

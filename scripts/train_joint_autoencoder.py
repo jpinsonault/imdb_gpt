@@ -36,8 +36,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a = F.normalize(a, dim=-1)
-    b = F.normalize(b, dim=-1)
     return a @ b.t()
 
 
@@ -154,7 +152,10 @@ class _TypedEncoder(nn.Module):
         device = z.device
         type_onehot = z.new_zeros(b, self.type_dim)
         type_onehot[:, self.type_index] = 1.0
-        return self.film(z, type_onehot)
+        z = self.film(z, type_onehot)
+        z = F.normalize(z, dim=-1)
+        return z
+
 
 
 class JointAutoencoder(nn.Module):

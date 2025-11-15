@@ -23,4 +23,5 @@ dependencies = [
     "mlx-lm>=0.28.3",
     "huggingface-hub>=0.34.1",
     "imageio>=2.37.2",
+    "flask-sock>=0.7.0",
 ]
