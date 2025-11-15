@@ -34,13 +34,6 @@ def _build_joint_style_autoencoders(cfg: ProjectConfig):
     mov_ae.accumulate_stats()
     per_ae.accumulate_stats()
 
-    policy = (
-        SharePolicy()
-        .group("text_all", TextField)
-        .group("year_digits", NumericDigitCategoryField)
-    )
-    policy.apply(mov_ae, per_ae)
-
     mov_ae.finalize_stats()
     per_ae.finalize_stats()
 

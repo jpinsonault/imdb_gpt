@@ -51,7 +51,7 @@ class ProjectConfig:
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
     path_siren_weight_decay: float = 0.0
-    path_siren_epochs: int = 100
+    path_siren_epochs: int = 1000
     path_siren_layers: int = 10
     path_siren_hidden_mult: float = 4.0
     path_siren_omega0_first: float = 30.0
