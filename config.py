@@ -100,15 +100,16 @@ class ProjectConfig:
     image_siren_hidden_layers: int = 20
     image_siren_w0_first: float = 30.0
     image_siren_w0_hidden: float = 1
-    image_siren_lr: float = 1e-4
+    image_siren_lr: float = 1e-3
     image_siren_epochs: int = 500
     image_siren_batch_size: int = 6
     image_siren_recon_every: int = 10
-    image_siren_max_recon_samples: int = 4
+    image_siren_max_recon_samples: int = 8
     image_siren_loss_w_l1: float = 1.0
     image_siren_loss_w_mse: float = 0.0
     image_siren_from_latent_sigmoid: bool = True
     image_siren_image_size: int = 256
+    image_siren_eval_data_dir: str = "data/image_siren_eval"
 
     image_siren_samples_per_image: int = 4096
     image_siren_density_alpha: float = 0.9
