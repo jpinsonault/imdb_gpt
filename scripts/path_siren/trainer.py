@@ -82,7 +82,6 @@ class PathSirenTrainer:
             Yp0,
             t_grid0,
             time_mask0,
-            Z_spline0,
         ) = next(iter(self.loader))
         Zt0 = Zt0.to(self.device)
         t_grid0 = t_grid0.to(self.device)
@@ -173,6 +172,22 @@ class PathSirenTrainer:
         if self.writer and self.writer.writer:
             self.writer.writer.add_text("debug/model_and_vocab", f"```\n{text}\n```", 0)
 
+    def _build_z_seq_from_deltas(
+        self,
+        Zt: torch.Tensor,
+        z_delta: torch.Tensor,
+    ) -> torch.Tensor:
+        b, L, d = z_delta.shape
+        if L == 0:
+            return Zt.new_zeros((b, 0, d))
+        outs = []
+        prev = Zt
+        for t in range(L):
+            cur = prev + z_delta[:, t, :]
+            outs.append(cur.unsqueeze(1))
+            prev = cur
+        return torch.cat(outs, dim=1)
+
     def _people_loss_all_steps(
         self,
         z_seq: torch.Tensor,
@@ -183,23 +198,21 @@ class PathSirenTrainer:
         if L <= 0:
             return z_seq.new_zeros(())
 
-        T = L
-        mask_t = time_mask[:, :T].float().clamp(0.0, 1.0)
-
-        if T <= 0 or mask_t.sum() <= 0:
+        mask_t = time_mask[:, :L].float().clamp(0.0, 1.0)
+        if mask_t.sum() <= 0:
             return z_seq.new_zeros(())
 
-        flat = z_seq.reshape(b * T, d)
+        flat = z_seq.reshape(b * L, d)
         preds_per_field = []
         for dec in self.per_ae.decoder.decs:
             y = dec(flat)
-            y = y.reshape(b, T, *y.shape[1:])
+            y = y.reshape(b, L, *y.shape[1:])
             preds_per_field.append(y)
 
         total = z_seq.new_zeros((b,), device=z_seq.device)
 
         for pred, tgt, field in zip(preds_per_field, tgts_per_field, self.per_ae.fields):
-            tgt_t = tgt[:, :T, ...]
+            tgt_t = tgt[:, :L, ...]
 
             if pred.dim() == 4 and hasattr(field, "tokenizer"):
                 bs, tlen, slen, vocab = pred.shape
@@ -239,48 +252,42 @@ class PathSirenTrainer:
 
             else:
                 diff = pred - tgt_t
-                loss_feat = diff.pow(2).reshape(b, T, -1).mean(dim=2)
+                loss_feat = diff.pow(2).reshape(b, L, -1).mean(dim=2)
                 time_denom = mask_t.sum(dim=1).clamp_min(1.0)
                 total = total + ((loss_feat * mask_t).sum(dim=1) / time_denom)
 
         return total.mean()
 
-    def _latent_path_loss(
+    def _delta_path_loss(
         self,
-        z_seq: torch.Tensor,
-        z_targets: torch.Tensor,
+        z_delta: torch.Tensor,
+        Zt: torch.Tensor,
+        Z_lat_tgts: torch.Tensor,
         time_mask: torch.Tensor,
     ) -> torch.Tensor:
-        b, L, d = z_seq.shape
+        b, L, d = z_delta.shape
         if L <= 0:
-            return z_seq.new_zeros(())
-        mask = time_mask.float()
+            return z_delta.new_zeros(())
+
+        mask = time_mask[:, :L].float().clamp(0.0, 1.0)
         if mask.sum() <= 0:
-            return z_seq.new_zeros(())
-        mse = (z_seq - z_targets).pow(2).mean(dim=2)
+            return z_delta.new_zeros(())
+
+        if Z_lat_tgts.size(1) < L:
+            raise RuntimeError(
+                f"Z_lat_tgts too short: {Z_lat_tgts.size()} for L={L}"
+            )
+
+        base = Z_lat_tgts.new_zeros((b, L, d))
+        base[:, 0, :] = Zt
+        if L > 1:
+            base[:, 1:, :] = Z_lat_tgts[:, : L - 1, :]
+
+        delta_tgt = Z_lat_tgts[:, :L, :] - base
+
+        mse = (z_delta - delta_tgt).pow(2).mean(dim=2)
         denom = mask.sum(dim=1).clamp_min(1.0)
         per_sample = (mse * mask).sum(dim=1) / denom
-        return per_sample.mean()
-
-    def _spline_path_loss(
-        self,
-        z_seq: torch.Tensor,
-        z_spline: torch.Tensor,
-        time_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if z_spline is None:
-            return z_seq.new_zeros(())
-        if z_spline.shape != z_seq.shape:
-            raise RuntimeError(
-                f"Z_spline shape mismatch: got {tuple(z_spline.shape)}, "
-                f"expected {tuple(z_seq.shape)}"
-            )
-        mask = time_mask.float()
-        if mask.sum() <= 0:
-            return z_seq.new_zeros(())
-        diff = (z_seq - z_spline).pow(2).mean(dim=2)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        per_sample = (diff * mask).sum(dim=1) / denom
         return per_sample.mean()
 
     def train(self):
@@ -307,7 +314,6 @@ class PathSirenTrainer:
                 Yp_tgts,
                 t_grid,
                 time_mask,
-                Z_spline,
             ) in pbar:
                 t0 = time.perf_counter()
 
@@ -318,36 +324,26 @@ class PathSirenTrainer:
                 Yp_tgts = [y.to(self.device) for y in Yp_tgts]
                 t_grid = t_grid.to(self.device)
                 time_mask = time_mask.to(self.device)
-                Z_spline = Z_spline.to(self.device) if Z_spline is not None else None
 
-                z_seq = self.model(Zt, t_grid)
+                z_delta = self.model(Zt, t_grid)
+                z_seq = self._build_z_seq_from_deltas(Zt, z_delta)
 
-                loss_people = self._people_loss_all_steps(z_seq, Yp_tgts, time_mask)
+                loss_people = self._people_loss_all_steps(
+                    z_seq=z_seq,
+                    tgts_per_field=Yp_tgts,
+                    time_mask=time_mask,
+                )
 
-                if Z_spline is not None:
-                    loss_spline_path = self._spline_path_loss(
-                        z_seq=z_seq,
-                        z_spline=Z_spline,
-                        time_mask=time_mask,
-                    )
-                    loss_anchor_path = self._latent_path_loss(
-                        z_seq=z_seq,
-                        z_targets=Z_lat_tgts,
-                        time_mask=time_mask,
-                    )
-                    loss_latent_path = loss_spline_path
-                else:
-                    loss_spline_path = z_seq.new_zeros(())
-                    loss_anchor_path = self._latent_path_loss(
-                        z_seq=z_seq,
-                        z_targets=Z_lat_tgts,
-                        time_mask=time_mask,
-                    )
-                    loss_latent_path = loss_anchor_path
+                loss_delta_path = self._delta_path_loss(
+                    z_delta=z_delta,
+                    Zt=Zt,
+                    Z_lat_tgts=Z_lat_tgts,
+                    time_mask=time_mask,
+                )
 
                 loss = (
                     w_people * loss_people
-                    + w_latent_path * loss_latent_path
+                    + w_latent_path * loss_delta_path
                 )
 
                 self.optim.zero_grad(set_to_none=True)
@@ -363,9 +359,7 @@ class PathSirenTrainer:
                     {
                         "loss/total": float(loss.detach().cpu().item()),
                         "loss/people": float(loss_people.detach().cpu().item()),
-                        "loss/path": float(loss_latent_path.detach().cpu().item()),
-                        "debug/path_spline": float(loss_spline_path.detach().cpu().item()),
-                        "debug/path_anchors": float(loss_anchor_path.detach().cpu().item()),
+                        "loss/path_delta": float(loss_delta_path.detach().cpu().item()),
                         "time/iter_s": float(iter_time),
                         "opt/lr": lr,
                     },
@@ -374,7 +368,7 @@ class PathSirenTrainer:
                 pbar.set_postfix(
                     loss=f"{float(loss.detach().cpu().item()):.4f}",
                     ppl=f"{float(loss_people.detach().cpu().item()):.4f}",
-                    path=f"{float(loss_latent_path.detach().cpu().item()):.4f}",
+                    path_d=f"{float(loss_delta_path.detach().cpu().item()):.4f}",
                     it_s=f"{iter_time:.3f}",
                 )
 
@@ -388,7 +382,6 @@ class PathSirenTrainer:
                     mask=time_mask,
                     Yp_tgts=Yp_tgts,
                     Z_lat_tgts=Z_lat_tgts,
-                    Z_spline=Z_spline,
                 )
 
                 step += 1

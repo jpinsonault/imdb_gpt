@@ -51,12 +51,17 @@ class CondSirenLayer(nn.Module):
     def forward(self, x, cond):
         b, l, _ = x.shape
 
-        gamma_in = torch.tanh(self.beta_in(cond)).unsqueeze(1)
+        if cond.dim() == 2:
+            cond_in = cond.unsqueeze(1).expand(b, l, -1)
+        else:
+            cond_in = cond
+
+        gamma_in = torch.tanh(self.beta_in(cond_in))
         x_mod = x * (1.0 + self.scale * gamma_in)
 
         y = self.linear(x_mod)
 
-        gamma_out = torch.tanh(self.beta_out(cond)).unsqueeze(1)
+        gamma_out = torch.tanh(self.beta_out(cond_in))
         y = y * (1.0 + self.scale * gamma_out)
 
         return self.act(y)
@@ -87,9 +92,12 @@ class PathSiren(nn.Module):
         self.layers = l
         self.t_fourier = max(0, int(time_fourier))
 
-        self.proj_in = DynLinearRowCol(d, self.c, cond_dim=d, hidden=self.h)
+        self.proj_in = nn.Linear(d, self.c)
 
         t_feats = 1 + 2 * self.t_fourier
+        self.time_feat_dim = t_feats
+        self.time_film = _CondMLP(self.time_feat_dim, 2 * self.c, self.h)
+
         siren_in = t_feats + self.c
 
         self.first = CondSirenLayer(
@@ -138,26 +146,31 @@ class PathSiren(nn.Module):
         b, d = z_title.shape
         l = int(t_grid.size(1))
 
-        z_full = z_title
-        z_proj = self.proj_in(z_full, z_full)
+        z_base = self.proj_in(z_title)
 
         t01 = t_grid.view(b * l, 1)
-        t_feat = self._time_features(t01).view(b, l, -1)
+        t_feat_flat = self._time_features(t01)
+        t_feat = t_feat_flat.view(b, l, -1)
 
-        zc = z_proj.unsqueeze(1).expand(b, l, self.c)
-        x0 = torch.cat([t_feat, zc], dim=2)
+        film_params = self.time_film(t_feat)
+        gamma, beta = film_params.chunk(2, dim=-1)
 
-        h = self.first(x0, z_proj)
+        z_base_exp = z_base.unsqueeze(1).expand(b, l, self.c)
+        z_cond = z_base_exp * (1.0 + gamma) + beta
+
+        x0 = torch.cat([t_feat, z_cond], dim=2)
+
+        h = self.first(x0, z_cond)
         for layer in self.hiddens:
-            h = layer(h, z_proj)
+            h = layer(h, z_cond)
 
         y_last = self.last(h)
         y_flat = y_last.contiguous().view(b * l, d)
 
-        cond_out = z_full.repeat_interleave(l, dim=0)
-        y_flat = self.proj_out(y_flat, cond_out)
+        cond_out = z_title.unsqueeze(1).expand(b, l, d).contiguous().view(b * l, d)
+        y_mod = self.proj_out(y_flat, cond_out)
+        y_mod = y_mod.view(b, l, d)
 
-        y = y_flat.view(b, l, d)
         base = z_title.unsqueeze(1).expand(b, l, d)
-        z = base + y
+        z = base + y_mod
         return z
