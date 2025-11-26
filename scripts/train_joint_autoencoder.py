@@ -18,7 +18,7 @@ from tqdm import tqdm
 from config import ProjectConfig, project_config
 from scripts.autoencoder.mapping_samplers import LossLedger
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.joint_edge_sampler import make_edge_sampler, EdgeEpochDataset
+from scripts.autoencoder.joint_edge_sampler import EdgeTensorCacheDataset
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.autoencoder.run_logger import build_run_logger
 from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger
@@ -30,6 +30,7 @@ from scripts.autoencoder.fields import (
     SingleCategoryField,
     NumericDigitCategoryField,
 )
+from scripts.autoencoder.precompute_joint_cache import ensure_joint_tensor_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -156,7 +157,6 @@ class _TypedEncoder(nn.Module):
         return z
 
 
-
 class JointAutoencoder(nn.Module):
     def __init__(self, movie_ae: TitlesAutoencoder, person_ae: PeopleAutoencoder):
         super().__init__()
@@ -279,7 +279,6 @@ def build_joint_trainer(
     warm: bool,
     db_path: Path,
 ):
-
     movie_ae = TitlesAutoencoder(config)
     people_ae = PeopleAutoencoder(config)
 
@@ -301,14 +300,11 @@ def build_joint_trainer(
 
     loss_logger = LossLedger()
 
-    edge_gen = make_edge_sampler(
-        db_path=str(db_path),
-        movie_ae=movie_ae,
-        person_ae=people_ae,
-        batch_size=config.batch_size,
-        refresh_batches=config.refresh_batches,
-        boost=config.weak_edge_boost,
-        loss_logger=loss_logger,
+    cache_path = ensure_joint_tensor_cache(
+        config,
+        db_path,
+        movie_ae.fields,
+        people_ae.fields,
     )
 
     num_workers = int(getattr(config, "num_workers", 0) or 0)
@@ -316,7 +312,7 @@ def build_joint_trainer(
     prefetch_factor = None if num_workers == 0 else max(1, cfg_pf)
     pin = bool(torch.cuda.is_available())
 
-    ds_epoch = EdgeEpochDataset(edge_gen)
+    ds_epoch = EdgeTensorCacheDataset(str(cache_path))
     loader = DataLoader(
         ds_epoch,
         batch_size=config.batch_size,
@@ -330,7 +326,7 @@ def build_joint_trainer(
     )
 
     joint = JointAutoencoder(movie_ae, people_ae).to(device)
-    total_edges = len(edge_gen.edges)
+    total_edges = len(ds_epoch)
     logging.info(
         f"joint trainer ready device={device} edges={total_edges} "
         f"bs={config.batch_size} workers={num_workers} mode=epoch"
@@ -495,7 +491,6 @@ def main(config: ProjectConfig):
         num_samples=4,
         table_width=38,
     )
-
 
     stop_flag = {"stop": False}
 

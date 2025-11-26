@@ -8,7 +8,6 @@ import torch
 from config import ProjectConfig, project_config
 from .imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
 from .fields import TextField, NumericDigitCategoryField
-from .share_policy import SharePolicy
 from scripts.train_joint_autoencoder import JointAutoencoder
 
 
@@ -23,7 +22,6 @@ def _build_joint_style_autoencoders(cfg: ProjectConfig):
 
         - fresh config
         - accumulate_stats() on both
-        - apply SharePolicy (text + year digits)
         - finalize_stats() on both
         - build_autoencoder() on both
     """
@@ -58,7 +56,7 @@ def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
 
     Assumptions:
       - JointMoviePersonAE_final.pt was produced by scripts.train_joint_autoencoder
-        using the same ProjectConfig (including SharePolicy).
+        using the same ProjectConfig
       - We do NOT trust any standalone per-table autoencoder checkpoints or caches.
     """
     if cfg is None:

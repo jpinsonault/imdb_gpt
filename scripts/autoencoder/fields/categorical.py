@@ -53,8 +53,14 @@ class MultiCategoryField(BaseField):
     def transform_target(self, raw_value):
         return self._transform(raw_value if raw_value is not None else [])
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None, threshold: float = 0.5) -> str:
-        probs = predicted_main.flatten().astype(float)
+    def to_string(
+        self,
+        predicted_main: np.ndarray,
+        predicted_flag: Optional[np.ndarray] = None,
+        threshold: float = 0.5,
+    ) -> str:
+        logits = np.asarray(predicted_main).flatten().astype(float)
+        probs = 1.0 / (1.0 + np.exp(-logits))
         chosen = [(c, p) for c, p in zip(self.category_list, probs) if p >= threshold]
         if not chosen and len(probs) > 0:
             i = int(np.argmax(probs))

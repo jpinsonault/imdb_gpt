@@ -1,43 +1,21 @@
-from itertools import islice
 import datetime
-import logging
 from pathlib import Path
-import random
 import sqlite3
-import os
+import random
+from itertools import islice
+import textwrap
+from typing import Dict
+
 import numpy as np
-from scripts.sql_filters import people_from_join, people_group_by, people_having, people_where_clause
 import torch
 from prettytable import PrettyTable
-from typing import Any, List, Dict, Optional
-from ..fields import NumericDigitCategoryField, TextField
 
-def _sample_random_person(conn, tconst):
-    q = f"""
-        SELECT p.primaryName,
-               p.birthYear,
-               p.deathYear,
-               GROUP_CONCAT(pp.profession, ',')
-        {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? AND {people_where_clause()}
-        {people_group_by()}
-        {people_having()}
-        ORDER BY RANDOM()
-        LIMIT 1
-    """
-    r = conn.execute(q, (tconst,)).fetchone()
-    if not r:
-        return None
-    return {
-        "primaryName": r[0],
-        "birthYear": r[1],
-        "deathYear": r[2],
-        "professions": r[3].split(',') if r[3] else None,
-    }
+from scripts.autoencoder.fields import (
+    NumericDigitCategoryField,
+    MultiCategoryField,
+    SingleCategoryField,
+)
 
-
-def _norm(x): return np.linalg.norm(x) + 1e-9
-def _cos(a, b): return float(np.dot(a, b) / (_norm(a) * _norm(b)))
 
 class JointReconstructionLogger:
     def __init__(
@@ -52,10 +30,6 @@ class JointReconstructionLogger:
         max_movie_scan: int = 50000,
         neg_pool: int = 256,
     ):
-        import sqlite3
-        import random
-        from itertools import islice
-
         self.joint = joint_model
         self.m_ae = movie_ae
         self.p_ae = person_ae
@@ -147,13 +121,16 @@ class JointReconstructionLogger:
 
     def _tensor_to_string(self, field, main_tensor, flag_tensor=None):
         try:
+            # Numeric digits: let the field distinguish digits vs logits by shape.
             if isinstance(field, NumericDigitCategoryField):
                 arr = np.array(main_tensor)
-                if arr.ndim == 3:
-                    return field.to_string(arr)
-                return field.to_string(arr.flatten())
+                return field.to_string(arr)
+
+            # Text-like fields: pass logits/id sequences directly.
             if hasattr(field, "tokenizer") and field.tokenizer is not None:
                 return field.to_string(main_tensor, flag_tensor)
+
+            # Everything else: flatten to 1D and call to_string.
             arr = np.array(main_tensor)
             if arr.ndim > 1:
                 arr = arr.flatten()
@@ -163,6 +140,29 @@ class JointReconstructionLogger:
 
     def _roundtrip_string(self, field, raw_value):
         try:
+            # Multi-label categoricals: transform gives a multi-hot vector.
+            if isinstance(field, MultiCategoryField):
+                t = field.transform(raw_value)
+                arr = t.detach().cpu().numpy().flatten().astype(float)
+                chosen = [
+                    (c, p)
+                    for c, p in zip(field.category_list, arr)
+                    if p >= 0.5
+                ]
+                if not chosen and len(arr) > 0:
+                    i = int(np.argmax(arr))
+                    chosen = [(field.category_list[i], arr[i])]
+                return " ".join(f"{c}:{p:.2f}" for c, p in chosen)
+
+            # Single-label categoricals: transform gives an index.
+            if isinstance(field, SingleCategoryField):
+                t = field.transform(raw_value)
+                idx = int(t.detach().cpu().numpy().flatten()[0])
+                if 0 <= idx < len(field.category_list):
+                    return field.category_list[idx]
+                return "[Unknown]"
+
+            # Everything else: transform, then use the usual string path.
             t = field.transform(raw_value)
             return self._tensor_to_string(field, t)
         except Exception:
@@ -176,6 +176,15 @@ class JointReconstructionLogger:
         pos = float(np.dot(z_m, z_p) / ((np.linalg.norm(z_m) + 1e-9) * (np.linalg.norm(z_p) + 1e-9)))
         sims = np.append(sims_neg, pos)
         return int((-sims).argsort().tolist().index(len(sims) - 1)) + 1
+
+    def _wrap_cell(self, value):
+        s = "" if value is None else str(value)
+        if not s:
+            return ""
+        lines = textwrap.wrap(s, self.w)
+        if not lines:
+            return ""
+        return "\n".join(lines)
 
     def on_batch_end(self, global_step: int):
         if self.every <= 0:
@@ -202,14 +211,28 @@ class JointReconstructionLogger:
                 o = m_row.get(f.name, "")
                 rt = self._roundtrip_string(f, o)
                 r = m_rec.get(f.name, "")
-                tm.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
+                tm.add_row(
+                    [
+                        self._wrap_cell(f.name),
+                        self._wrap_cell(o),
+                        self._wrap_cell(rt),
+                        self._wrap_cell(r),
+                    ]
+                )
 
             tp = PrettyTable(["Person field", "orig", "round", "recon"])
             for f in self.p_ae.fields:
                 o = p_row.get(f.name, "")
                 rt = self._roundtrip_string(f, o)
                 r = p_rec.get(f.name, "")
-                tp.add_row([f.name, str(o)[: self.w], rt[: self.w], str(r)[: self.w]])
+                tp.add_row(
+                    [
+                        self._wrap_cell(f.name),
+                        self._wrap_cell(o),
+                        self._wrap_cell(rt),
+                        self._wrap_cell(r),
+                    ]
+                )
 
             bar_len = 20
             filled = max(0, min(bar_len, int(round(cos * bar_len))))
@@ -220,6 +243,8 @@ class JointReconstructionLogger:
                 f"[{bar}]\n"
                 f"{tm}\n{tp}"
             )
+
+
 
 
 class TensorBoardPerBatchLogger:
@@ -262,185 +287,3 @@ class ModelSaveHook:
     def on_epoch_end(self, epoch: int):
         self.row_autoencoder.save_model()
         print(f"Model saved to {self.output_dir} at the end of epoch {epoch + 1}")
-
-class RowReconstructionLogger:
-    """Prints reconstructions for a single RowAutoencoder at intervals."""
-    def __init__(
-        self,
-        interval_steps: int,
-        row_autoencoder,
-        db_path: str,
-        num_samples: int = 5,
-        table_width: int = 40,
-    ):
-        self.interval_steps = max(1, int(interval_steps))
-        self.row_autoencoder = row_autoencoder
-        self.db_path = db_path
-        self.num_samples = num_samples
-        self.w = table_width
-
-        if not self.row_autoencoder.stats_accumulated:
-            self.row_autoencoder.accumulate_stats()
-
-        all_rows = list(self.row_autoencoder.row_generator())
-        n = min(num_samples, len(all_rows))
-        self.samples = random.sample(all_rows, n) if n > 0 else []
-
-    @torch.no_grad()
-    def _encode(self, row):
-        xs = [f.transform(row.get(f.name)) for f in self.row_autoencoder.fields]
-        xs = [x.unsqueeze(0).to(self.row_autoencoder.device) for x in xs]
-        z = self.row_autoencoder.encoder(xs)
-        return z.detach()
-
-    @torch.no_grad()
-    def _decode(self, z_tensor):
-        outs = self.row_autoencoder.decoder(z_tensor)
-        return [o.detach().cpu().numpy()[0] for o in outs]
-
-    def _tensor_to_string(self, field, main_tensor: np.ndarray) -> str:
-        try:
-            if isinstance(field, NumericDigitCategoryField):
-                arr = np.array(main_tensor)
-                return field.to_string(arr if arr.ndim == 2 else arr.flatten())
-            if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                return field.to_string(np.array(main_tensor))
-            arr = np.array(main_tensor)
-            if arr.ndim > 1:
-                arr = arr.flatten()
-            return field.to_string(arr)
-        except Exception:
-            return "[Conversion Error]"
-
-    def on_batch_end(self, global_step: int):
-        if not self.samples:
-            return
-        if (global_step + 1) % self.interval_steps != 0:
-            return
-
-        print(f"\nBatch {global_step + 1}: Reconstruction Demo")
-        for i, row_dict in enumerate(self.samples):
-            print(f"\nSample {i + 1}:")
-            table = PrettyTable()
-            table.field_names = ["Field", "Original Value", "Reconstructed"]
-            table.align = "l"
-            for col in ["Original Value", "Reconstructed"]:
-                table.max_width[col] = self.w
-
-            z = self._encode(row_dict)
-            preds = self._decode(z)
-
-            for field, pred in zip(self.row_autoencoder.fields, preds):
-                field_name = field.name
-                original_raw = row_dict.get(field_name, "N/A")
-                original_str = ", ".join(map(str, original_raw)) if isinstance(original_raw, list) else str(original_raw)
-                reconstructed_str = self._tensor_to_string(field, pred)
-                table.add_row([field_name, original_str, reconstructed_str])
-
-            print(table)
-
-
-class SequenceReconstructionLogger:
-    def __init__(self, movie_ae, people_ae, predictor, db_path: str, seq_len: int, interval_steps: int = 200, num_samples: int = 2, table_width: int = 38):
-        import sqlite3, random
-        from itertools import islice
-        self.m_ae = movie_ae
-        self.p_ae = people_ae
-        self.pred = predictor
-        self.seq_len = seq_len
-        self.every = max(1, int(interval_steps))
-        self.w = table_width
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        movies = list(islice(self.m_ae.row_generator(), 50000))
-        rng = random.Random()
-        rng.shuffle(movies)
-        self.samples = []
-        for m in movies:
-            ppl = self._people_for(m.get("tconst"))
-            if ppl:
-                if len(ppl) < self.seq_len:
-                    ppl = ppl + [ppl[-1]] * (self.seq_len - len(ppl))
-                else:
-                    ppl = ppl[: self.seq_len]
-                self.samples.append((m, ppl))
-            if len(self.samples) == num_samples:
-                break
-
-    def _people_for(self, tconst: str):
-        q = f"""
-        SELECT p.primaryName, p.birthYear, p.deathYear, GROUP_CONCAT(pp.profession, ',')
-        {people_from_join()} INNER JOIN principals pr ON pr.nconst = p.nconst
-        WHERE pr.tconst = ? AND {people_where_clause()}
-        {people_group_by()}
-        {people_having()}
-        ORDER BY pr.ordering
-        LIMIT ?
-        """
-        r = self.conn.execute(q, (tconst, self.seq_len)).fetchall()
-        out = []
-        for row in r:
-            out.append({
-                "primaryName": row[0],
-                "birthYear": row[1],
-                "deathYear": row[2],
-                "professions": row[3].split(",") if row[3] else None,
-            })
-        return out
-
-
-    def _tensor_to_string(self, field, arr):
-        import numpy as np
-        try:
-            a = np.array(arr)
-            from ..fields import NumericDigitCategoryField
-            if isinstance(field, NumericDigitCategoryField):
-                return field.to_string(a if a.ndim >= 2 else a.flatten())
-            if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                return field.to_string(a)
-            return field.to_string(a.flatten() if a.ndim > 1 else a)
-        except Exception:
-            return "[conv_err]"
-
-    @torch.no_grad()
-    def _predict_seq(self, movie_row):
-        device = self.m_ae.device
-        xs = [f.transform(movie_row.get(f.name)) for f in self.m_ae.fields]
-        xs = [x.unsqueeze(0).to(device) for x in xs]
-        if self.pred is None:
-            raise RuntimeError("SequenceReconstructionLogger requires a non-None predictor")
-        outs = self.pred(xs)
-        return [o.detach().cpu().numpy()[0] for o in outs]
-
-    @torch.no_grad()
-    def _roundtrip_person(self, person_row):
-        xs = [f.transform(person_row.get(f.name)) for f in self.p_ae.fields]
-        xs = [x.unsqueeze(0).to(self.p_ae.device) for x in xs]
-        z = self.p_ae.encoder(xs)
-        outs = self.p_ae.decoder(z)
-        return [o.detach().cpu().numpy()[0] for o in outs]
-
-    def on_batch_end(self, global_step: int):
-        if not self.samples:
-            return
-        if (global_step + 1) % self.every != 0:
-            return
-        from prettytable import PrettyTable
-        for m_row, ppl in self.samples:
-            preds = self._predict_seq(m_row)
-            print("\nSequence reconstruction")
-            print(f"movie: {m_row.get('primaryTitle', '')}")
-            for t in range(self.seq_len):
-                tab = PrettyTable(["field", "orig", "round", "recon"])
-                tab.align = "l"
-                rt = self._roundtrip_person(ppl[t])
-                for i, (f, pred) in enumerate(zip(self.p_ae.fields, preds)):
-                    y = pred[t]
-                    orig_raw = ppl[t].get(f.name, "")
-                    if isinstance(orig_raw, list):
-                        orig_str = ", ".join(map(str, orig_raw))
-                    else:
-                        orig_str = str(orig_raw)
-                    round_str = self._tensor_to_string(f, rt[i])
-                    recon_str = self._tensor_to_string(f, y)
-                    tab.add_row([f.name, orig_str[: self.w], round_str[: self.w], recon_str[: self.w]])
-                print(f"\ntimestep {t+1}/{self.seq_len}\n{tab}")

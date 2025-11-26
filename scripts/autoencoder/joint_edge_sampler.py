@@ -188,3 +188,21 @@ class EdgeEpochDataset(Dataset):
         m, p = self.sampler._get_tensors(i)
         eid = self.sampler.edges[i][0]
         return m, p, eid
+    
+class EdgeTensorCacheDataset(Dataset):
+    def __init__(self, cache_path: str):
+        super().__init__()
+        data = torch.load(cache_path, map_location="cpu")
+        self.edge_ids = data["edge_ids"].long()
+        self.movie_tensors = data["movie"]
+        self.person_tensors = data["person"]
+
+    def __len__(self):
+        return int(self.edge_ids.shape[0])
+
+    def __getitem__(self, idx: int):
+        i = int(idx)
+        m = tuple(t[i] for t in self.movie_tensors)
+        p = tuple(t[i] for t in self.person_tensors)
+        eid = int(self.edge_ids[i])
+        return m, p, eid

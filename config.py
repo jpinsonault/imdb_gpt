@@ -9,8 +9,8 @@ class ProjectConfig:
     model_dir: str = "models"
 
     batch_size: int = 2048
-    learning_rate: float = 3e-4
-    weight_decay: float = 1e-2
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-3
     epochs: int = 4
 
     latent_dim: int = 64
@@ -21,10 +21,10 @@ class ProjectConfig:
     tensorboard_dir: str = "runs"
     log_interval: int = 50
 
-    nce_temp: float = 0.07
-    nce_weight: float = 1.0
+    nce_temp: float = 0.05
+    nce_weight: float = 2.0
 
-    latent_type_loss_weight: float = 0.1
+    latent_type_loss_weight: float = 0.01
 
     movie_limit: int = 100000000000
 
@@ -32,7 +32,7 @@ class ProjectConfig:
     prefetch_factor: int = 0
     max_training_steps: int | None = None
 
-    use_cache: bool = False
+    use_cache: bool = True
     refresh_cache: bool = False
 
     compile_trunk: bool = False
@@ -51,7 +51,7 @@ class ProjectConfig:
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
     path_siren_weight_decay: float = 0.0
-    path_siren_epochs: int = 1000
+    path_siren_epochs: int = 100
     path_siren_layers: int = 10
     path_siren_hidden_mult: float = 4.0
     path_siren_omega0_first: float = 30.0
@@ -115,6 +115,10 @@ class ProjectConfig:
     image_siren_density_alpha: float = 0.9
     image_siren_uniform_frac: float = 0.1
     image_siren_image_repeats_per_epoch: int = 4
+
+    # Joint trainer: precomputed edge tensors on disk (not sqlite)
+    joint_edge_tensor_cache: bool = True
+    joint_edge_tensor_cache_file: str = "joint_edge_tensors.pt"
 
 
 project_config = ProjectConfig()
