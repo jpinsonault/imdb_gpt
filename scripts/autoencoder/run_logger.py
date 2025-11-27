@@ -90,6 +90,22 @@ class RunLogger:
                 pass
         self.writer.add_text("env/hardware", "\n".join(lines), 0)
 
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int = None):
+        """Safely add a scalar value to TensorBoard."""
+        if not self.writer:
+            return
+        if global_step is None:
+            global_step = self.step
+        self.writer.add_scalar(tag, scalar_value, global_step)
+
+    def add_text(self, tag: str, text_string: str, global_step: int = None):
+        """Safely add text to TensorBoard."""
+        if not self.writer:
+            return
+        if global_step is None:
+            global_step = self.step
+        self.writer.add_text(tag, text_string, global_step)
+
     def add_scalars(
         self,
         total: float,

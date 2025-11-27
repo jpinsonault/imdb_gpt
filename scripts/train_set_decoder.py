@@ -1,11 +1,20 @@
+# scripts/train_set_decoder.py
+
 import argparse
 import logging
+import json
+import random
+import signal
+import math
+import numpy as np
+import time
 from pathlib import Path
+from dataclasses import asdict
 
 import torch
 from tqdm import tqdm
 
-from config import project_config, ensure_dirs
+from config import project_config, ensure_dirs, ProjectConfig
 from scripts.set_decoder.training import (
     build_set_decoder_trainer,
     _compute_cost_matrices,
@@ -15,9 +24,110 @@ from scripts.set_decoder.training import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int | None,
+    schedule: str,
+    warmup_steps: int,
+    warmup_ratio: float,
+    min_factor: float,
+    last_epoch: int = -1,
+):
+    if total_steps is None:
+        return None
+
+    total_steps = max(1, int(total_steps))
+    schedule = (schedule or "").lower()
+    if schedule not in ("cosine", "linear"):
+        return None
+
+    base_warmup = max(0, int(warmup_steps))
+    ratio = float(warmup_ratio)
+    if ratio > 0.0:
+        frac_warmup = int(total_steps * ratio)
+    else:
+        frac_warmup = 0
+
+    w_steps = max(base_warmup, frac_warmup)
+    w_steps = min(w_steps, total_steps - 1) if total_steps > 1 else 0
+    min_factor = float(min_factor)
+
+    def cosine_lambda(step: int) -> float:
+        s = int(step)
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
+        t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
+        decay = 0.5 * (1.0 + math.cos(math.pi * t))
+        return min_factor + (1.0 - min_factor) * decay
+
+    def linear_lambda(step: int) -> float:
+        s = int(step)
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
+        t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
+        return max(min_factor, 1.0 - (1.0 - min_factor) * t)
+
+    if schedule == "cosine":
+        lr_lambda = cosine_lambda
+    else:
+        lr_lambda = linear_lambda
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_epoch)
+
+
+def save_checkpoint(
+    model_dir: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR | None,
+    epoch: int,
+    global_step: int,
+    config: ProjectConfig,
+    best_loss: float | None,
+):
+    try:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save config for reproducibility
+        with open(model_dir / "set_decoder_config.json", "w") as f:
+            json.dump(asdict(config), f, indent=4)
+
+        state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "best_loss": best_loss,
+            "rng_state_pytorch": torch.get_rng_state(),
+            "rng_state_numpy": np.random.get_state(),
+            "rng_state_random": random.getstate(),
+        }
+
+        torch.save(state, model_dir / "set_decoder_state.pt")
+        logging.info(f"Saved training state to {model_dir / 'set_decoder_state.pt'}")
+    except Exception as e:
+        logging.error(f"Failed to save training state: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train set decoder: movie latent -> set of people latents"
+    )
+    parser.add_argument(
+        "--new-run", 
+        action="store_true", 
+        help="Ignore existing checkpoint and start fresh"
     )
     args = parser.parse_args()
 
@@ -49,12 +159,59 @@ def main():
     w_presence = loss_cfg["w_presence"]
     w_null = loss_cfg["w_null"]
 
-    num_slots = int(getattr(cfg, "set_decoder_slots", 10))
+    # Scheduler Setup
+    total_steps = len(loader) * num_epochs
+    sched = make_lr_scheduler(
+        optimizer=opt,
+        total_steps=total_steps,
+        schedule=cfg.lr_schedule,
+        warmup_steps=cfg.lr_warmup_steps,
+        warmup_ratio=cfg.lr_warmup_ratio,
+        min_factor=cfg.lr_min_factor,
+        last_epoch=-1
+    )
 
+    # Resume Logic
+    start_epoch = 0
     global_step = 0
     best_loss = None
+    checkpoint_path = Path(cfg.model_dir) / "set_decoder_state.pt"
 
-    for epoch in range(num_epochs):
+    if checkpoint_path.exists() and not args.new_run:
+        logging.info(f"Found checkpoint at {checkpoint_path}. Resuming...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            opt.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+            start_epoch = checkpoint["epoch"]
+            global_step = checkpoint["global_step"]
+            best_loss = checkpoint.get("best_loss")
+
+            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] and sched:
+                sched.load_state_dict(checkpoint["scheduler_state_dict"])
+
+            torch.set_rng_state(checkpoint["rng_state_pytorch"])
+            np.random.set_state(checkpoint["rng_state_numpy"])
+            random.setstate(checkpoint["rng_state_random"])
+
+            logging.info(f"Resumed from Epoch {start_epoch}, Step {global_step}")
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint: {e}. Starting fresh.")
+    elif args.new_run and checkpoint_path.exists():
+        logging.info("--new-run flag detected. Ignoring existing checkpoint.")
+
+    if run_logger and run_logger.run_dir:
+        # Sync logger step
+        run_logger.step = global_step
+
+    stop_flag = {"stop": False}
+    def _handle_sigint(signum, frame):
+        stop_flag["stop"] = True
+        logging.info("interrupt received; will finish current step and save")
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(loader, dynamic_ncols=True)
         pbar.set_description(f"set-decoder epoch {epoch+1}/{num_epochs}")
 
@@ -236,6 +393,8 @@ def main():
 
             total_loss.backward()
             opt.step()
+            if sched:
+                sched.step()
 
             mean_recall = sum(recalls) / len(recalls) if recalls else 0.0
             mean_prec = sum(precisions) / len(precisions) if precisions else 0.0
@@ -250,23 +409,32 @@ def main():
                 run_logger.add_scalar("set_decoder/recall", float(mean_recall), global_step)
                 run_logger.add_scalar("set_decoder/precision", float(mean_prec), global_step)
                 run_logger.add_scalar("set_decoder/cardinality_error", float(mean_card_err), global_step)
+                run_logger.add_scalar("set_decoder/lr", float(opt.param_groups[0]["lr"]), global_step)
+                run_logger.tick()
 
             pbar.set_postfix(
                 loss=f"{float(total_loss.detach().cpu()):.4f}",
                 rec=f"{float(mean_recall):.3f}",
                 prec=f"{float(mean_prec):.3f}",
-                card_err=f"{float(mean_card_err):.3f}",
+                err=f"{float(mean_card_err):.2f}",
             )
 
             if (global_step + 1) % flush_interval == 0 and run_logger:
                 run_logger.flush()
 
             if (global_step + 1) % save_interval == 0:
-                out_dir = Path(cfg.model_dir)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                path = out_dir / "SetDecoder.pt"
-                torch.save(model.state_dict(), path)
-                logging.info(f"saved checkpoint to {path}")
+                save_checkpoint(
+                    model_dir=Path(cfg.model_dir),
+                    model=model,
+                    optimizer=opt,
+                    scheduler=sched,
+                    epoch=epoch,
+                    global_step=global_step,
+                    config=cfg,
+                    best_loss=best_loss
+                )
+                # Also save standalone model weights for inference
+                torch.save(model.state_dict(), Path(cfg.model_dir) / "SetDecoder.pt")
 
             if hasattr(loader.dataset, "movies"):
                 sample_tconsts = loader.dataset.movies[: z_movies.size(0)]
@@ -286,6 +454,23 @@ def main():
                 best_loss = float(total_loss.detach().cpu())
 
             global_step += 1
+            if stop_flag["stop"]:
+                break
+        
+        # End of epoch save
+        save_checkpoint(
+            model_dir=Path(cfg.model_dir),
+            model=model,
+            optimizer=opt,
+            scheduler=sched,
+            epoch=epoch + 1,
+            global_step=global_step,
+            config=cfg,
+            best_loss=best_loss
+        )
+        
+        if stop_flag["stop"]:
+            break
 
     out_dir = Path(cfg.model_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

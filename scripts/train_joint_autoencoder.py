@@ -6,8 +6,13 @@ import logging
 import math
 import signal
 import time
+import os
+import json
+import random
+import numpy as np
 from pathlib import Path
 from typing import Dict, List
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
@@ -56,6 +61,7 @@ def make_lr_scheduler(
     warmup_steps: int,
     warmup_ratio: float,
     min_factor: float,
+    last_epoch: int = -1,
 ):
     if total_steps is None:
         return None
@@ -106,7 +112,7 @@ def make_lr_scheduler(
     else:
         lr_lambda = linear_lambda
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_epoch)
 
 
 class _TypeFiLM(nn.Module):
@@ -294,18 +300,92 @@ def build_joint_trainer(
         movie_ae.build_autoencoder()
         people_ae.build_autoencoder()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    movie_ae.model.to(device)
-    people_ae.model.to(device)
-
-    loss_logger = LossLedger()
-
+    # -------------------------------------------------------------------------
+    # SELF-HEALING CACHE CHECK
+    # -------------------------------------------------------------------------
     cache_path = ensure_joint_tensor_cache(
         config,
         db_path,
         movie_ae.fields,
         people_ae.fields,
     )
+
+    must_rebuild = False
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+        
+        # Check movie fields
+        if len(payload["movie"]) != len(movie_ae.fields):
+            logging.warning("Cache validation: Number of movie fields mismatch.")
+            must_rebuild = True
+        else:
+            for i, f in enumerate(movie_ae.fields):
+                # cache tensor shape is (NumEdges, Features...)
+                cache_shape = payload["movie"][i].shape[1:]
+                if cache_shape != f.input_shape:
+                    logging.warning(
+                        f"Cache mismatch for field '{f.name}': "
+                        f"Cache {cache_shape} != Model {f.input_shape}"
+                    )
+                    must_rebuild = True
+                    break
+
+        # Check person fields
+        if not must_rebuild:
+            if len(payload["person"]) != len(people_ae.fields):
+                logging.warning("Cache validation: Number of person fields mismatch.")
+                must_rebuild = True
+            else:
+                for i, f in enumerate(people_ae.fields):
+                    cache_shape = payload["person"][i].shape[1:]
+                    if cache_shape != f.input_shape:
+                        logging.warning(
+                            f"Cache mismatch for field '{f.name}': "
+                            f"Cache {cache_shape} != Model {f.input_shape}"
+                        )
+                        must_rebuild = True
+                        break
+
+    except Exception as e:
+        logging.warning(f"Cache validation check failed ({e}). Forcing rebuild.")
+        must_rebuild = True
+
+    if must_rebuild:
+        logging.info("!!! CACHE INCONSISTENCY DETECTED !!!")
+        logging.info("Invalidating tensor cache and JSON stats to ensure synchronization.")
+        
+        if cache_path.exists():
+            os.remove(cache_path)
+            logging.info(f"Deleted {cache_path}")
+
+        movie_ae._drop_cache()
+        people_ae._drop_cache()
+
+        movie_ae = TitlesAutoencoder(config)
+        people_ae = PeopleAutoencoder(config)
+
+        movie_ae.accumulate_stats()
+        people_ae.accumulate_stats()
+        movie_ae.finalize_stats()
+        people_ae.finalize_stats()
+
+        movie_ae.build_autoencoder()
+        people_ae.build_autoencoder()
+
+        cache_path = ensure_joint_tensor_cache(
+            config,
+            db_path,
+            movie_ae.fields,
+            people_ae.fields,
+        )
+        logging.info("Cache rebuild complete. Resuming training.")
+    # -------------------------------------------------------------------------
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    movie_ae.model.to(device)
+    people_ae.model.to(device)
+
+    loss_logger = LossLedger()
 
     num_workers = int(getattr(config, "num_workers", 0) or 0)
     cfg_pf = int(getattr(config, "prefetch_factor", 2) or 0)
@@ -429,11 +509,54 @@ def _train_step(
     )
 
 
+def save_checkpoint(
+    model_dir: Path,
+    joint_model: JointAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    epoch: int,
+    global_step: int,
+    config: ProjectConfig,
+):
+    """
+    Saves a resume-capable checkpoint including model weights, optimizer/scheduler state,
+    and the project configuration.
+    """
+    try:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save the config for reference/verification
+        with open(model_dir / "config.json", "w") as f:
+            json.dump(asdict(config), f, indent=4)
+
+        state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "model_state_dict": joint_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "rng_state_pytorch": torch.get_rng_state(),
+            "rng_state_numpy": np.random.get_state(),
+            "rng_state_random": random.getstate(),
+        }
+
+        # Atomic save is preferred but simple direct save here
+        torch.save(state, model_dir / "training_state.pt")
+        logging.info(f"Saved training state to {model_dir / 'training_state.pt'}")
+    except Exception as e:
+        logging.error(f"Failed to save training state: {e}")
+
+
 def main(config: ProjectConfig):
     parser = argparse.ArgumentParser(
         description="Train movie-person joint embedding autoencoder"
     )
     parser.add_argument("--warm", action="store_true")
+    parser.add_argument(
+        "--new-run", 
+        action="store_true", 
+        help="Ignore existing checkpoint and start fresh"
+    )
     args = parser.parse_args()
 
     data_dir = Path(config.data_dir)
@@ -461,6 +584,46 @@ def main(config: ProjectConfig):
     steps_per_epoch = (total_edges + config.batch_size - 1) // config.batch_size
     total_steps = int(config.epochs) * int(max(1, steps_per_epoch))
 
+    # Initialize variables for training state
+    start_epoch = 0
+    global_step = 0
+    
+    # -------------------------------------------------------------------------
+    # RESUME LOGIC
+    # -------------------------------------------------------------------------
+    checkpoint_path = Path(config.model_dir) / "training_state.pt"
+    
+    if checkpoint_path.exists() and not args.new_run:
+        logging.info(f"Found checkpoint at {checkpoint_path}. Resuming...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            joint_model.load_state_dict(checkpoint["model_state_dict"])
+            opt.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+            start_epoch = checkpoint["epoch"]
+            global_step = checkpoint["global_step"]
+            
+            # Restore RNG states to ensure data augmentation/shuffling continuity if possible
+            torch.set_rng_state(checkpoint["rng_state_pytorch"])
+            np.random.set_state(checkpoint["rng_state_numpy"])
+            random.setstate(checkpoint["rng_state_random"])
+            
+            logging.info(f"Resumed from Epoch {start_epoch}, Step {global_step}")
+            
+            # Since we are restarting the epoch loop (retreading data), 
+            # we do not seek the dataloader. The global_step remains valid for
+            # LR scheduling purposes.
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint: {e}. Starting fresh.")
+    elif args.new_run and checkpoint_path.exists():
+        logging.info("--new-run flag detected. Ignoring existing checkpoint.")
+
+    # -------------------------------------------------------------------------
+
+    # Scheduler creation needs to happen after we know if we loaded state or not,
+    # because if we loaded, we load the scheduler state dict.
+    # Note: We pass -1 as last_epoch initially, then load state dict if available.
     sched = make_lr_scheduler(
         optimizer=opt,
         total_steps=total_steps,
@@ -468,7 +631,12 @@ def main(config: ProjectConfig):
         warmup_steps=config.lr_warmup_steps,
         warmup_ratio=config.lr_warmup_ratio,
         min_factor=config.lr_min_factor,
+        last_epoch=-1
     )
+    
+    if checkpoint_path.exists() and not args.new_run:
+         if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] and sched:
+             sched.load_state_dict(checkpoint["scheduler_state_dict"])
 
     temperature = config.nce_temp
     nce_weight = config.nce_weight
@@ -480,6 +648,8 @@ def main(config: ProjectConfig):
     run_logger = build_run_logger(config)
     if run_logger.run_dir:
         logging.info(f"tensorboard logdir: {run_logger.run_dir}")
+        # Sync logger step
+        run_logger.step = global_step
 
     jr_interval = config.callback_interval
     joint_recon = JointReconstructionLogger(
@@ -506,13 +676,16 @@ def main(config: ProjectConfig):
         )
 
     joint_model.train()
-    global_step = 0
-    edges_seen = 0
+    edges_seen = 0 # This resets on resume as we restart the epoch iteration
     epochs = int(getattr(config, "epochs", 1) or 1)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         pbar = tqdm(loader, unit="batch", dynamic_ncols=True)
         pbar.set_description(f"epoch {epoch+1}/{epochs}")
+        
+        # NOTE: On resume, we restart the epoch from the beginning of the dataloader.
+        # This retreads data seen in the interrupted epoch, but ensures robust resuming.
+        
         for M, P, eids in pbar:
             iter_start = time.perf_counter()
 
@@ -592,14 +765,35 @@ def main(config: ProjectConfig):
                 logger.flush()
 
             if (global_step % save_interval) == 0:
+                # Save regular model checkpoints (weights only)
                 mov_ae.save_model()
                 per_ae.save_model()
-                logging.info(
-                    f"checkpoint saved at step {global_step}"
+                
+                # Save Resume State (weights + optimizer + scheduler + config)
+                save_checkpoint(
+                    model_dir=Path(config.model_dir),
+                    joint_model=joint_model,
+                    optimizer=opt,
+                    scheduler=sched,
+                    epoch=epoch, # Save current epoch index (will start here on resume)
+                    global_step=global_step,
+                    config=config
                 )
+                logging.info(f"checkpoint saved at step {global_step}")
 
             if stop_flag["stop"]:
                 break
+
+        # End of epoch save
+        save_checkpoint(
+            model_dir=Path(config.model_dir),
+            joint_model=joint_model,
+            optimizer=opt,
+            scheduler=sched,
+            epoch=epoch + 1, # Next start epoch
+            global_step=global_step,
+            config=config
+        )
 
         if stop_flag["stop"]:
             break
@@ -610,7 +804,13 @@ def main(config: ProjectConfig):
 
     out = Path(project_config.model_dir)
     out.mkdir(parents=True, exist_ok=True)
-    torch.save(joint_model.state_dict(), out / "JointMoviePersonAE_final.pt")
+    
+    # Save final model
+    try:
+        torch.save(joint_model.state_dict(), out / "JointMoviePersonAE_final.pt")
+    except Exception as e:
+        logging.error(f"Failed to save final model: {e}")
+        
     run_logger.close()
 
 

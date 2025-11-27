@@ -1,6 +1,7 @@
+# scripts/autoencoder/row_autoencoder.py
+
 import logging
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any, List, Dict, Tuple
 
@@ -308,6 +309,9 @@ def _field_to_state(f: BaseField) -> Dict[str, Any]:
                     if getattr(f, "total_positions", None) is not None
                     else 1
                 ),
+                # Save derived fields to help debugging/future loading
+                "mask_index": int(getattr(f, "mask_index", 10)),
+                "vocab_size": int(getattr(f, "vocab_size", 11)),
             }
         )
         return state
@@ -416,6 +420,12 @@ def _apply_field_state(f: BaseField, st: Dict[str, Any]) -> None:
                 getattr(f, "total_positions", f.integer_digits),
             )
         )
+        
+        # CRITICAL FIX: Manually restore vocab_size and mask_index based on base.
+        # This prevents _ensure_finalized() from seeing None, triggering _finalize_stats(),
+        # and overwriting total_positions with 1 (due to empty data_points).
+        f.mask_index = f.base
+        f.vocab_size = f.base + 1
         return
 
     if isinstance(f, TextField):
@@ -491,69 +501,58 @@ class RowAutoencoder:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-    def _cache_table_name(self) -> str:
-        return f"{self.__class__.__name__}_stats_cache"
+    def _get_cache_path(self) -> Path:
+        """Return path to the JSON cache file for this autoencoder class."""
+        return Path(self.config.data_dir) / f"{self.__class__.__name__}_stats.json"
 
-    def _drop_cache_table(self):
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            conn.execute(
-                f"DROP TABLE IF EXISTS {self._cache_table_name()};"
-            )
-            conn.commit()
+    def _drop_cache(self):
+        """Delete the JSON stats cache file."""
+        p = self._get_cache_path()
+        if p.exists():
+            try:
+                p.unlink()
+                logging.info(f"Deleted cache file {p}")
+            except OSError as e:
+                logging.warning(f"Failed to delete cache file {p}: {e}")
 
     def _save_cache(self):
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            conn.execute(
-                f"CREATE TABLE IF NOT EXISTS {self._cache_table_name()} (field_name TEXT PRIMARY KEY, data BLOB)"
-            )
-            for f in self.fields:
-                st = _field_to_state(f)
-                blob = json.dumps(
-                    st,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                conn.execute(
-                    f"INSERT OR REPLACE INTO {self._cache_table_name()} (field_name, data) VALUES (?, ?);",
-                    (f.name, blob),
-                )
-            conn.commit()
+        """Save field stats to a JSON file."""
+        cache_data = {}
+        for f in self.fields:
+            cache_data[f.name] = _field_to_state(f)
+        
+        p = self._get_cache_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, 'w') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"Failed to save stats cache to {p}: {e}")
 
     def _load_cache(self) -> bool:
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?;",
-                (self._cache_table_name(),),
-            )
-            if cur.fetchone() is None:
-                return False
-            cur.execute(
-                f"SELECT field_name, data FROM {self._cache_table_name()};"
-            )
-            rows = cur.fetchall()
-            if not rows:
-                return False
-            cache_map: Dict[str, Dict[str, Any]] = {}
-            for name, blob in rows:
-                try:
-                    cache_map[name] = json.loads(
-                        blob.decode("utf-8")
-                    )
-                except Exception:
-                    return False
+        """Load field stats from a JSON file."""
+        p = self._get_cache_path()
+        if not p.exists():
+            return False
+        try:
+            with open(p, 'r') as f:
+                cache_data = json.load(f)
+            
             for f in self.fields:
-                st = cache_map.get(f.name)
-                if st:
-                    _apply_field_state(f, st)
-        self.stats_accumulated = True
-        return True
+                if f.name in cache_data:
+                    _apply_field_state(f, cache_data[f.name])
+            
+            self.stats_accumulated = True
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to load stats cache from {p}: {e}")
+            return False
 
     def accumulate_stats(self):
         use_cache = self.config.use_cache
         refresh_cache = self.config.refresh_cache
         if refresh_cache:
-            self._drop_cache_table()
+            self._drop_cache()
         if use_cache and self._load_cache():
             logging.info("stats loaded from cache")
             return
@@ -660,20 +659,24 @@ class RowAutoencoder:
 
     def save_model(self):
         out = Path(self.model_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        name = self.__class__.__name__
-        torch.save(
-            self.model.state_dict(),
-            out / f"{name}_autoencoder.pt",
-        )
-        torch.save(
-            self.encoder.state_dict(),
-            out / f"{name}_encoder.pt",
-        )
-        torch.save(
-            self.decoder.state_dict(),
-            out / f"{name}_decoder.pt",
-        )
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            name = self.__class__.__name__
+            torch.save(
+                self.model.state_dict(),
+                out / f"{name}_autoencoder.pt",
+            )
+            torch.save(
+                self.encoder.state_dict(),
+                out / f"{name}_encoder.pt",
+            )
+            torch.save(
+                self.decoder.state_dict(),
+                out / f"{name}_decoder.pt",
+            )
+        except Exception as e:
+            logging.error(f"Failed to save model {self.__class__.__name__} to {out}: {e}")
+            logging.error("Continuing training without saving this checkpoint.")
 
     def fit(self):
         if not self.stats_accumulated:

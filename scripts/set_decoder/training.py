@@ -1,3 +1,5 @@
+# scripts/set_decoder/training.py
+
 import sqlite3
 from typing import Dict, List, Tuple
 
