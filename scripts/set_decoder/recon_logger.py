@@ -107,7 +107,11 @@ class SetReconstructionLogger:
         with torch.no_grad():
             z_movies_dev = z_movies.to(device)
             # Run Model
-            z_slots_batch, presence_logits_batch = self.model(z_movies_dev)
+            # outputs is now a list of tuples [(z, p), (z, p)...]
+            outputs = self.model(z_movies_dev)
+            
+            # We visualize the FINAL layer output
+            z_slots_batch, presence_logits_batch = outputs[-1]
             probs_batch = torch.sigmoid(presence_logits_batch)
 
             for i in idxs:
@@ -126,7 +130,6 @@ class SetReconstructionLogger:
                 output_log.append(subhead)
 
                 # 2. Sort slots by Presence Confidence
-                # This is CRITICAL for set decoders to make sense of the output
                 sort_idx = torch.argsort(probs, descending=True)
                 
                 z_slots_sorted = z_slots[sort_idx]

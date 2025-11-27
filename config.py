@@ -50,7 +50,7 @@ class ProjectConfig:
     set_decoder_save_interval: int = 100
     set_decoder_callback_interval: int = 100
     set_decoder_recon_samples: int = 5
-    set_decoder_table_width: int = 60
+    set_decoder_table_width: int = 120
     # Path Siren
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001

@@ -16,12 +16,12 @@ from tqdm import tqdm
 
 from config import project_config, ensure_dirs, ProjectConfig
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
-from scripts.autoencoder.run_logger import build_run_logger
+from scripts.autoencoder.run_logger import RunLogger
 from scripts.set_decoder.model import SetDecoder
-from scripts.set_decoder.training import _compute_cost_matrices
 from scripts.set_decoder.recon_logger import SetReconstructionLogger
 from scripts.precompute_set_cache import ensure_set_decoder_cache
 from scripts.set_decoder.data import CachedSetDataset, collate_set_decoder
+from scripts.set_decoder.training import compute_cost_and_losses, match_batch_hungarian
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -80,6 +80,8 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
 def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
     mov_ae, per_ae = _load_frozen_autoencoders(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
     
     mov_ae.decoder.to(device).eval()
     per_ae.decoder.to(device).eval()
@@ -107,10 +109,14 @@ def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
     )
 
     latent_dim = int(getattr(mov_ae, "latent_dim", cfg.latent_dim))
+    
+    # FiLM + Deep Supervision Model
     model = SetDecoder(
         latent_dim=latent_dim,
         num_slots=num_slots,
         hidden_mult=float(getattr(cfg, "set_decoder_hidden_mult", 2.0)),
+        num_layers=int(getattr(cfg, "set_decoder_layers", 4)),
+        num_heads=int(getattr(cfg, "set_decoder_heads", 4)),
     ).to(device)
 
     opt = torch.optim.AdamW(
@@ -119,9 +125,8 @@ def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
         weight_decay=float(getattr(cfg, "set_decoder_weight_decay", 1e-2)),
     )
 
-    run_logger = build_run_logger(cfg)
+    run_logger = RunLogger(cfg.tensorboard_dir, "set_decoder", cfg)
     
-    # [FIX] Updated signature: removed db_path
     recon_logger = SetReconstructionLogger(
         model=model, movie_ae=mov_ae, people_ae=per_ae,
         num_slots=num_slots,
@@ -149,9 +154,8 @@ def main():
     db_path = cfg.db_path
 
     model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg = build_set_decoder_trainer(cfg, db_path=db_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
+    device = next(model.parameters()).device
+    
     num_epochs = int(getattr(cfg, "set_decoder_epochs", 3))
     save_interval = int(getattr(cfg, "set_decoder_save_interval", 1000))
     flush_interval = int(getattr(cfg, "flush_interval", 250))
@@ -186,6 +190,8 @@ def main():
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(loader, dynamic_ncols=True, desc=f"set-dec epoch {epoch+1}/{num_epochs}")
         for batch in pbar:
+            iter_start = time.perf_counter()
+
             z_movies, Z_gt, mask, Y_gt_fields = batch
             z_movies = z_movies.to(device, non_blocking=True)
             Z_gt = Z_gt.to(device, non_blocking=True)
@@ -194,90 +200,113 @@ def main():
 
             model.train()
             opt.zero_grad()
-            z_slots, presence_logits = model(z_movies)
-
-            # [FIX] Hungarian import inside loop to avoid top-level issues if any
-            from scripts.set_decoder.training import _compute_cost_matrices, _hungarian
-
-            C_match_list, C_lat_list, C_rec_list = _compute_cost_matrices(
-                per_ae, z_slots, Z_gt, Y_gt_fields, mask, w_latent, w_recon
-            )
-
-            total_latent_loss = torch.zeros((), device=device)
-            total_recon_loss = torch.zeros((), device=device)
-            total_presence_loss = torch.zeros((), device=device)
-            total_null_loss = torch.zeros((), device=device)
             
-            matched_cnt, pres_cnt, null_cnt = 0, 0, 0
-            recalls, precisions, cards = [], [], []
+            # Outputs is a list of tuples [(z, p), (z, p)...] for each layer
+            layer_outputs = model(z_movies)
+            
+            total_loss = torch.tensor(0.0, device=device)
+            
+            # Metrics to log (will grab from final layer)
+            log_metrics = {}
 
-            for b in range(z_slots.shape[0]):
-                k_b = int(mask[b].sum().item())
-                logits_b = presence_logits[b]
-                probs_b = torch.sigmoid(logits_b)
-                pred_on = int((probs_b > 0.5).sum().item())
+            # Iterate through all layers (Deep Supervision)
+            for i, (z_slots, presence_logits) in enumerate(layer_outputs):
+                
+                # 1. Compute Costs & Losses for THIS layer
+                C_match, C_lat_full, C_rec_full, lengths = compute_cost_and_losses(
+                    per_ae, z_slots, Z_gt, Y_gt_fields, mask, w_latent, w_recon
+                )
 
-                rows, cols = torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
-                if k_b > 0 and C_match_list[b] is not None:
-                    # Pass the cost matrix for this sample
-                    rows, cols = _hungarian(C_match_list[b])
+                # 2. Match for THIS layer (Independent matching per layer guides flow)
+                b_idx, r_idx, c_idx = match_batch_hungarian(C_match, lengths)
+                
+                # 3. Calculate layer loss
+                matched_count = b_idx.numel()
+                denom = max(1, matched_count)
+                
+                loss_latent_l = torch.zeros((), device=device)
+                loss_recon_l = torch.zeros((), device=device)
+                
+                if matched_count > 0:
+                    loss_latent_l = C_lat_full[b_idx, r_idx, c_idx].sum() / denom
+                    loss_recon_l = C_rec_full[b_idx, r_idx, c_idx].sum() / denom
+
+                # Presence
+                target_pres = torch.zeros_like(presence_logits)
+                if matched_count > 0:
+                    target_pres[b_idx, r_idx] = 1.0
+                
+                loss_presence_l = torch.nn.functional.binary_cross_entropy_with_logits(presence_logits, target_pres)
+
+                # Null
+                mask_unmatched = torch.ones((z_slots.shape[0], z_slots.shape[1]), dtype=torch.bool, device=device)
+                if matched_count > 0:
+                    mask_unmatched[b_idx, r_idx] = False
+                loss_null_l = z_slots[mask_unmatched].pow(2).mean()
+                if torch.isnan(loss_null_l): loss_null_l = torch.tensor(0.0, device=device)
+
+                layer_loss = (
+                    w_latent * loss_latent_l +
+                    w_recon * loss_recon_l +
+                    w_presence * loss_presence_l +
+                    w_null * loss_null_l
+                )
+                
+                total_loss = total_loss + layer_loss
+
+                # If this is the final layer, capture metrics for logging
+                if i == len(layer_outputs) - 1:
+                    total_targets = lengths.sum().item()
+                    total_preds = (torch.sigmoid(presence_logits) > 0.5).float().sum().item()
                     
-                    # C_match_list is (N, k_b). 
-                    # Rows are pred indices, Cols are target indices.
-                    # _hungarian returns valid pairs.
-                    # No need to filter cols < k_b explicitly because the matrix passed 
-                    # into hungarian was already sliced to k_b cols in _compute_cost_matrices.
+                    log_metrics['loss_total'] = layer_loss.item() # Log final layer's contribution for clarity
+                    log_metrics['loss_latent'] = loss_latent_l.item()
+                    log_metrics['loss_recon'] = loss_recon_l.item()
+                    log_metrics['loss_presence'] = loss_presence_l.item()
+                    log_metrics['loss_null'] = loss_null_l.item()
+                    
+                    log_metrics['recall'] = matched_count / max(1, total_targets)
+                    log_metrics['precision'] = matched_count / max(1, total_preds)
+                    log_metrics['card_error'] = abs(total_preds - total_targets) / z_movies.shape[0]
+                    
+                    # Top-1 Loss Check
+                    with torch.no_grad():
+                        top1_slots = presence_logits.argmax(dim=1)
+                        is_top1 = (r_idx == top1_slots[b_idx])
+                        top1_loss = 0.0
+                        if is_top1.any():
+                            top1_loss = C_rec_full[b_idx[is_top1], r_idx[is_top1], c_idx[is_top1]].mean().item()
+                        log_metrics['loss_recon_top1'] = top1_loss
 
-                # Presence Loss
-                tgt_pres = torch.zeros_like(logits_b)
-                if rows.numel() > 0:
-                    tgt_pres[rows.to(device)] = 1.0
-                
-                total_presence_loss += torch.nn.functional.binary_cross_entropy_with_logits(logits_b, tgt_pres)
-                pres_cnt += 1
+            # Average loss over layers to keep magnitude consistent
+            total_loss = total_loss / len(layer_outputs)
 
-                # Content Loss
-                if rows.numel() > 0:
-                    r_idx, c_idx = rows.to(device), cols.to(device)
-                    # Accumulate losses from the precomputed matrices
-                    total_latent_loss += C_lat_list[b][r_idx, c_idx].mean()
-                    total_recon_loss += C_rec_list[b][r_idx, c_idx].mean()
-                    matched_cnt += 1
-                
-                # Null Loss
-                if rows.numel() < z_slots.shape[1]:
-                    mask_null = torch.ones(z_slots.shape[1], dtype=torch.bool, device=device)
-                    if rows.numel() > 0: mask_null[rows.to(device)] = False
-                    total_null_loss += z_slots[b, mask_null].pow(2).mean()
-                    null_cnt += 1
-
-                # Metrics
-                matched_n = rows.numel()
-                recalls.append(matched_n / max(k_b, 1) if k_b > 0 else (1.0 if pred_on==0 else 0.0))
-                precisions.append(matched_n / max(pred_on, 1) if pred_on > 0 else (1.0 if k_b==0 else 0.0))
-                cards.append(abs(pred_on - k_b))
-
-            loss = (
-                w_latent * (total_latent_loss / max(1, matched_cnt)) +
-                w_recon * (total_recon_loss / max(1, matched_cnt)) +
-                w_presence * (total_presence_loss / max(1, pres_cnt)) +
-                w_null * (total_null_loss / max(1, null_cnt))
-            )
-
-            loss.backward()
+            total_loss.backward()
             opt.step()
             if sched: sched.step()
 
-            m_rec = sum(recalls)/len(recalls)
-            m_prec = sum(precisions)/len(precisions)
-            m_err = sum(cards)/len(cards)
+            iter_time = time.perf_counter() - iter_start
 
             if run_logger:
-                run_logger.add_scalar("set_decoder/loss", float(loss), global_step)
-                run_logger.add_scalar("set_decoder/recall", m_rec, global_step)
+                run_logger.add_scalar("loss/total", float(total_loss), global_step)
+                run_logger.add_scalar("loss/latent", log_metrics['loss_latent'], global_step)
+                run_logger.add_scalar("loss/recon", log_metrics['loss_recon'], global_step)
+                run_logger.add_scalar("loss/presence", log_metrics['loss_presence'], global_step)
+                run_logger.add_scalar("loss/null", log_metrics['loss_null'], global_step)
+                run_logger.add_scalar("loss/recon_top1", log_metrics['loss_recon_top1'], global_step)
+                
+                run_logger.add_scalar("metric/recall", log_metrics['recall'], global_step)
+                run_logger.add_scalar("metric/precision", log_metrics['precision'], global_step)
+                run_logger.add_scalar("metric/card_error", log_metrics['card_error'], global_step)
+                
+                run_logger.add_scalar("time/iter_sec", iter_time, global_step)
                 run_logger.tick()
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}", rec=f"{m_rec:.3f}", prec=f"{m_prec:.3f}", err=f"{m_err:.2f}")
+            pbar.set_postfix(
+                loss=f"{total_loss.item():.4f}", 
+                rec=f"{log_metrics['recall']:.3f}", 
+                prec=f"{log_metrics['precision']:.3f}"
+            )
 
             if (global_step+1) % save_interval == 0:
                 save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch, global_step, cfg, None)
