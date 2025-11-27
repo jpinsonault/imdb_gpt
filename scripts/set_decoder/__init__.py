@@ -1,6 +1,10 @@
 from .model import SetDecoder
-from .data import TitlePeopleSetDataset, collate_set_decoder
-from .training import (
-    build_set_decoder_trainer,
-    SetReconstructionLogger,
-)
+from .data import CachedSetDataset, collate_set_decoder
+from .recon_logger import SetReconstructionLogger
+
+__all__ = [
+    "SetDecoder",
+    "CachedSetDataset",
+    "collate_set_decoder",
+    "SetReconstructionLogger",
+]

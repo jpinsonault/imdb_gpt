@@ -8,7 +8,7 @@ class ProjectConfig:
     db_path: str = "data/imdb.db"
     model_dir: str = "models"
 
-    batch_size: int = 2048
+    batch_size: int = 512
     learning_rate: float = 1e-3
     weight_decay: float = 1e-3
     epochs: int = 4
@@ -46,7 +46,11 @@ class ProjectConfig:
     lr_warmup_steps: int = 0
     lr_warmup_ratio: float = 0.05
     lr_min_factor: float = 0.05
-
+    set_decoder_epochs: int = 100
+    set_decoder_save_interval: int = 100
+    set_decoder_callback_interval: int = 100
+    set_decoder_recon_samples: int = 5
+    set_decoder_table_width: int = 60
     # Path Siren
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001

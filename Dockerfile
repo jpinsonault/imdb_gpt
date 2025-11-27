@@ -17,6 +17,7 @@ RUN pip install \
   simplejson==3.20.1 \
   tensorboard \
   tqdm \
+  scipy \
   openai \
   datasets \
   requests
