@@ -46,15 +46,31 @@ class ProjectConfig:
     lr_warmup_steps: int = 0
     lr_warmup_ratio: float = 0.05
     lr_min_factor: float = 0.05
-    set_decoder_epochs: int = 100
-    set_decoder_save_interval: int = 100
-    set_decoder_callback_interval: int = 100
-    set_decoder_recon_samples: int = 5
-    set_decoder_table_width: int = 120
-    set_decoder_hidden_mult: float = 2.0
-    set_decoder_layers: int = 8
-    set_decoder_heads: int = 8
-    # Path Siren
+
+    # Sequence Decoder Settings
+    seq_decoder_epochs: int = 100
+    seq_decoder_save_interval: int = 100
+    seq_decoder_callback_interval: int = 100
+    seq_decoder_recon_samples: int = 5
+    seq_decoder_table_width: int = 120
+    
+    # Model Architecture
+    seq_decoder_len: int = 10  # Max sequence length (formerly slots)
+    seq_decoder_hidden_dim: int = 256
+    seq_decoder_layers: int = 6
+    seq_decoder_heads: int = 8
+    seq_decoder_dropout: float = 0.1
+    
+    # Optimizer
+    seq_decoder_lr: float = 3e-4
+    seq_decoder_weight_decay: float = 1e-2
+
+    # Loss Weights
+    seq_decoder_w_latent: float = 1.0
+    seq_decoder_w_recon: float = 1.0
+    seq_decoder_w_presence: float = 1.0
+
+    # Path Siren (legacy/future)
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001
     path_siren_weight_decay: float = 0.0
@@ -70,20 +86,14 @@ class ProjectConfig:
     path_siren_save_interval: int = 500
 
     path_siren_movie_limit: int | None = None
-
-    # title-level: if you keep these nonzero, they should be used
-    # only against the separate movie latent (not path slots).
     path_siren_loss_w_title_latent: float = 1.0
     path_siren_loss_w_title_recon: float = 1.0
-
-    # people + path supervision
     path_siren_loss_w_people: float = 1.0
     path_siren_loss_w_latent_path: float = 1.0
-
     path_siren_seed: int = 1337
     path_siren_time_fourier: int = 0
 
-    # Image AE / Image Siren (unchanged)
+    # Image AE / Siren (unchanged)
     image_ae_data_dir: str = "data/image_autoencoder"
     image_ae_runs_dir: str = "runs/image_autoencoder"
     image_ae_image_size: int = 128
@@ -95,7 +105,6 @@ class ProjectConfig:
     image_ae_epochs: int = 100
     image_ae_recon_every: int = 2
     image_ae_max_recon_samples: int = 8
-
     image_ae_loss_w_l1: float = 1.0
     image_ae_loss_w_grad: float = 0.5
     image_ae_loss_w_tv: float = 0.0
@@ -117,13 +126,11 @@ class ProjectConfig:
     image_siren_from_latent_sigmoid: bool = True
     image_siren_image_size: int = 256
     image_siren_eval_data_dir: str = "data/image_siren_eval"
-
     image_siren_samples_per_image: int = 4096
     image_siren_density_alpha: float = 0.9
     image_siren_uniform_frac: float = 0.1
     image_siren_image_repeats_per_epoch: int = 4
 
-    # Joint trainer: precomputed edge tensors on disk (not sqlite)
     joint_edge_tensor_cache: bool = True
     joint_edge_tensor_cache_file: str = "joint_edge_tensors.pt"
 

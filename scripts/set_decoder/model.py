@@ -3,107 +3,135 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class AdaLN(nn.Module):
     """
     Adaptive Layer Normalization (FiLM).
     Scales and shifts the normalized input based on an external condition (z_movie).
     """
-    def __init__(self, latent_dim: int, condition_dim: int):
+    def __init__(self, hidden_dim: int, condition_dim: int):
         super().__init__()
-        # Standard LayerNorm (elementwise_affine=False because we predict params)
-        self.norm = nn.LayerNorm(latent_dim, elementwise_affine=False, eps=1e-6)
+        # Elementwise affine is False because we predict the affine parameters
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         
-        # Projection from condition (movie) to gamma (scale) and beta (shift)
-        self.film_proj = nn.Linear(condition_dim, 2 * latent_dim)
+        # Projection: condition -> [gamma, beta]
+        self.film_proj = nn.Linear(condition_dim, 2 * hidden_dim)
         
-        # Initialize to Identity: gamma=0 (out = x * (1+0) + 0)
+        # Init to Identity: gamma=0, beta=0
         nn.init.zeros_(self.film_proj.weight)
         nn.init.zeros_(self.film_proj.bias)
 
     def forward(self, x: torch.Tensor, condition: torch.Tensor):
-        # x: (B, Seq, Dim)
-        # condition: (B, CondDim)
-        
-        params = self.film_proj(condition) # (B, 2*Dim)
-        gamma, beta = params.chunk(2, dim=-1) # (B, Dim)
-        
-        # Expand for sequence length broadcasting
-        gamma = gamma.unsqueeze(1)
-        beta = beta.unsqueeze(1)
+        """
+        x: (B, SeqLen, Hidden)
+        condition: (B, CondDim) or (B, 1, CondDim)
+        """
+        if condition.dim() == 2:
+            condition = condition.unsqueeze(1) # (B, 1, CondDim) for broadcasting
+            
+        params = self.film_proj(condition) # (B, 1, 2*H)
+        gamma, beta = params.chunk(2, dim=-1) # (B, 1, H) each
         
         out = self.norm(x)
         out = out * (1 + gamma) + beta
         return out
 
 
-class FiLMTransformerBlock(nn.Module):
-    def __init__(self, dim: int, condition_dim: int, num_heads: int, mlp_ratio: float = 2.0):
+class FiLMDecoderLayer(nn.Module):
+    """
+    A Transformer Decoder Layer that uses FiLM (AdaLN) for normalization 
+    instead of standard LayerNorm.
+    """
+    def __init__(self, hidden_dim: int, latent_dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
-        self.attn_norm = AdaLN(dim, condition_dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        # 1. Self Attention (Causal)
+        self.norm1 = AdaLN(hidden_dim, latent_dim)
+        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
         
-        self.mlp_norm = AdaLN(dim, condition_dim)
-        hidden_dim = int(dim * mlp_ratio)
+        # 2. Cross Attention (Look at Movie Memory)
+        self.norm2 = AdaLN(hidden_dim, latent_dim)
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        
+        # 3. Feed Forward
+        self.norm3 = AdaLN(hidden_dim, latent_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
-            nn.Linear(hidden_dim, dim)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
         )
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, condition: torch.Tensor):
-        # 1. Attention Block (Pre-LN with FiLM)
-        norm_x = self.attn_norm(x, condition)
-        attn_out, _ = self.attn(norm_x, norm_x, norm_x)
-        x = x + attn_out
+    def forward(self, x, memory, tgt_mask=None, z_movie=None):
+        # x: (B, T, H)
+        # memory: (B, 1, H) - projected movie latent for cross attn
+        # z_movie: (B, D) - raw movie latent for FiLM
         
-        # 2. MLP Block (Pre-LN with FiLM)
-        norm_x = self.mlp_norm(x, condition)
-        mlp_out = self.mlp(norm_x)
-        x = x + mlp_out
+        # Block 1: Masked Self-Attention
+        # Pre-Norm with FiLM
+        res = x
+        x = self.norm1(x, z_movie)
+        x, _ = self.self_attn(x, x, x, attn_mask=tgt_mask, need_weights=False)
+        x = res + self.dropout(x)
+        
+        # Block 2: Cross-Attention
+        # Pre-Norm with FiLM
+        res = x
+        x = self.norm2(x, z_movie)
+        x, _ = self.cross_attn(x, memory, memory, need_weights=False)
+        x = res + self.dropout(x)
+        
+        # Block 3: MLP
+        # Pre-Norm with FiLM
+        res = x
+        x = self.norm3(x, z_movie)
+        x = self.mlp(x)
+        x = res + x
         
         return x
 
 
-class SetDecoder(nn.Module):
+class SequenceDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int,
-        num_slots: int,
-        hidden_mult: float,
+        max_len: int,
+        hidden_dim: int,
         num_layers: int,
         num_heads: int,
+        dropout: float = 0.1
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
-        self.num_slots = int(num_slots)
+        self.max_len = int(max_len)
+        self.hidden_dim = int(hidden_dim)
         
-        # --- Learnable Slot Queries (DETR Style) ---
-        # Instead of projecting from z_movie, we start with fixed learnable parameters.
-        # These represent "Slot 1", "Slot 2", etc., which will be modulated by the movie context.
-        self.slot_queries = nn.Parameter(torch.randn(1, self.num_slots, self.latent_dim))
-
-        # --- The FiLM Transformer Backbone ---
-        self.blocks = nn.ModuleList([
-            FiLMTransformerBlock(
-                dim=self.latent_dim, 
-                condition_dim=self.latent_dim, 
-                num_heads=num_heads, 
-                mlp_ratio=hidden_mult
-            )
+        # Project latents to hidden dim
+        self.input_proj = nn.Linear(latent_dim, hidden_dim)
+        
+        # We also project z_movie to hidden_dim for Cross-Attention keys/values
+        self.movie_proj = nn.Linear(latent_dim, hidden_dim)
+        
+        # Learnable SOS token (represents "Start of Sequence")
+        self.sos_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        
+        # Positional Embeddings
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len + 1, hidden_dim) * 0.02)
+        
+        # Custom FiLM Decoder Stack
+        self.layers = nn.ModuleList([
+            FiLMDecoderLayer(hidden_dim, latent_dim, num_heads, dropout)
             for _ in range(num_layers)
         ])
         
-        # Output Norm
-        self.final_norm = AdaLN(self.latent_dim, self.latent_dim)
+        # Final Norm
+        self.final_norm = AdaLN(hidden_dim, latent_dim)
 
-        # --- Shared Output Heads ---
-        self.latent_head = nn.Linear(self.latent_dim, self.latent_dim)
-        self.presence_head = nn.Linear(self.latent_dim, 1)
-
-        # --- Learned Null Embedding ---
-        # A learnable anchor point for "empty" slots. 
-        self.null_embedding = nn.Parameter(torch.randn(1, 1, self.latent_dim))
+        # Output Heads
+        self.latent_head = nn.Linear(hidden_dim, latent_dim)
+        self.presence_head = nn.Linear(hidden_dim, 1)
 
         self.apply(self._init_weights)
 
@@ -113,72 +141,113 @@ class SetDecoder(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, z_movie: torch.Tensor):
+    def _generate_square_subsequent_mask(self, sz: int, device: torch.device):
+        # Standard causal mask
+        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def forward(self, z_movie: torch.Tensor, z_sequence: torch.Tensor):
         """
         Args:
-            z_movie: (B, LatentDim)
-        Returns:
-            z_slots: (B, NumSlots, LatentDim) - Normalized
-            presence_logits: (B, NumSlots)
+            z_movie: (B, LatentDim) -> Used for Cross-Attn AND FiLM
+            z_sequence: (B, SeqLen, LatentDim) -> Target sequence
         """
-        batch_size = z_movie.size(0)
-
-        # 1. Expand Learnable Queries to Batch Size
-        # (1, N, D) -> (B, N, D)
-        x = self.slot_queries.expand(batch_size, -1, -1)
+        B, T, _ = z_sequence.shape
         
-        # 2. Run Backbone with FiLM Conditioning
-        # The z_movie modulates the normalization of the slots at every layer
-        for block in self.blocks:
-            x = block(x, z_movie)
-            
-        # 3. Final Heads
-        x_aux = self.final_norm(x, z_movie)
+        # 1. Prepare Memory (Movie Latent for Cross Attn)
+        # (B, D) -> (B, 1, H)
+        memory = self.movie_proj(z_movie).unsqueeze(1)
         
-        z_raw = self.latent_head(x_aux)
-        # Sphere Awareness: Normalize output latents
-        z_slots = F.normalize(z_raw, p=2, dim=-1)
+        # 2. Prepare Input (Autoregressive Input)
+        # Project sequence to hidden
+        seq_emb = self.input_proj(z_sequence) # (B, T, H)
         
-        pres_logits = self.presence_head(x_aux).squeeze(-1)
-            
-        return z_slots, pres_logits
+        # Prepend SOS
+        sos = self.sos_token.expand(B, -1, -1) # (B, 1, H)
+        
+        # Shift: Input is [SOS, T0, T1... Tn-1] to predict [T0, T1... Tn]
+        shifted_seq = seq_emb[:, :-1, :]
+        decoder_input = torch.cat([sos, shifted_seq], dim=1) # (B, T, H)
+        
+        # 3. Add Positional Embeddings
+        decoder_input = decoder_input + self.pos_embedding[:, :T, :]
+        
+        # 4. Causal Mask
+        tgt_mask = self._generate_square_subsequent_mask(T, z_sequence.device)
+        
+        # 5. Pass through FiLM Layers
+        x = decoder_input
+        for layer in self.layers:
+            # We pass z_movie explicitly for AdaLN modulation
+            x = layer(x, memory=memory, tgt_mask=tgt_mask, z_movie=z_movie)
+        
+        # 6. Final Norm (also FiLM'd)
+        x = self.final_norm(x, z_movie)
+        
+        # 7. Output Heads
+        z_raw = self.latent_head(x)
+        z_pred = F.normalize(z_raw, p=2, dim=-1)
+        pres_logits = self.presence_head(x).squeeze(-1)
+        
+        return z_pred, pres_logits
 
     @torch.no_grad()
-    def predict(
+    def generate(
         self,
         z_movie: torch.Tensor,
-        threshold: float = 0.5,
-        top_k: int | None = None,
+        max_len: int | None = None,
+        threshold: float = 0.5
     ):
-        z_slots, presence_logits = self.forward(z_movie)
+        """
+        Autoregressive Inference Loop
+        """
+        if max_len is None: max_len = self.max_len
         
-        probs = torch.sigmoid(presence_logits)
-
-        if top_k is None:
-            mask = probs > threshold
-            if mask.sum(dim=-1).max().item() == 0:
-                top_k = 1
-            else:
-                top_k = self.num_slots
-
-        top_k = min(self.num_slots, int(top_k))
+        B = z_movie.size(0)
+        device = z_movie.device
         
-        probs_sorted, idx_sorted = probs.sort(dim=-1, descending=True)
-
-        idx_top = idx_sorted[:, :top_k]
-        probs_top = probs_sorted[:, :top_k]
-
-        b = z_movie.size(0)
-        z_out = []
-        p_out = []
-        for i in range(b):
-            sel = probs_top[i] > threshold
-            if sel.sum().item() == 0:
-                sel = torch.zeros_like(probs_top[i], dtype=torch.bool)
-                sel[0] = True
-                
-            chosen_idx = idx_top[i][sel]
-            z_out.append(z_slots[i, chosen_idx])
-            p_out.append(probs[i, chosen_idx])
-
+        # Memory for Cross Attn
+        memory = self.movie_proj(z_movie).unsqueeze(1) # (B, 1, H)
+        
+        # Start with SOS
+        curr_input = self.sos_token.expand(B, -1, -1) # (B, 1, H)
+        curr_input = curr_input + self.pos_embedding[:, 0:1, :]
+        
+        generated_latents = []
+        generated_probs = []
+        
+        full_input_seq = curr_input
+        
+        for t in range(max_len):
+            tgt_mask = self._generate_square_subsequent_mask(full_input_seq.size(1), device)
+            
+            # Run stack
+            x = full_input_seq
+            for layer in self.layers:
+                x = layer(x, memory=memory, tgt_mask=tgt_mask, z_movie=z_movie)
+            
+            # Take only the last step
+            last_step = x[:, -1:, :] # (B, 1, H)
+            last_step = self.final_norm(last_step, z_movie)
+            
+            # Predict
+            z_raw = self.latent_head(last_step)
+            z_next = F.normalize(z_raw, p=2, dim=-1) # (B, 1, D)
+            p_next = self.presence_head(last_step).squeeze(-1) # (B, 1)
+            
+            generated_latents.append(z_next.squeeze(1))
+            generated_probs.append(torch.sigmoid(p_next).squeeze(1))
+            
+            # Prepare next input
+            if t < max_len - 1:
+                next_emb = self.input_proj(z_next) # (B, 1, H)
+                # Add pos embedding
+                next_emb = next_emb + self.pos_embedding[:, t+1:t+2, :]
+                full_input_seq = torch.cat([full_input_seq, next_emb], dim=1)
+        
+        # Stack
+        z_out = torch.stack(generated_latents, dim=1)
+        p_out = torch.stack(generated_probs, dim=1)
+        
         return z_out, p_out

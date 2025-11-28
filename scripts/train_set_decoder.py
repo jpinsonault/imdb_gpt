@@ -17,11 +17,11 @@ from tqdm import tqdm
 from config import project_config, ensure_dirs, ProjectConfig
 from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
 from scripts.autoencoder.run_logger import RunLogger
-from scripts.set_decoder.model import SetDecoder
+from scripts.set_decoder.model import SequenceDecoder
 from scripts.set_decoder.recon_logger import SetReconstructionLogger
 from scripts.precompute_set_cache import ensure_set_decoder_cache
-from scripts.set_decoder.data import CachedSetDataset, collate_set_decoder
-from scripts.set_decoder.training import compute_cost_and_losses, match_batch_hungarian
+from scripts.set_decoder.data import CachedSequenceDataset, collate_seq_decoder
+from scripts.set_decoder.training import compute_sequence_losses
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -59,7 +59,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
 def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config, best_loss):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
-        with open(model_dir / "set_decoder_config.json", "w") as f:
+        with open(model_dir / "seq_decoder_config.json", "w") as f:
             json.dump(asdict(config), f, indent=4)
         state = {
             "epoch": epoch,
@@ -72,12 +72,12 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "rng_state_numpy": np.random.get_state(),
             "rng_state_random": random.getstate(),
         }
-        torch.save(state, model_dir / "set_decoder_state.pt")
-        logging.info(f"Saved training state to {model_dir / 'set_decoder_state.pt'}")
+        torch.save(state, model_dir / "seq_decoder_state.pt")
+        logging.info(f"Saved training state to {model_dir / 'seq_decoder_state.pt'}")
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
 
-def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
+def build_seq_decoder_trainer(cfg: ProjectConfig, db_path: str):
     mov_ae, per_ae = _load_frozen_autoencoders(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available():
@@ -92,8 +92,8 @@ def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
         for p in m.parameters(): p.requires_grad_(False)
 
     cache_path = ensure_set_decoder_cache(cfg)
-    num_slots = int(getattr(cfg, "set_decoder_slots", 10))
-    ds = CachedSetDataset(str(cache_path), num_slots=num_slots)
+    max_len = int(getattr(cfg, "seq_decoder_len", 10))
+    ds = CachedSequenceDataset(str(cache_path), max_len=max_len)
 
     from torch.utils.data import DataLoader
     num_workers = int(getattr(cfg, "num_workers", 0) or 0)
@@ -103,49 +103,49 @@ def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
         batch_size=cfg.batch_size,
         shuffle=True,
         drop_last=False,
-        collate_fn=collate_set_decoder,
+        collate_fn=collate_seq_decoder,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
     )
 
     latent_dim = int(getattr(mov_ae, "latent_dim", cfg.latent_dim))
     
-    # FiLM + Single Final Decoding (No Deep Supervision)
-    model = SetDecoder(
+    # Autoregressive Model
+    model = SequenceDecoder(
         latent_dim=latent_dim,
-        num_slots=num_slots,
-        hidden_mult=float(cfg.set_decoder_hidden_mult),
-        num_layers=int(cfg.set_decoder_layers),
-        num_heads=int(cfg.set_decoder_heads),
+        max_len=max_len,
+        hidden_dim=int(getattr(cfg, "seq_decoder_hidden_dim", 256)),
+        num_layers=int(getattr(cfg, "seq_decoder_layers", 6)),
+        num_heads=int(getattr(cfg, "seq_decoder_heads", 8)),
+        dropout=float(getattr(cfg, "seq_decoder_dropout", 0.1)),
     ).to(device)
 
     opt = torch.optim.AdamW(
         model.parameters(),
-        lr=float(getattr(cfg, "set_decoder_lr", 3e-4)),
-        weight_decay=float(getattr(cfg, "set_decoder_weight_decay", 1e-2)),
+        lr=float(getattr(cfg, "seq_decoder_lr", 3e-4)),
+        weight_decay=float(getattr(cfg, "seq_decoder_weight_decay", 1e-2)),
     )
 
-    run_logger = RunLogger(cfg.tensorboard_dir, "set_decoder", cfg)
+    run_logger = RunLogger(cfg.tensorboard_dir, "seq_decoder", cfg)
     
     recon_logger = SetReconstructionLogger(
         model=model, movie_ae=mov_ae, people_ae=per_ae,
-        num_slots=num_slots,
-        interval_steps=int(getattr(cfg, "set_decoder_callback_interval", 500)),
-        num_samples=int(getattr(cfg, "set_decoder_recon_samples", 3)),
-        table_width=int(getattr(cfg, "set_decoder_table_width", 60)),
+        num_slots=max_len,
+        interval_steps=int(getattr(cfg, "seq_decoder_callback_interval", 500)),
+        num_samples=int(getattr(cfg, "seq_decoder_recon_samples", 3)),
+        table_width=int(getattr(cfg, "seq_decoder_table_width", 60)),
     )
 
     loss_cfg = {
-        "w_latent": float(getattr(cfg, "set_decoder_w_latent", 1.0)),
-        "w_recon": float(getattr(cfg, "set_decoder_w_recon", 1.0)),
-        "w_presence": float(getattr(cfg, "set_decoder_w_presence", 1.0)),
-        "w_null": float(getattr(cfg, "set_decoder_w_null", 0.1)),
+        "w_latent": float(getattr(cfg, "seq_decoder_w_latent", 1.0)),
+        "w_recon": float(getattr(cfg, "seq_decoder_w_recon", 1.0)),
+        "w_presence": float(getattr(cfg, "seq_decoder_w_presence", 1.0)),
     }
 
     return model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg
 
 def main():
-    parser = argparse.ArgumentParser(description="Train set decoder")
+    parser = argparse.ArgumentParser(description="Train sequence decoder")
     parser.add_argument("--new-run", action="store_true", help="Start fresh")
     args = parser.parse_args()
 
@@ -153,21 +153,20 @@ def main():
     ensure_dirs(cfg)
     db_path = cfg.db_path
 
-    model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg = build_set_decoder_trainer(cfg, db_path=db_path)
+    model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg = build_seq_decoder_trainer(cfg, db_path=db_path)
     device = next(model.parameters()).device
     
-    num_epochs = int(getattr(cfg, "set_decoder_epochs", 3))
-    save_interval = int(getattr(cfg, "set_decoder_save_interval", 1000))
-    flush_interval = int(getattr(cfg, "flush_interval", 250))
+    num_epochs = int(getattr(cfg, "seq_decoder_epochs", 50))
+    save_interval = int(getattr(cfg, "seq_decoder_save_interval", 1000))
     w_latent, w_recon = loss_cfg["w_latent"], loss_cfg["w_recon"]
-    w_presence, w_null = loss_cfg["w_presence"], loss_cfg["w_null"]
+    w_presence = loss_cfg["w_presence"]
 
     sched = make_lr_scheduler(opt, len(loader) * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
 
     start_epoch = 0
     global_step = 0
     best_loss = None
-    checkpoint_path = Path(cfg.model_dir) / "set_decoder_state.pt"
+    checkpoint_path = Path(cfg.model_dir) / "seq_decoder_state.pt"
 
     if checkpoint_path.exists() and not args.new_run:
         try:
@@ -188,7 +187,7 @@ def main():
     signal.signal(signal.SIGINT, _sig)
 
     for epoch in range(start_epoch, num_epochs):
-        pbar = tqdm(loader, dynamic_ncols=True, desc=f"set-dec epoch {epoch+1}/{num_epochs}")
+        pbar = tqdm(loader, dynamic_ncols=True, desc=f"seq-dec epoch {epoch+1}/{num_epochs}")
         for batch in pbar:
             iter_start = time.perf_counter()
 
@@ -201,48 +200,21 @@ def main():
             model.train()
             opt.zero_grad()
             
-            # 1. Forward Pass (Final Layer Only)
-            z_slots, presence_logits = model(z_movies)
+            # 1. Forward Pass (Teacher Forcing)
+            # Z_gt contains full sequence [p1, p2, p3]
+            # Model shifts internally to input [SOS, p1, p2]
+            z_pred, pres_logits = model(z_movies, Z_gt)
             
-            # 2. Compute Costs & Losses
-            C_match, C_lat_full, C_rec_full, lengths = compute_cost_and_losses(
-                per_ae, z_slots, Z_gt, Y_gt_fields, mask, w_latent, w_recon
+            # 2. Compute Losses
+            loss_latent, loss_recon = compute_sequence_losses(
+                per_ae, z_pred, Z_gt, Y_gt_fields, mask, w_latent, w_recon
             )
-
-            # 3. Hungarian Matching
-            b_idx, r_idx, c_idx = match_batch_hungarian(C_match, lengths)
             
-            # 4. Calculate Final Loss
-            matched_count = b_idx.numel()
-            denom = max(1, matched_count)
-            
-            loss_latent = torch.zeros((), device=device)
-            loss_recon = torch.zeros((), device=device)
-            
-            if matched_count > 0:
-                loss_latent = C_lat_full[b_idx, r_idx, c_idx].sum() / denom
-                loss_recon = C_rec_full[b_idx, r_idx, c_idx].sum() / denom
-
-            # Presence
-            target_pres = torch.zeros_like(presence_logits)
-            if matched_count > 0:
-                target_pres[b_idx, r_idx] = 1.0
-            
-            loss_presence = torch.nn.functional.binary_cross_entropy_with_logits(presence_logits, target_pres)
-
-            # Null (Force unmatched slots to zero/noise? Or just ignore?)
-            # Usually in SET prediction, we want unmatched slots to output "Nothing".
-            # The Latent/Recon loss above only trains matched slots.
-            # We can regularize unmatched slots to be near zero or just rely on Presence head.
-            # Let's keep the explicit Null regularization for stability.
-            mask_unmatched = torch.ones((z_slots.shape[0], z_slots.shape[1]), dtype=torch.bool, device=device)
-            if matched_count > 0:
-                mask_unmatched[b_idx, r_idx] = False
-            
-            # Since vectors are normalized to length 1, minimizing them to 0 is impossible.
-            # Instead, we rely entirely on the Presence Head to kill these slots.
-            # We remove the L2 penalty on latent magnitude because F.normalize fixed it to 1.
-            loss_null = torch.tensor(0.0, device=device)
+            # Presence Loss (BCE)
+            # Mask is 1 if person exists, 0 otherwise
+            loss_presence = torch.nn.functional.binary_cross_entropy_with_logits(
+                pres_logits, mask.float()
+            )
 
             total_loss = (
                 w_latent * loss_latent +
@@ -251,27 +223,17 @@ def main():
             )
             
             # Metrics
-            total_targets = lengths.sum().item()
-            total_preds = (torch.sigmoid(presence_logits) > 0.5).float().sum().item()
+            total_targets = mask.sum().item()
+            preds_bin = (torch.sigmoid(pres_logits) > 0.5)
+            correct_presence = ((preds_bin == mask).float().sum()) / mask.numel()
             
             log_metrics = {
                 'loss_latent': loss_latent.item(),
                 'loss_recon': loss_recon.item(),
                 'loss_presence': loss_presence.item(),
-                'recall': matched_count / max(1, total_targets),
-                'precision': matched_count / max(1, total_preds),
-                'card_error': abs(total_preds - total_targets) / z_movies.shape[0]
+                'acc_presence': correct_presence.item()
             }
             
-            # Top-1 Loss Check
-            with torch.no_grad():
-                top1_slots = presence_logits.argmax(dim=1)
-                is_top1 = (r_idx == top1_slots[b_idx])
-                top1_loss = 0.0
-                if is_top1.any():
-                    top1_loss = C_rec_full[b_idx[is_top1], r_idx[is_top1], c_idx[is_top1]].mean().item()
-                log_metrics['loss_recon_top1'] = top1_loss
-
             total_loss.backward()
             opt.step()
             if sched: sched.step()
@@ -283,24 +245,19 @@ def main():
                 run_logger.add_scalar("loss/latent", log_metrics['loss_latent'], global_step)
                 run_logger.add_scalar("loss/recon", log_metrics['loss_recon'], global_step)
                 run_logger.add_scalar("loss/presence", log_metrics['loss_presence'], global_step)
-                run_logger.add_scalar("loss/recon_top1", log_metrics['loss_recon_top1'], global_step)
-                
-                run_logger.add_scalar("metric/recall", log_metrics['recall'], global_step)
-                run_logger.add_scalar("metric/precision", log_metrics['precision'], global_step)
-                run_logger.add_scalar("metric/card_error", log_metrics['card_error'], global_step)
-                
+                run_logger.add_scalar("metric/acc_presence", log_metrics['acc_presence'], global_step)
                 run_logger.add_scalar("time/iter_sec", iter_time, global_step)
                 run_logger.tick()
 
             pbar.set_postfix(
                 loss=f"{total_loss.item():.4f}", 
-                rec=f"{log_metrics['recall']:.3f}", 
-                prec=f"{log_metrics['precision']:.3f}"
+                lat=f"{log_metrics['loss_latent']:.3f}", 
+                pres=f"{log_metrics['acc_presence']:.3f}"
             )
 
             if (global_step+1) % save_interval == 0:
                 save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch, global_step, cfg, None)
-                torch.save(model.state_dict(), Path(cfg.model_dir) / "SetDecoder.pt")
+                torch.save(model.state_dict(), Path(cfg.model_dir) / "SequenceDecoder.pt")
 
             if hasattr(loader.dataset, "movies"):
                 sample_tconsts = loader.dataset.movies[: z_movies.size(0)]
@@ -316,7 +273,7 @@ def main():
         save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch+1, global_step, cfg, None)
         if stop_flag["stop"]: break
 
-    torch.save(model.state_dict(), Path(cfg.model_dir) / "SetDecoder_final.pt")
+    torch.save(model.state_dict(), Path(cfg.model_dir) / "SequenceDecoder_final.pt")
     if run_logger: run_logger.close()
 
 if __name__ == "__main__":

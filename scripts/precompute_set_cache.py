@@ -3,7 +3,6 @@
 import logging
 import sqlite3
 import torch
-import torch.nn as nn
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
@@ -15,7 +14,6 @@ from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class _RawEntityDataset(Dataset):
-    """Helper to serve raw dict rows for batch encoding."""
     def __init__(self, rows, fields):
         self.rows = rows
         self.fields = fields
@@ -25,74 +23,31 @@ class _RawEntityDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.rows[idx]
-        # Return transformed tensors (inputs, targets)
-        # Note: fields handle None internally usually, but row must exist
         inputs = [f.transform(row.get(f.name)) for f in self.fields]
         targets = [f.transform_target(row.get(f.name)) for f in self.fields]
         return inputs, targets
 
 def _collate_raw(batch):
     inputs_list, targets_list = zip(*batch)
-    # Group inputs by field
     num_fields = len(inputs_list[0])
     collated_inputs = []
     for i in range(num_fields):
         collated_inputs.append(torch.stack([x[i] for x in inputs_list]))
     
-    # Group targets by field
     collated_targets = []
     for i in range(num_fields):
         collated_targets.append(torch.stack([x[i] for x in targets_list]))
         
     return collated_inputs, collated_targets
 
-def _fetch_movie_rows(db_path, tconsts, mov_ae) -> List[Dict]:
-    """Bulk fetch movie rows to avoid opening 200k sqlite connections."""
-    # We'll just reuse the generator logic but filter in python if list is small, 
-    # or more efficiently: grab everything and filter. 
-    # Given IMDB scale, let's rely on the fact that tconsts are likely contiguous 
-    # or we just use the existing row_generator and keep valid ones.
-    
-    logging.info(f"Bulk fetching {len(tconsts)} movie rows...")
-    tconst_set = set(tconsts)
-    valid_rows = []
-    
-    # We use the AE's generator which already does the complex JOINs
-    count = 0
-    for row in tqdm(mov_ae.row_generator(), desc="Scanning movies"):
-        if row['tconst'] in tconst_set:
-            valid_rows.append(row)
-            count += 1
-            
-    # Sort to match input order (critical for index alignment)
-    row_map = {r['tconst']: r for r in valid_rows}
-    ordered_rows = [row_map.get(t, {}) for t in tconsts]
-    return ordered_rows
-
 def _fetch_person_rows(db_path, nconsts, per_ae) -> List[Dict]:
-    """Bulk fetch person rows."""
     logging.info(f"Bulk fetching {len(nconsts)} person rows...")
-    nconst_set = set(nconsts)
-    valid_rows = []
-    
-    for row in tqdm(per_ae.row_generator(), desc="Scanning people"):
-        if row['primaryName'] in nconst_set or getattr(row, 'nconst', '') in nconst_set: 
-            # Note: row_generator dicts might not have 'nconst' key depending on implementation
-            # PeopleAutoencoder generator returns: primaryName, birthYear... 
-            # It does NOT return nconst by default in the dict! 
-            # We need to patch PeopleAutoencoder.row_generator or rely on order?
-            # Actually, let's write a custom quick query here to be safe.
-            pass
-
-    # Custom efficient fetch
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     
-    # Create temp table for join filtering
     cur.execute("CREATE TEMPORARY TABLE target_people (nconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_people (nconst) VALUES (?)", [(n,) for n in nconsts])
     
-    # Query mirrors PeopleAutoencoder but joins our temp list
     sql = """
     SELECT 
         p.nconst,
@@ -119,59 +74,68 @@ def _fetch_person_rows(db_path, nconsts, per_ae) -> List[Dict]:
     ordered_rows = [rows.get(n, {}) for n in nconsts]
     return ordered_rows
 
-def build_set_decoder_cache(cfg: ProjectConfig):
+def build_sequence_cache(cfg: ProjectConfig):
     db_path = Path(cfg.data_dir) / "imdb.db"
-    cache_path = Path(cfg.data_dir) / "set_decoder_data.pt"
+    cache_path = Path(cfg.data_dir) / "seq_decoder_data.pt"
     
     logging.info("Loading frozen autoencoders...")
     mov_ae, per_ae = _load_frozen_autoencoders(cfg)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Fix for AttributeError: Wrapper class doesn't have .to(), move internals
     mov_ae.encoder.to(device).eval()
     per_ae.encoder.to(device).eval()
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    # 1. Identify valid Movies and their connected People
-    logging.info("Querying edges...")
-    # Get all edges: tconst -> list of nconst
-    # Limit scope if configured
-    limit = getattr(cfg, "set_decoder_movie_limit", None)
-    if limit:
-        cur.execute("SELECT tconst, nconst FROM edges WHERE tconst IN (SELECT tconst FROM edges GROUP BY tconst LIMIT ?) ORDER BY tconst", (limit,))
-    else:
-        cur.execute("SELECT tconst, nconst FROM edges ORDER BY tconst")
+    # 1. Identify valid Movies and their ordered People
+    logging.info("Querying ordered principals...")
     
+    # We join titles and edges to ensure we only get valid filtered data,
+    # but strictly order by 'ordering' column in principals
+    limit_clause = ""
+    limit = getattr(cfg, "movie_limit", None)
+    if limit and limit < 100000000000:
+        limit_clause = f"LIMIT {limit}"
+
+    # Get movies first
+    cur.execute(f"SELECT tconst FROM edges GROUP BY tconst {limit_clause}")
+    valid_tconsts = {r[0] for r in cur.fetchall()}
+
+    logging.info(f"Fetching ordered cast for {len(valid_tconsts)} movies...")
+    
+    # Batch query for principals to ensure order
+    # This is a bit heavy, so we might want to iterate if dataset is huge.
+    # For <1M movies, pulling to memory is okay.
+    
+    cur.execute(f"""
+        SELECT pr.tconst, pr.nconst 
+        FROM principals pr
+        WHERE pr.tconst IN (SELECT tconst FROM edges)
+        ORDER BY pr.tconst, pr.ordering
+    """)
+
     movie_to_people = {}
     all_nconsts = set()
     
-    for t, n in tqdm(cur, desc="Reading edges"):
+    for t, n in tqdm(cur, desc="Organizing sequences"):
+        if t not in valid_tconsts: continue
         if t not in movie_to_people:
             movie_to_people[t] = []
         movie_to_people[t].append(n)
         all_nconsts.add(n)
 
-    all_tconsts = sorted(list(movie_to_people.keys()))
+    # Filter out movies that got lost in edge filtering (should correspond to valid_tconsts)
+    all_tconsts = sorted([t for t in movie_to_people.keys() if t in valid_tconsts])
     unique_nconsts = sorted(list(all_nconsts))
     
-    logging.info(f"Found {len(all_tconsts)} movies and {len(unique_nconsts)} unique people.")
+    logging.info(f"Found {len(all_tconsts)} valid movies and {len(unique_nconsts)} unique people.")
 
     # 2. Batch Encode Movies
-    # Fetch rows using the AE's generator logic but filtered
-    # For speed in this script, we will assume we can fetch by ID or scan efficiently.
-    # The custom _fetch helpers above are safest.
-    
-    # We use a simplified fetch for movies similar to people to ensure alignment
-    # Since scanning 10M rows for 10k is slow, we use the temp table trick for movies too.
-    
     logging.info("Fetching movie data...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in all_tconsts])
     
-    # Mirroring TitlesAutoencoder query
     sql_mov = """
     SELECT 
         t.tconst,
@@ -203,7 +167,6 @@ def build_set_decoder_cache(cfg: ProjectConfig):
         }
     
     movie_rows = [m_data_map.get(t, {}) for t in all_tconsts]
-    
     mov_ds = _RawEntityDataset(movie_rows, mov_ae.fields)
     mov_dl = DataLoader(mov_ds, batch_size=cfg.batch_size, num_workers=0, collate_fn=_collate_raw)
 
@@ -239,16 +202,18 @@ def build_set_decoder_cache(cfg: ProjectConfig):
 
     nconst_to_idx = {n: i for i, n in enumerate(unique_nconsts)}
 
-    # 4. Build Index Tensor
-    num_slots = int(getattr(cfg, "set_decoder_slots", 10))
-    logging.info(f"Building index tensor (slots={num_slots})...")
+    # 4. Build Index Tensor (Ordered Sequence)
+    # Using 'seq_decoder_len' from config instead of 'set_decoder_slots'
+    seq_len = int(getattr(cfg, "seq_decoder_len", 10))
+    logging.info(f"Building sequence tensor (max_len={seq_len})...")
     
-    indices = torch.full((len(all_tconsts), num_slots), -1, dtype=torch.long)
-    masks = torch.zeros((len(all_tconsts), num_slots), dtype=torch.bool)
+    indices = torch.full((len(all_tconsts), seq_len), -1, dtype=torch.long)
+    masks = torch.zeros((len(all_tconsts), seq_len), dtype=torch.bool)
     
-    for i, tconst in enumerate(tqdm(all_tconsts, desc="Structuring sets")):
+    for i, tconst in enumerate(tqdm(all_tconsts, desc="Building sequences")):
         people = movie_to_people[tconst]
-        take = min(len(people), num_slots)
+        # Important: people list is already sorted by ordering from SQL
+        take = min(len(people), seq_len)
         for k in range(take):
             pidx = nconst_to_idx.get(people[k], -1)
             if pidx != -1:
@@ -265,17 +230,18 @@ def build_set_decoder_cache(cfg: ProjectConfig):
         "tconsts": all_tconsts,
     }
 
-    logging.info(f"Saving set decoder cache to {cache_path}...")
+    logging.info(f"Saving sequence decoder cache to {cache_path}...")
     torch.save(payload, cache_path)
     logging.info("Done.")
     return cache_path
 
 def ensure_set_decoder_cache(cfg: ProjectConfig):
-    cache_path = Path(cfg.data_dir) / "set_decoder_data.pt"
+    # Backward compatible name for function call
+    cache_path = Path(cfg.data_dir) / "seq_decoder_data.pt"
     if cache_path.exists() and not cfg.refresh_cache:
-        logging.info(f"Found existing set decoder cache at {cache_path}")
+        logging.info(f"Found existing sequence cache at {cache_path}")
         return cache_path
-    return build_set_decoder_cache(cfg)
+    return build_sequence_cache(cfg)
 
 if __name__ == "__main__":
     ensure_set_decoder_cache(project_config)

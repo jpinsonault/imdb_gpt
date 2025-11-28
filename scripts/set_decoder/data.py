@@ -4,8 +4,8 @@ import torch
 from torch.utils.data import Dataset
 from typing import List
 
-class CachedSetDataset(Dataset):
-    def __init__(self, cache_path: str, num_slots: int):
+class CachedSequenceDataset(Dataset):
+    def __init__(self, cache_path: str, max_len: int):
         super().__init__()
         data = torch.load(cache_path, map_location="cpu")
         
@@ -16,11 +16,11 @@ class CachedSetDataset(Dataset):
         self.masks = data["masks"]
         self.movies = data.get("tconsts", []) 
         
-        self.num_slots = int(num_slots)
+        self.max_len = int(max_len)
         
-        cached_slots = self.indices.shape[1]
-        if cached_slots < self.num_slots:
-            raise ValueError(f"Cache built with {cached_slots} slots, but config requested {self.num_slots}. Please refresh cache.")
+        cached_len = self.indices.shape[1]
+        if cached_len < self.max_len:
+            raise ValueError(f"Cache built with length {cached_len}, but config requested {self.max_len}. Please refresh cache.")
 
     def __len__(self):
         return self.indices.shape[0]
@@ -29,16 +29,15 @@ class CachedSetDataset(Dataset):
         # 1. Movie Latent
         z_movie = self.movie_latents[idx]
         
-        # 2. Get indices for this movie
-        idxs = self.indices[idx, :self.num_slots]
-        mask = self.masks[idx, :self.num_slots].float()
+        # 2. Get indices for this movie (sequence)
+        idxs = self.indices[idx, :self.max_len]
+        mask = self.masks[idx, :self.max_len].float()
         
-        # 3. Gather Person Latents
-        # Replace -1 with 0 for gathering, then mask out result
+        # 3. Gather Person Latents (Sequence)
         valid_idxs = idxs.clone()
         valid_idxs[idxs == -1] = 0
         
-        Z_gt = self.person_latents[valid_idxs] # (Slots, Latent)
+        Z_gt = self.person_latents[valid_idxs] # (SeqLen, Latent)
         Z_gt = Z_gt * mask.unsqueeze(-1)
         
         # 4. Gather Person Targets
@@ -46,11 +45,7 @@ class CachedSetDataset(Dataset):
         for tgt_tensor in self.person_targets:
             Y_sample = tgt_tensor[valid_idxs]
             
-            # Reshape mask to broadcast: (Slots, 1, 1...)
             view_shape = [-1] + [1] * (Y_sample.dim() - 1)
-            
-            # Multiplying by float mask promotes Y_sample to float. 
-            # We must cast back to original dtype (usually Long for categories/text).
             masked_sample = Y_sample * mask.view(*view_shape)
             
             if tgt_tensor.dtype in (torch.long, torch.int64, torch.int32, torch.int16, torch.uint8):
@@ -61,7 +56,7 @@ class CachedSetDataset(Dataset):
         return z_movie, Z_gt, mask, Y_fields
 
 
-def collate_set_decoder(batch):
+def collate_seq_decoder(batch):
     z_movies, Z_gts, masks, Y_fields_list = zip(*batch)
 
     z_movies = torch.stack(z_movies, dim=0)
