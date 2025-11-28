@@ -45,10 +45,18 @@ class CachedSetDataset(Dataset):
         Y_fields = []
         for tgt_tensor in self.person_targets:
             Y_sample = tgt_tensor[valid_idxs]
+            
             # Reshape mask to broadcast: (Slots, 1, 1...)
             view_shape = [-1] + [1] * (Y_sample.dim() - 1)
-            Y_sample = Y_sample * mask.view(*view_shape)
-            Y_fields.append(Y_sample)
+            
+            # Multiplying by float mask promotes Y_sample to float. 
+            # We must cast back to original dtype (usually Long for categories/text).
+            masked_sample = Y_sample * mask.view(*view_shape)
+            
+            if tgt_tensor.dtype in (torch.long, torch.int64, torch.int32, torch.int16, torch.uint8):
+                masked_sample = masked_sample.long()
+                
+            Y_fields.append(masked_sample)
 
         return z_movie, Z_gt, mask, Y_fields
 

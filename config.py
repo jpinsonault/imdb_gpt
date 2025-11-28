@@ -51,6 +51,9 @@ class ProjectConfig:
     set_decoder_callback_interval: int = 100
     set_decoder_recon_samples: int = 5
     set_decoder_table_width: int = 120
+    set_decoder_hidden_mult: float = 2.0
+    set_decoder_layers: int = 8
+    set_decoder_heads: int = 8
     # Path Siren
     path_siren_people_count: int = 10
     path_siren_lr: float = 0.001

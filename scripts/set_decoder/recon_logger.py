@@ -106,12 +106,11 @@ class SetReconstructionLogger:
 
         with torch.no_grad():
             z_movies_dev = z_movies.to(device)
-            # Run Model
-            # outputs is now a list of tuples [(z, p), (z, p)...]
-            outputs = self.model(z_movies_dev)
             
-            # We visualize the FINAL layer output
-            z_slots_batch, presence_logits_batch = outputs[-1]
+            # Run Model
+            # FIX: Model now returns (z_slots, logits) directly, not a list of layers
+            z_slots_batch, presence_logits_batch = self.model(z_movies_dev)
+            
             probs_batch = torch.sigmoid(presence_logits_batch)
 
             for i in idxs:

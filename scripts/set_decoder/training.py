@@ -21,16 +21,8 @@ def match_batch_hungarian(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs Hungarian matching on a batch of cost matrices on CPU.
-    
-    Args:
-        cost_matrix_batch: (B, N, MaxK) tensor.
-        lengths: (B,) tensor of valid targets per sample.
-        
-    Returns:
-        (batch_idx, row_idx, col_idx) tensors representing matched triplets.
     """
     # Move to CPU / Numpy for Scipy
-    # We detach to ensure no graph logic is carried over (though costs shouldn't have grad here usually)
     C_cpu = cost_matrix_batch.detach().cpu().numpy()
     lengths_cpu = lengths.cpu().numpy()
     
@@ -49,10 +41,12 @@ def match_batch_hungarian(
         cost_sub = C_cpu[i, :, :k]
         
         # Scipy linear_sum_assignment
+        # Replace NaNs to prevent crashes if training is unstable
+        cost_sub = np.nan_to_num(cost_sub, nan=1e9, posinf=1e9, neginf=1e9)
+        
         rows, cols = linear_sum_assignment(cost_sub)
         
         # Accumulate indices
-        # We need to offset batch index
         b_indices.extend([i] * len(rows))
         r_indices.extend(rows)
         c_indices.extend(cols)
@@ -67,22 +61,31 @@ def match_batch_hungarian(
 def _field_loss_broadcast(field, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     """
     Computes loss matrix (B, N, K).
+    Optimized to avoid creating (B, N, K, L, V) tensors which OOM.
     """
     if isinstance(field, TextField):
         B, N, L, V = pred.shape
-        K = tgt.shape[1]
+        K = tgt.shape[1] # tgt is (B, K, L)
+
+        # Reshape for optimized cross entropy
+        # (B, N, 1, L, V) vs (B, 1, K, L)
         
-        pred_exp = pred.unsqueeze(2).expand(-1, -1, K, -1, -1)
-        tgt_exp = tgt.unsqueeze(1).expand(-1, N, -1, -1).long()
-        
-        flat_pred = pred_exp.reshape(B * N * K * L, V)
-        flat_tgt = tgt_exp.reshape(B * N * K * L)
+        # We manually expand only the dims necessary to broadcast into F.cross_entropy
+        pred_exp = pred.unsqueeze(2).expand(-1, -1, K, -1, -1) # (B, N, K, L, V)
+        tgt_exp = tgt.unsqueeze(1).expand(-1, N, -1, -1)       # (B, N, K, L)
         
         pad_id = int(getattr(field, "pad_token_id", 0) or 0)
         
-        loss = F.cross_entropy(flat_pred, flat_tgt, ignore_index=pad_id, reduction="none")
+        loss = F.cross_entropy(
+            pred_exp.reshape(-1, V),
+            tgt_exp.reshape(-1),
+            ignore_index=pad_id,
+            reduction="none"
+        )
+        
         loss = loss.view(B, N, K, L)
         
+        # Mask check
         mask = (tgt_exp != pad_id).float()
         denom = mask.sum(dim=-1).clamp_min(1.0)
         return (loss * mask).sum(dim=-1) / denom
@@ -150,6 +153,10 @@ def compute_cost_and_losses(
     """
     Computes the Dense Cost Matrices for matching AND the Loss tensors.
     
+    Inputs:
+        z_slots: (B, N, D) - Normalized Predicted Latents (Hypersphere)
+        Z_gt:    (B, MaxK, D) - Normalized Ground Truth Latents (Hypersphere)
+    
     Returns:
         C_total: (B, N, MaxK) for matching (detached)
         C_lat:   (B, N, MaxK) latent loss values (with grad)
@@ -167,7 +174,14 @@ def compute_cost_and_losses(
     slot_device = z_slots.device
 
     # 1. Latent Cost (B, N, MaxK)
-    # This is fast and vectorized on GPU/MPS
+    # Sphere Awareness:
+    # Since z_slots and Z_gt are normalized to length 1:
+    # ||A - B||^2 = ||A||^2 + ||B||^2 - 2(A.B)
+    #             = 1 + 1 - 2(CosineSimilarity)
+    #             = 2 - 2(CosineSimilarity)
+    # Therefore, minimizing Squared Euclidean Distance IS maximizing Cosine Similarity.
+    # We use Squared Euclidean here as it's numerically friendly.
+    
     diff_lat = z_slots.unsqueeze(2) - Z_gt.unsqueeze(1)
     C_lat_batch = diff_lat.pow(2).sum(dim=-1) 
 

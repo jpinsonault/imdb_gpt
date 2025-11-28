@@ -110,13 +110,13 @@ def build_set_decoder_trainer(cfg: ProjectConfig, db_path: str):
 
     latent_dim = int(getattr(mov_ae, "latent_dim", cfg.latent_dim))
     
-    # FiLM + Deep Supervision Model
+    # FiLM + Single Final Decoding (No Deep Supervision)
     model = SetDecoder(
         latent_dim=latent_dim,
         num_slots=num_slots,
-        hidden_mult=float(getattr(cfg, "set_decoder_hidden_mult", 2.0)),
-        num_layers=int(getattr(cfg, "set_decoder_layers", 4)),
-        num_heads=int(getattr(cfg, "set_decoder_heads", 4)),
+        hidden_mult=float(cfg.set_decoder_hidden_mult),
+        num_layers=int(cfg.set_decoder_layers),
+        num_heads=int(cfg.set_decoder_heads),
     ).to(device)
 
     opt = torch.optim.AdamW(
@@ -201,85 +201,76 @@ def main():
             model.train()
             opt.zero_grad()
             
-            # Outputs is a list of tuples [(z, p), (z, p)...] for each layer
-            layer_outputs = model(z_movies)
+            # 1. Forward Pass (Final Layer Only)
+            z_slots, presence_logits = model(z_movies)
             
-            total_loss = torch.tensor(0.0, device=device)
+            # 2. Compute Costs & Losses
+            C_match, C_lat_full, C_rec_full, lengths = compute_cost_and_losses(
+                per_ae, z_slots, Z_gt, Y_gt_fields, mask, w_latent, w_recon
+            )
+
+            # 3. Hungarian Matching
+            b_idx, r_idx, c_idx = match_batch_hungarian(C_match, lengths)
             
-            # Metrics to log (will grab from final layer)
-            log_metrics = {}
+            # 4. Calculate Final Loss
+            matched_count = b_idx.numel()
+            denom = max(1, matched_count)
+            
+            loss_latent = torch.zeros((), device=device)
+            loss_recon = torch.zeros((), device=device)
+            
+            if matched_count > 0:
+                loss_latent = C_lat_full[b_idx, r_idx, c_idx].sum() / denom
+                loss_recon = C_rec_full[b_idx, r_idx, c_idx].sum() / denom
 
-            # Iterate through all layers (Deep Supervision)
-            for i, (z_slots, presence_logits) in enumerate(layer_outputs):
-                
-                # 1. Compute Costs & Losses for THIS layer
-                C_match, C_lat_full, C_rec_full, lengths = compute_cost_and_losses(
-                    per_ae, z_slots, Z_gt, Y_gt_fields, mask, w_latent, w_recon
-                )
+            # Presence
+            target_pres = torch.zeros_like(presence_logits)
+            if matched_count > 0:
+                target_pres[b_idx, r_idx] = 1.0
+            
+            loss_presence = torch.nn.functional.binary_cross_entropy_with_logits(presence_logits, target_pres)
 
-                # 2. Match for THIS layer (Independent matching per layer guides flow)
-                b_idx, r_idx, c_idx = match_batch_hungarian(C_match, lengths)
-                
-                # 3. Calculate layer loss
-                matched_count = b_idx.numel()
-                denom = max(1, matched_count)
-                
-                loss_latent_l = torch.zeros((), device=device)
-                loss_recon_l = torch.zeros((), device=device)
-                
-                if matched_count > 0:
-                    loss_latent_l = C_lat_full[b_idx, r_idx, c_idx].sum() / denom
-                    loss_recon_l = C_rec_full[b_idx, r_idx, c_idx].sum() / denom
+            # Null (Force unmatched slots to zero/noise? Or just ignore?)
+            # Usually in SET prediction, we want unmatched slots to output "Nothing".
+            # The Latent/Recon loss above only trains matched slots.
+            # We can regularize unmatched slots to be near zero or just rely on Presence head.
+            # Let's keep the explicit Null regularization for stability.
+            mask_unmatched = torch.ones((z_slots.shape[0], z_slots.shape[1]), dtype=torch.bool, device=device)
+            if matched_count > 0:
+                mask_unmatched[b_idx, r_idx] = False
+            
+            # Since vectors are normalized to length 1, minimizing them to 0 is impossible.
+            # Instead, we rely entirely on the Presence Head to kill these slots.
+            # We remove the L2 penalty on latent magnitude because F.normalize fixed it to 1.
+            loss_null = torch.tensor(0.0, device=device)
 
-                # Presence
-                target_pres = torch.zeros_like(presence_logits)
-                if matched_count > 0:
-                    target_pres[b_idx, r_idx] = 1.0
-                
-                loss_presence_l = torch.nn.functional.binary_cross_entropy_with_logits(presence_logits, target_pres)
-
-                # Null
-                mask_unmatched = torch.ones((z_slots.shape[0], z_slots.shape[1]), dtype=torch.bool, device=device)
-                if matched_count > 0:
-                    mask_unmatched[b_idx, r_idx] = False
-                loss_null_l = z_slots[mask_unmatched].pow(2).mean()
-                if torch.isnan(loss_null_l): loss_null_l = torch.tensor(0.0, device=device)
-
-                layer_loss = (
-                    w_latent * loss_latent_l +
-                    w_recon * loss_recon_l +
-                    w_presence * loss_presence_l +
-                    w_null * loss_null_l
-                )
-                
-                total_loss = total_loss + layer_loss
-
-                # If this is the final layer, capture metrics for logging
-                if i == len(layer_outputs) - 1:
-                    total_targets = lengths.sum().item()
-                    total_preds = (torch.sigmoid(presence_logits) > 0.5).float().sum().item()
-                    
-                    log_metrics['loss_total'] = layer_loss.item() # Log final layer's contribution for clarity
-                    log_metrics['loss_latent'] = loss_latent_l.item()
-                    log_metrics['loss_recon'] = loss_recon_l.item()
-                    log_metrics['loss_presence'] = loss_presence_l.item()
-                    log_metrics['loss_null'] = loss_null_l.item()
-                    
-                    log_metrics['recall'] = matched_count / max(1, total_targets)
-                    log_metrics['precision'] = matched_count / max(1, total_preds)
-                    log_metrics['card_error'] = abs(total_preds - total_targets) / z_movies.shape[0]
-                    
-                    # Top-1 Loss Check
-                    with torch.no_grad():
-                        top1_slots = presence_logits.argmax(dim=1)
-                        is_top1 = (r_idx == top1_slots[b_idx])
-                        top1_loss = 0.0
-                        if is_top1.any():
-                            top1_loss = C_rec_full[b_idx[is_top1], r_idx[is_top1], c_idx[is_top1]].mean().item()
-                        log_metrics['loss_recon_top1'] = top1_loss
-
-            # Average loss over layers to keep magnitude consistent
-            total_loss = total_loss / len(layer_outputs)
+            total_loss = (
+                w_latent * loss_latent +
+                w_recon * loss_recon +
+                w_presence * loss_presence
+            )
+            
+            # Metrics
+            total_targets = lengths.sum().item()
+            total_preds = (torch.sigmoid(presence_logits) > 0.5).float().sum().item()
+            
+            log_metrics = {
+                'loss_latent': loss_latent.item(),
+                'loss_recon': loss_recon.item(),
+                'loss_presence': loss_presence.item(),
+                'recall': matched_count / max(1, total_targets),
+                'precision': matched_count / max(1, total_preds),
+                'card_error': abs(total_preds - total_targets) / z_movies.shape[0]
+            }
+            
+            # Top-1 Loss Check
+            with torch.no_grad():
+                top1_slots = presence_logits.argmax(dim=1)
+                is_top1 = (r_idx == top1_slots[b_idx])
+                top1_loss = 0.0
+                if is_top1.any():
+                    top1_loss = C_rec_full[b_idx[is_top1], r_idx[is_top1], c_idx[is_top1]].mean().item()
+                log_metrics['loss_recon_top1'] = top1_loss
 
             total_loss.backward()
             opt.step()
@@ -292,7 +283,6 @@ def main():
                 run_logger.add_scalar("loss/latent", log_metrics['loss_latent'], global_step)
                 run_logger.add_scalar("loss/recon", log_metrics['loss_recon'], global_step)
                 run_logger.add_scalar("loss/presence", log_metrics['loss_presence'], global_step)
-                run_logger.add_scalar("loss/null", log_metrics['loss_null'], global_step)
                 run_logger.add_scalar("loss/recon_top1", log_metrics['loss_recon_top1'], global_step)
                 
                 run_logger.add_scalar("metric/recall", log_metrics['recall'], global_step)

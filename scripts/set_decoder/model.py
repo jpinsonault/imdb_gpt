@@ -65,19 +65,57 @@ class FiLMTransformerBlock(nn.Module):
         return x
 
 
+class SlotGenerator(nn.Module):
+    """
+    Generates initial slot embeddings directly from the movie latent.
+    """
+    def __init__(self, movie_dim: int, num_slots: int, slot_dim: int):
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        
+        # Expand movie latent into enough bits to form N slots
+        hidden = max(movie_dim, slot_dim * 4)
+        self.net = nn.Sequential(
+            nn.Linear(movie_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_slots * slot_dim)
+        )
+        
+        # Initialize output to be small so slots start roughly uniform but conditioned
+        with torch.no_grad():
+            self.net[-1].weight.mul_(0.1)
+
+    def forward(self, z_movie: torch.Tensor) -> torch.Tensor:
+        B = z_movie.size(0)
+        flat = self.net(z_movie)
+        slots = flat.view(B, self.num_slots, self.slot_dim)
+        # Sphere Awareness: Normalize initialization
+        return F.normalize(slots, p=2, dim=-1)
+
+
 class SetDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int,
         num_slots: int,
-        hidden_mult: float = 2.0,
-        num_layers: int = 4,
-        num_heads: int = 4,
+        hidden_mult: float,
+        num_layers: int,
+        num_heads: int,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.num_slots = int(num_slots)
         
+        # --- Dynamic Slot Generation ---
+        self.slot_generator = SlotGenerator(
+            movie_dim=self.latent_dim,
+            num_slots=self.num_slots,
+            slot_dim=self.latent_dim
+        )
+
         # --- The FiLM Transformer Backbone ---
         self.blocks = nn.ModuleList([
             FiLMTransformerBlock(
@@ -89,7 +127,7 @@ class SetDecoder(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # We use the same final norm logic for intermediate auxiliary outputs
+        # Output Norm
         self.final_norm = AdaLN(self.latent_dim, self.latent_dim)
 
         # --- Shared Output Heads ---
@@ -109,32 +147,26 @@ class SetDecoder(nn.Module):
         Args:
             z_movie: (B, LatentDim)
         Returns:
-            List of tuples [(z_slots, presence_logits), ...] per layer.
+            z_slots: (B, NumSlots, LatentDim) - Normalized
+            presence_logits: (B, NumSlots)
         """
-        B = z_movie.size(0)
-        device = z_movie.device
+        # 1. Generate Initial Slots from Movie Context
+        x = self.slot_generator(z_movie)
         
-        # 1. Initialize Slots with Pure Gaussian Noise
-        # No positional embeddings. The model must rely on the noise values + FiLM context.
-        x = torch.randn(B, self.num_slots, self.latent_dim, device=device)
-        
-        outputs = []
-        
-        # 2. Iterative Refinement (Deep Supervision)
+        # 2. Run Backbone (No intermediate outputs)
         for block in self.blocks:
             x = block(x, z_movie)
             
-            # Auxiliary Output:
-            # Apply norm to the current state to prep for heads
-            x_aux = self.final_norm(x, z_movie)
+        # 3. Final Heads
+        x_aux = self.final_norm(x, z_movie)
+        
+        z_raw = self.latent_head(x_aux)
+        # Sphere Awareness: Normalize output latents
+        z_slots = F.normalize(z_raw, p=2, dim=-1)
+        
+        pres_logits = self.presence_head(x_aux).squeeze(-1)
             
-            # Apply heads
-            z_slots_i = self.latent_head(x_aux)
-            pres_logits_i = self.presence_head(x_aux).squeeze(-1)
-            
-            outputs.append((z_slots_i, pres_logits_i))
-            
-        return outputs
+        return z_slots, pres_logits
 
     @torch.no_grad()
     def predict(
@@ -143,9 +175,7 @@ class SetDecoder(nn.Module):
         threshold: float = 0.5,
         top_k: int | None = None,
     ):
-        # Run forward pass, grab the FINAL layer output
-        outputs = self.forward(z_movie)
-        z_slots, presence_logits = outputs[-1]
+        z_slots, presence_logits = self.forward(z_movie)
         
         probs = torch.sigmoid(presence_logits)
 
