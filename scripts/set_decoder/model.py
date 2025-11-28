@@ -65,37 +65,6 @@ class FiLMTransformerBlock(nn.Module):
         return x
 
 
-class SlotGenerator(nn.Module):
-    """
-    Generates initial slot embeddings directly from the movie latent.
-    """
-    def __init__(self, movie_dim: int, num_slots: int, slot_dim: int):
-        super().__init__()
-        self.num_slots = num_slots
-        self.slot_dim = slot_dim
-        
-        # Expand movie latent into enough bits to form N slots
-        hidden = max(movie_dim, slot_dim * 4)
-        self.net = nn.Sequential(
-            nn.Linear(movie_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, num_slots * slot_dim)
-        )
-        
-        # Initialize output to be small so slots start roughly uniform but conditioned
-        with torch.no_grad():
-            self.net[-1].weight.mul_(0.1)
-
-    def forward(self, z_movie: torch.Tensor) -> torch.Tensor:
-        B = z_movie.size(0)
-        flat = self.net(z_movie)
-        slots = flat.view(B, self.num_slots, self.slot_dim)
-        # Sphere Awareness: Normalize initialization
-        return F.normalize(slots, p=2, dim=-1)
-
-
 class SetDecoder(nn.Module):
     def __init__(
         self,
@@ -109,12 +78,10 @@ class SetDecoder(nn.Module):
         self.latent_dim = int(latent_dim)
         self.num_slots = int(num_slots)
         
-        # --- Dynamic Slot Generation ---
-        self.slot_generator = SlotGenerator(
-            movie_dim=self.latent_dim,
-            num_slots=self.num_slots,
-            slot_dim=self.latent_dim
-        )
+        # --- Learnable Slot Queries (DETR Style) ---
+        # Instead of projecting from z_movie, we start with fixed learnable parameters.
+        # These represent "Slot 1", "Slot 2", etc., which will be modulated by the movie context.
+        self.slot_queries = nn.Parameter(torch.randn(1, self.num_slots, self.latent_dim))
 
         # --- The FiLM Transformer Backbone ---
         self.blocks = nn.ModuleList([
@@ -134,6 +101,10 @@ class SetDecoder(nn.Module):
         self.latent_head = nn.Linear(self.latent_dim, self.latent_dim)
         self.presence_head = nn.Linear(self.latent_dim, 1)
 
+        # --- Learned Null Embedding ---
+        # A learnable anchor point for "empty" slots. 
+        self.null_embedding = nn.Parameter(torch.randn(1, 1, self.latent_dim))
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -150,10 +121,14 @@ class SetDecoder(nn.Module):
             z_slots: (B, NumSlots, LatentDim) - Normalized
             presence_logits: (B, NumSlots)
         """
-        # 1. Generate Initial Slots from Movie Context
-        x = self.slot_generator(z_movie)
+        batch_size = z_movie.size(0)
+
+        # 1. Expand Learnable Queries to Batch Size
+        # (1, N, D) -> (B, N, D)
+        x = self.slot_queries.expand(batch_size, -1, -1)
         
-        # 2. Run Backbone (No intermediate outputs)
+        # 2. Run Backbone with FiLM Conditioning
+        # The z_movie modulates the normalization of the slots at every layer
         for block in self.blocks:
             x = block(x, z_movie)
             

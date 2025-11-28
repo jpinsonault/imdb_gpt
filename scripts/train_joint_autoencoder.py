@@ -26,7 +26,7 @@ from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleA
 from scripts.autoencoder.joint_edge_sampler import EdgeTensorCacheDataset
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.autoencoder.run_logger import build_run_logger
-from scripts.autoencoder.training_callbacks.training_callbacks import JointReconstructionLogger
+from scripts.autoencoder.joint_autoencoder.training_callbacks import JointReconstructionLogger
 from scripts.autoencoder.fields import (
     TextField,
     MultiCategoryField,
