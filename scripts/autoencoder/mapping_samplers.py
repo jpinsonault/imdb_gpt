@@ -3,11 +3,19 @@ from __future__ import annotations
 import sqlite3
 from typing import List, Tuple, Dict, Optional
 import numpy as np
-from scripts.sql_filters import movie_where_clause, people_having, people_where_clause
 import torch
 from torch.utils.data import IterableDataset
 
 from .fields import BaseField
+from scripts.sql_filters import (
+    movie_where_clause, 
+    people_where_clause, 
+    people_having,
+    movie_select_clause,
+    people_select_clause,
+    map_movie_row,
+    map_person_row
+)
 
 
 class LossLedger:
@@ -101,16 +109,22 @@ class MoviePeoplePairSampler:
         self.cur_movie = None
         self.cur_person = None
 
-        self.movie_sql = """
-        SELECT primaryTitle,startYear,endYear,runtimeMinutes,
-               averageRating,numVotes,
-               (SELECT GROUP_CONCAT(genre,',') FROM title_genres WHERE tconst = ?)
-        FROM titles WHERE tconst = ? LIMIT 1
+        self.movie_sql = f"""
+        SELECT {movie_select_clause(alias='t', genre_alias='g')}
+        FROM titles t
+        LEFT JOIN title_genres g ON g.tconst = t.tconst
+        WHERE t.tconst = ? 
+        GROUP BY t.tconst
+        LIMIT 1
         """
-        self.person_sql = """
-        SELECT primaryName,birthYear,deathYear,
-               (SELECT GROUP_CONCAT(profession,',') FROM people_professions WHERE nconst = ?)
-        FROM people WHERE nconst = ? LIMIT 1
+        
+        self.person_sql = f"""
+        SELECT {people_select_clause(alias='p', prof_alias='pp')}
+        FROM people p
+        LEFT JOIN people_professions pp ON pp.nconst = p.nconst
+        WHERE p.nconst = ? 
+        GROUP BY p.nconst
+        LIMIT 1
         """
 
         self.weights = np.ones(len(self.keys), dtype=np.float32)
@@ -169,30 +183,16 @@ class MoviePeoplePairSampler:
     def _movie_row(self, tconst: str) -> Dict:
         if tconst in self.mov_cache_row:
             return self.mov_cache_row[tconst]
-        r = self.cur_movie.execute(self.movie_sql, (tconst, tconst)).fetchone()
-        row = {
-            "tconst": tconst,
-            "primaryTitle": r[0],
-            "startYear": r[1],
-            "endYear": r[2],
-            "runtimeMinutes": r[3],
-            "averageRating": r[4],
-            "numVotes": r[5],
-            "genres": r[6].split(",") if r[6] else [],
-        }
+        r = self.cur_movie.execute(self.movie_sql, (tconst,)).fetchone()
+        row = map_movie_row(r)
         self.mov_cache_row[tconst] = row
         return row
 
     def _person_row(self, nconst: str) -> Dict:
         if nconst in self.per_cache_row:
             return self.per_cache_row[nconst]
-        r = self.cur_person.execute(self.person_sql, (nconst, nconst)).fetchone()
-        row = {
-            "primaryName": r[0],
-            "birthYear": r[1],
-            "deathYear": r[2],
-            "professions": r[3].split(",") if r[3] else None,
-        }
+        r = self.cur_person.execute(self.person_sql, (nconst,)).fetchone()
+        row = map_person_row(r)
         self.per_cache_row[nconst] = row
         return row
 

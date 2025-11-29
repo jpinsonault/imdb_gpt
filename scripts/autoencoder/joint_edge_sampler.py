@@ -7,6 +7,12 @@ import torch
 from torch.utils.data import Dataset
 
 from .mapping_samplers import AliasSampler
+from scripts.sql_filters import (
+    movie_select_clause, 
+    people_select_clause, 
+    map_movie_row, 
+    map_person_row
+)
 
 
 class WeightedEdgeSampler:
@@ -40,16 +46,24 @@ class WeightedEdgeSampler:
         self.movie_cur = None
         self.person_cur = None
 
-        self.movie_sql = """
-        SELECT primaryTitle,startYear,endYear,runtimeMinutes,
-               averageRating,numVotes,
-               (SELECT GROUP_CONCAT(genre,',') FROM title_genres WHERE tconst = ?)
-        FROM titles WHERE tconst = ? LIMIT 1
+        # Use centralized SQL generation
+        # Note: We query by tconst/nconst, and specific joins are handled below
+        self.movie_sql = f"""
+        SELECT {movie_select_clause(alias='t', genre_alias='genre_tbl')}
+        FROM titles t
+        LEFT JOIN title_genres genre_tbl ON genre_tbl.tconst = t.tconst
+        WHERE t.tconst = ? 
+        GROUP BY t.tconst
+        LIMIT 1
         """
-        self.person_sql = """
-        SELECT primaryName,birthYear,deathYear,
-               (SELECT GROUP_CONCAT(profession,',') FROM people_professions WHERE nconst = ?)
-        FROM people WHERE nconst = ? LIMIT 1
+        
+        self.person_sql = f"""
+        SELECT {people_select_clause(alias='p', prof_alias='prof_tbl')}
+        FROM people p
+        LEFT JOIN people_professions prof_tbl ON prof_tbl.nconst = p.nconst
+        WHERE p.nconst = ? 
+        GROUP BY p.nconst
+        LIMIT 1
         """
 
         self.weights = np.ones(len(self.edges), dtype=np.float32)
@@ -101,30 +115,16 @@ class WeightedEdgeSampler:
     def _movie_row(self, tconst: str):
         if tconst in self.mov_cache:
             return self.mov_cache[tconst]
-        r = self.movie_cur.execute(self.movie_sql, (tconst, tconst)).fetchone()
-        row = {
-            "tconst": tconst,
-            "primaryTitle": r[0],
-            "startYear": r[1],
-            "endYear": r[2],
-            "runtimeMinutes": r[3],
-            "averageRating": r[4],
-            "numVotes": r[5],
-            "genres": r[6].split(",") if r[6] else [],
-        }
+        r = self.movie_cur.execute(self.movie_sql, (tconst,)).fetchone()
+        row = map_movie_row(r)
         self.mov_cache[tconst] = row
         return row
 
     def _person_row(self, nconst: str):
         if nconst in self.per_cache:
             return self.per_cache[nconst]
-        r = self.person_cur.execute(self.person_sql, (nconst, nconst)).fetchone()
-        row = {
-            "primaryName": r[0],
-            "birthYear": r[1],
-            "deathYear": r[2],
-            "professions": r[3].split(",") if r[3] else None,
-        }
+        r = self.person_cur.execute(self.person_sql, (nconst,)).fetchone()
+        row = map_person_row(r)
         self.per_cache[nconst] = row
         return row
 

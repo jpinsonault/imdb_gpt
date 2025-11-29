@@ -8,6 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 from config import ProjectConfig
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder
+from scripts.sql_filters import movie_select_clause, map_movie_row
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -60,18 +61,10 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in sorted_tconsts])
     
-    # Updated SQL to include principalCount
-    sql = """
+    # Use centralized SQL clause
+    sql = f"""
     SELECT 
-        t.tconst,
-        t.primaryTitle,
-        t.startYear,
-        t.endYear,
-        t.runtimeMinutes,
-        t.averageRating,
-        t.numVotes,
-        GROUP_CONCAT(g.genre, ','),
-        (SELECT COUNT(*) FROM principals pr WHERE pr.tconst = t.tconst)
+        {movie_select_clause(alias='t', genre_alias='g')}
     FROM titles t
     JOIN target_movies tm ON tm.tconst = t.tconst
     JOIN title_genres g ON g.tconst = t.tconst
@@ -92,24 +85,10 @@ def build_hybrid_cache(cfg: ProjectConfig):
     
     logging.info("Transforming movie rows...")
     
-    # Helper to map sql row to dict
-    def row_to_dict(r):
-        return {
-            "tconst": r[0],
-            "primaryTitle": r[1],
-            "startYear": r[2],
-            "endYear": r[3],
-            "runtimeMinutes": r[4],
-            "averageRating": r[5],
-            "numVotes": r[6],
-            "genres": r[7].split(",") if r[7] else [],
-            "principalCount": r[8]
-        }
-
     valid_count = 0
     
     for r in tqdm(cur, total=len(sorted_tconsts), desc="Processing movies"):
-        row_dict = row_to_dict(r)
+        row_dict = map_movie_row(r)
         tconst = row_dict["tconst"]
         
         # Transform fields
