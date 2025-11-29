@@ -50,14 +50,9 @@ def _freeze_autoencoder(ae, device: torch.device):
         p.requires_grad_(False)
 
 
-def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
+def _load_base_autoencoders(cfg: ProjectConfig | None = None, freeze: bool = True):
     """
-    Load joint-trained encoders/decoders for use by PathSiren.
-
-    Assumptions:
-      - JointMoviePersonAE_final.pt was produced by scripts.train_joint_autoencoder
-        using the same ProjectConfig
-      - We do NOT trust any standalone per-table autoencoder checkpoints or caches.
+    Shared logic to load AEs from disk.
     """
     if cfg is None:
         cfg = project_config
@@ -67,7 +62,7 @@ def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
     ckpt_path = Path(cfg.model_dir) / "JointMoviePersonAE_final.pt"
     if not ckpt_path.exists():
         raise AutoencoderLoadError(
-            f"[path-siren] joint checkpoint not found at {ckpt_path}. "
+            f"[loader] joint checkpoint not found at {ckpt_path}. "
             f"Run scripts.train_joint_autoencoder first."
         )
 
@@ -76,7 +71,7 @@ def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
         mov_ae, per_ae = _build_joint_style_autoencoders(cfg)
     except Exception as exc:
         raise AutoencoderLoadError(
-            f"[path-siren] failed to rebuild joint-style autoencoders: {exc}"
+            f"[loader] failed to rebuild joint-style autoencoders: {exc}"
         ) from exc
 
     # Wrap in JointAutoencoder skeleton and load weights
@@ -86,18 +81,32 @@ def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
         joint.load_state_dict(state, strict=True)
     except Exception as exc:
         raise AutoencoderLoadError(
-            f"[path-siren] failed to load joint weights from {ckpt_path}: {exc}"
+            f"[loader] failed to load joint weights from {ckpt_path}: {exc}"
         ) from exc
-
-    # After this, mov_ae.encoder / per_ae.encoder are TypedEncoders that
-    # output post-FiLM latents; decoders match; everything is consistent.
-    _freeze_autoencoder(mov_ae, device)
-    _freeze_autoencoder(per_ae, device)
-
-    logging.info(
-        "[path-siren] loaded frozen joint autoencoders from %s on %s",
-        ckpt_path,
-        device,
-    )
+    
+    # Unwrap is implicit because mov_ae.encoder is now the TypedEncoder from the joint model
+    
+    if freeze:
+        _freeze_autoencoder(mov_ae, device)
+        _freeze_autoencoder(per_ae, device)
+        logging.info("[loader] loaded frozen joint autoencoders")
+    else:
+        # Move wrappers explicitly to device. 
+        # Do NOT use .model.to(device) here, as .model references the unwrapped encoder.
+        mov_ae.encoder.to(device).train()
+        mov_ae.decoder.to(device).train()
+        
+        per_ae.encoder.to(device).train()
+        per_ae.decoder.to(device).train()
+        
+        logging.info("[loader] loaded TRAINABLE joint autoencoders (fine-tuning mode)")
 
     return mov_ae, per_ae
+
+
+def _load_frozen_autoencoders(cfg: ProjectConfig | None = None):
+    return _load_base_autoencoders(cfg, freeze=True)
+
+
+def _load_trainable_autoencoders(cfg: ProjectConfig | None = None):
+    return _load_base_autoencoders(cfg, freeze=False)

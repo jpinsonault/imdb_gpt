@@ -1,3 +1,5 @@
+# config.py
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,7 +57,7 @@ class ProjectConfig:
     seq_decoder_table_width: int = 120
     
     # Model Architecture
-    seq_decoder_len: int = 10  # Max sequence length (formerly slots)
+    seq_decoder_len: int = 10 
     seq_decoder_hidden_dim: int = 256
     seq_decoder_layers: int = 6
     seq_decoder_heads: int = 8
@@ -69,6 +71,23 @@ class ProjectConfig:
     seq_decoder_w_latent: float = 1.0
     seq_decoder_w_recon: float = 1.0
     seq_decoder_w_presence: float = 1.0
+
+    # --- Hybrid Set Model Settings (New) ---
+    hybrid_set_epochs: int = 100
+    hybrid_set_lr: float = 1e-3
+    hybrid_set_weight_decay: float = 0.0 
+    
+    # The Model
+    hybrid_set_latent_dim: int = 128      # Output of Transformer Aggregator
+    hybrid_set_hidden_dim: int = 1024     # Width of ResNet Trunk
+    hybrid_set_depth: int = 12            # Depth of ResNet Trunk
+    hybrid_set_output_rank: int = 64      # Low-Rank bottleneck for people
+    hybrid_set_dropout: float = 0.0
+    
+    hybrid_set_w_bce: float = 1.0
+    hybrid_set_w_count: float = 0.05
+    hybrid_set_save_interval: int = 500
+    hybrid_set_recon_interval: int = 200
 
     # Path Siren (legacy/future)
     path_siren_people_count: int = 10

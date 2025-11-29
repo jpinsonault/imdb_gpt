@@ -1,4 +1,4 @@
-# scripts/precompute_set_cache.py
+# scripts/autoencoder/precompute_set_cache.py
 
 import logging
 import sqlite3
@@ -78,35 +78,23 @@ def build_sequence_cache(cfg: ProjectConfig):
     db_path = Path(cfg.data_dir) / "imdb.db"
     cache_path = Path(cfg.data_dir) / "seq_decoder_data.pt"
     
-    logging.info("Loading frozen autoencoders...")
+    logging.info("Loading autoencoders (for field defs only)...")
     mov_ae, per_ae = _load_frozen_autoencoders(cfg)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mov_ae.encoder.to(device).eval()
-    per_ae.encoder.to(device).eval()
-
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     # 1. Identify valid Movies and their ordered People
     logging.info("Querying ordered principals...")
-    
-    # We join titles and edges to ensure we only get valid filtered data,
-    # but strictly order by 'ordering' column in principals
     limit_clause = ""
     limit = getattr(cfg, "movie_limit", None)
     if limit and limit < 100000000000:
         limit_clause = f"LIMIT {limit}"
 
-    # Get movies first
     cur.execute(f"SELECT tconst FROM edges GROUP BY tconst {limit_clause}")
     valid_tconsts = {r[0] for r in cur.fetchall()}
 
     logging.info(f"Fetching ordered cast for {len(valid_tconsts)} movies...")
-    
-    # Batch query for principals to ensure order
-    # This is a bit heavy, so we might want to iterate if dataset is huge.
-    # For <1M movies, pulling to memory is okay.
     
     cur.execute(f"""
         SELECT pr.tconst, pr.nconst 
@@ -125,13 +113,12 @@ def build_sequence_cache(cfg: ProjectConfig):
         movie_to_people[t].append(n)
         all_nconsts.add(n)
 
-    # Filter out movies that got lost in edge filtering (should correspond to valid_tconsts)
     all_tconsts = sorted([t for t in movie_to_people.keys() if t in valid_tconsts])
     unique_nconsts = sorted(list(all_nconsts))
     
     logging.info(f"Found {len(all_tconsts)} valid movies and {len(unique_nconsts)} unique people.")
 
-    # 2. Batch Encode Movies
+    # 2. Batch Process Movies (Store Raw Inputs)
     logging.info("Fetching movie data...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in all_tconsts])
@@ -170,40 +157,37 @@ def build_sequence_cache(cfg: ProjectConfig):
     mov_ds = _RawEntityDataset(movie_rows, mov_ae.fields)
     mov_dl = DataLoader(mov_ds, batch_size=cfg.batch_size, num_workers=0, collate_fn=_collate_raw)
 
-    mov_latents = []
-    with torch.no_grad():
-        for inputs, _ in tqdm(mov_dl, desc="Encoding movies"):
-            inputs = [x.to(device) for x in inputs]
-            z = mov_ae.encoder(inputs) 
-            mov_latents.append(z.cpu())
-
-    mov_latents = torch.cat(mov_latents, dim=0)
+    mov_inputs_acc = [[] for _ in mov_ae.fields]
     
-    # 3. Batch Encode People
+    # We store the *inputs* to the encoder, not the latents
+    for inputs, _ in tqdm(mov_dl, desc="Processing movie inputs"):
+        for i, tensor in enumerate(inputs):
+            mov_inputs_acc[i].append(tensor.cpu())
+
+    mov_inputs = [torch.cat(acc, dim=0) for acc in mov_inputs_acc]
+
+    # 3. Batch Process People (Store Raw Inputs & Targets)
     logging.info("Fetching people data...")
     person_rows = _fetch_person_rows(db_path, unique_nconsts, per_ae)
     
     per_ds = _RawEntityDataset(person_rows, per_ae.fields)
     per_dl = DataLoader(per_ds, batch_size=cfg.batch_size, num_workers=0, collate_fn=_collate_raw)
 
-    per_latents = []
+    per_inputs_acc = [[] for _ in per_ae.fields]
     per_targets_acc = [[] for _ in per_ae.fields]
 
-    with torch.no_grad():
-        for inputs, targets in tqdm(per_dl, desc="Encoding people"):
-            inputs = [x.to(device) for x in inputs]
-            z = per_ae.encoder(inputs)
-            per_latents.append(z.cpu())
-            for i, tgt in enumerate(targets):
-                per_targets_acc[i].append(tgt.cpu())
+    for inputs, targets in tqdm(per_dl, desc="Processing people inputs"):
+        for i, tensor in enumerate(inputs):
+            per_inputs_acc[i].append(tensor.cpu())
+        for i, tensor in enumerate(targets):
+            per_targets_acc[i].append(tensor.cpu())
 
-    per_latents = torch.cat(per_latents, dim=0)
+    per_inputs = [torch.cat(acc, dim=0) for acc in per_inputs_acc]
     per_targets = [torch.cat(acc, dim=0) for acc in per_targets_acc]
 
     nconst_to_idx = {n: i for i, n in enumerate(unique_nconsts)}
 
-    # 4. Build Index Tensor (Ordered Sequence)
-    # Using 'seq_decoder_len' from config instead of 'set_decoder_slots'
+    # 4. Build Index Tensor
     seq_len = int(getattr(cfg, "seq_decoder_len", 10))
     logging.info(f"Building sequence tensor (max_len={seq_len})...")
     
@@ -212,7 +196,6 @@ def build_sequence_cache(cfg: ProjectConfig):
     
     for i, tconst in enumerate(tqdm(all_tconsts, desc="Building sequences")):
         people = movie_to_people[tconst]
-        # Important: people list is already sorted by ordering from SQL
         take = min(len(people), seq_len)
         for k in range(take):
             pidx = nconst_to_idx.get(people[k], -1)
@@ -222,21 +205,21 @@ def build_sequence_cache(cfg: ProjectConfig):
 
     # 5. Save
     payload = {
-        "movie_latents": mov_latents,
-        "person_latents": per_latents,
+        # Store lists of tensors (fields)
+        "movie_inputs": mov_inputs,
+        "person_inputs": per_inputs,
         "person_targets": per_targets,
         "indices": indices,
         "masks": masks,
         "tconsts": all_tconsts,
     }
 
-    logging.info(f"Saving sequence decoder cache to {cache_path}...")
+    logging.info(f"Saving sequence input cache to {cache_path}...")
     torch.save(payload, cache_path)
     logging.info("Done.")
     return cache_path
 
 def ensure_set_decoder_cache(cfg: ProjectConfig):
-    # Backward compatible name for function call
     cache_path = Path(cfg.data_dir) / "seq_decoder_data.pt"
     if cache_path.exists() and not cfg.refresh_cache:
         logging.info(f"Found existing sequence cache at {cache_path}")

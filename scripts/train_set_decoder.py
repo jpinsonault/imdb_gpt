@@ -12,10 +12,11 @@ from pathlib import Path
 from dataclasses import asdict
 
 import torch
+import torch.nn as nn
 from tqdm import tqdm
 
 from config import project_config, ensure_dirs, ProjectConfig
-from scripts.autoencoder.ae_loader import _load_frozen_autoencoders
+from scripts.autoencoder.ae_loader import _load_trainable_autoencoders, _load_frozen_autoencoders
 from scripts.autoencoder.run_logger import RunLogger
 from scripts.set_decoder.model import SequenceDecoder
 from scripts.set_decoder.recon_logger import SetReconstructionLogger
@@ -24,6 +25,40 @@ from scripts.set_decoder.data import CachedSequenceDataset, collate_seq_decoder
 from scripts.set_decoder.training import compute_sequence_losses
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class EndToEndSetModel(nn.Module):
+    def __init__(self, mov_ae, per_ae, seq_dec):
+        super().__init__()
+        self.mov_ae = mov_ae
+        self.per_ae = per_ae
+        self.seq_dec = seq_dec
+
+    def forward(self, m_inputs, p_inputs):
+        """
+        Forward pass through Encoders -> Set Decoder.
+        """
+        # 1. Encode Movie
+        # mov_ae.encoder expects List[Tensor]
+        z_movie = self.mov_ae.encoder(m_inputs)
+
+        # 2. Encode People Sequence
+        # p_inputs is List[Tensor(B, Seq, ...)]
+        # Encoder expects List[Tensor(Total, ...)], so we flatten B*Seq
+        B, SeqLen = p_inputs[0].shape[:2]
+        
+        flat_p_inputs = []
+        for f_tensor in p_inputs:
+            # Flatten B, Seq -> B*Seq
+            flat_shape = (-1,) + f_tensor.shape[2:]
+            flat_p_inputs.append(f_tensor.reshape(flat_shape))
+            
+        z_p_flat = self.per_ae.encoder(flat_p_inputs)
+        z_p_seq = z_p_flat.view(B, SeqLen, -1)
+
+        # 3. Set Decoder
+        z_pred, pres_logits = self.seq_dec(z_movie, z_p_seq)
+        
+        return z_pred, pres_logits, z_movie, z_p_seq
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None: return None
@@ -78,18 +113,35 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
         logging.error(f"Failed to save training state: {e}")
 
 def build_seq_decoder_trainer(cfg: ProjectConfig, db_path: str):
-    mov_ae, per_ae = _load_frozen_autoencoders(cfg)
+    fine_tune = cfg.seq_decoder_fine_tune_ae
+    
+    if fine_tune:
+        logging.info("Building End-to-End Fine-Tuning Trainer (AEs + SetDecoder)")
+        mov_ae, per_ae = _load_trainable_autoencoders(cfg)
+    else:
+        logging.info("Building Frozen AE Trainer")
+        mov_ae, per_ae = _load_frozen_autoencoders(cfg)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     
-    mov_ae.decoder.to(device).eval()
-    per_ae.decoder.to(device).eval()
-    mov_ae.encoder.to("cpu")
-    per_ae.encoder.to("cpu")
+    # CRITICAL FIX: Move the wrappers (encoder/decoder) directly. 
+    # Do not use .model.to(device) because .model.enc is the stale base encoder.
+    mov_ae.encoder.to(device)
+    mov_ae.decoder.to(device)
+    per_ae.encoder.to(device)
+    per_ae.decoder.to(device)
 
-    for m in [mov_ae.encoder, mov_ae.decoder, per_ae.encoder, per_ae.decoder]:
-        for p in m.parameters(): p.requires_grad_(False)
+    # Re-verify gradient state
+    if fine_tune:
+        mov_ae.encoder.train()
+        per_ae.encoder.train()
+        for p in mov_ae.encoder.parameters(): p.requires_grad_(True)
+        for p in per_ae.encoder.parameters(): p.requires_grad_(True)
+    else:
+        mov_ae.encoder.eval()
+        per_ae.encoder.eval()
 
     cache_path = ensure_set_decoder_cache(cfg)
     max_len = int(getattr(cfg, "seq_decoder_len", 10))
@@ -111,7 +163,7 @@ def build_seq_decoder_trainer(cfg: ProjectConfig, db_path: str):
     latent_dim = int(getattr(mov_ae, "latent_dim", cfg.latent_dim))
     
     # Autoregressive Model
-    model = SequenceDecoder(
+    seq_dec = SequenceDecoder(
         latent_dim=latent_dim,
         max_len=max_len,
         hidden_dim=int(getattr(cfg, "seq_decoder_hidden_dim", 256)),
@@ -120,16 +172,44 @@ def build_seq_decoder_trainer(cfg: ProjectConfig, db_path: str):
         dropout=float(getattr(cfg, "seq_decoder_dropout", 0.1)),
     ).to(device)
 
+    # Wrap in EndToEnd model
+    model = EndToEndSetModel(mov_ae, per_ae, seq_dec).to(device)
+
+    # Parameters & Optimizer
+    # If fine-tuning, we use a separate LR for AEs
+    params = []
+    
+    # Set Decoder Params (Group 1)
+    params.append({
+        "params": seq_dec.parameters(),
+        "lr": float(getattr(cfg, "seq_decoder_lr", 3e-4))
+    })
+
+    if fine_tune:
+        ae_lr = float(getattr(cfg, "seq_decoder_ae_lr", 1e-5))
+        
+        # Group 2: All Autoencoder Parameters
+        # CRITICAL FIX: We use a set() to collect parameters because the JointAutoencoder
+        # architecture shares the 'FiLM' network weights between mov_ae.encoder and per_ae.encoder.
+        # Passing them as separate lists triggers "ValueError: some parameters appear in more than one parameter group".
+        
+        ae_params = set()
+        ae_params.update(mov_ae.encoder.parameters())
+        ae_params.update(mov_ae.decoder.parameters())
+        ae_params.update(per_ae.encoder.parameters())
+        ae_params.update(per_ae.decoder.parameters())
+        
+        params.append({"params": list(ae_params), "lr": ae_lr})
+
     opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(getattr(cfg, "seq_decoder_lr", 3e-4)),
+        params,
         weight_decay=float(getattr(cfg, "seq_decoder_weight_decay", 1e-2)),
     )
 
     run_logger = RunLogger(cfg.tensorboard_dir, "seq_decoder", cfg)
     
     recon_logger = SetReconstructionLogger(
-        model=model, movie_ae=mov_ae, people_ae=per_ae,
+        model=seq_dec, movie_ae=mov_ae, people_ae=per_ae,
         num_slots=max_len,
         interval_steps=int(getattr(cfg, "seq_decoder_callback_interval", 500)),
         num_samples=int(getattr(cfg, "seq_decoder_recon_samples", 3)),
@@ -140,6 +220,7 @@ def build_seq_decoder_trainer(cfg: ProjectConfig, db_path: str):
         "w_latent": float(getattr(cfg, "seq_decoder_w_latent", 1.0)),
         "w_recon": float(getattr(cfg, "seq_decoder_w_recon", 1.0)),
         "w_presence": float(getattr(cfg, "seq_decoder_w_presence", 1.0)),
+        "w_ae_anchor": float(getattr(cfg, "seq_decoder_w_ae_recon", 0.5)), # Anchor loss weight
     }
 
     return model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg
@@ -152,14 +233,20 @@ def main():
     cfg = project_config
     ensure_dirs(cfg)
     db_path = cfg.db_path
+    
+    fine_tune = cfg.seq_decoder_fine_tune_ae
+    warmup_epochs = cfg.seq_decoder_ae_warmup_epochs if fine_tune else 0
 
     model, opt, loader, mov_ae, per_ae, run_logger, recon_logger, loss_cfg = build_seq_decoder_trainer(cfg, db_path=db_path)
     device = next(model.parameters()).device
     
     num_epochs = int(getattr(cfg, "seq_decoder_epochs", 50))
     save_interval = int(getattr(cfg, "seq_decoder_save_interval", 1000))
+    
+    # Loss Weights
     w_latent, w_recon = loss_cfg["w_latent"], loss_cfg["w_recon"]
     w_presence = loss_cfg["w_presence"]
+    w_anchor = loss_cfg["w_ae_anchor"]
 
     sched = make_lr_scheduler(opt, len(loader) * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
 
@@ -188,42 +275,98 @@ def main():
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(loader, dynamic_ncols=True, desc=f"seq-dec epoch {epoch+1}/{num_epochs}")
+        
+        # --- Handle AE Freezing/Unfreezing based on Epoch ---
+        if fine_tune:
+            if epoch < warmup_epochs:
+                # WARMUP PHASE: Freeze AEs (TARGET .encoder/.decoder explicitly)
+                model.mov_ae.encoder.eval()
+                model.mov_ae.decoder.eval()
+                model.per_ae.encoder.eval()
+                model.per_ae.decoder.eval()
+                
+                for p in model.mov_ae.encoder.parameters(): p.requires_grad_(False)
+                for p in model.mov_ae.decoder.parameters(): p.requires_grad_(False)
+                for p in model.per_ae.encoder.parameters(): p.requires_grad_(False)
+                for p in model.per_ae.decoder.parameters(): p.requires_grad_(False)
+                
+                pbar.set_description(f"epoch {epoch+1} (AE Frozen/Warmup)")
+            else:
+                # JOINT PHASE: Unfreeze AEs
+                model.mov_ae.encoder.train()
+                model.mov_ae.decoder.train()
+                model.per_ae.encoder.train()
+                model.per_ae.decoder.train()
+                
+                for p in model.mov_ae.encoder.parameters(): p.requires_grad_(True)
+                for p in model.mov_ae.decoder.parameters(): p.requires_grad_(True)
+                for p in model.per_ae.encoder.parameters(): p.requires_grad_(True)
+                for p in model.per_ae.decoder.parameters(): p.requires_grad_(True)
+                
+                pbar.set_description(f"epoch {epoch+1} (AE Fine-Tuning)")
+        # ----------------------------------------------------
+
         for batch in pbar:
             iter_start = time.perf_counter()
 
-            z_movies, Z_gt, mask, Y_gt_fields = batch
-            z_movies = z_movies.to(device, non_blocking=True)
-            Z_gt = Z_gt.to(device, non_blocking=True)
+            # batch is M_raw, P_in_raw, P_tgt_raw, mask
+            M_raw, P_in_raw, P_tgt_raw, mask = batch
+            M_raw = [x.to(device, non_blocking=True) for x in M_raw]
+            P_in_raw = [x.to(device, non_blocking=True) for x in P_in_raw]
+            P_tgt_raw = [x.to(device, non_blocking=True) for x in P_tgt_raw]
             mask = mask.to(device, non_blocking=True)
-            Y_gt_fields = [y.to(device, non_blocking=True) for y in Y_gt_fields]
 
-            model.train()
+            # We use model.train() for the SeqDecoder, but the AE state is controlled by the logic above.
+            model.seq_dec.train() 
             opt.zero_grad()
             
-            # 1. Forward Pass (Teacher Forcing)
-            # Z_gt contains full sequence [p1, p2, p3]
-            # Model shifts internally to input [SOS, p1, p2]
-            z_pred, pres_logits = model(z_movies, Z_gt)
+            # 1. Forward Pass (End-to-End)
+            # z_movie and z_p_seq are generated dynamically from raw inputs!
+            z_pred, pres_logits, z_movie, z_p_seq = model(M_raw, P_in_raw)
             
-            # 2. Compute Losses
+            # 2. Sequence Losses (Set Prediction)
+            # We compare z_pred (from decoder) against z_p_seq (from encoder)
+            
             loss_latent, loss_recon = compute_sequence_losses(
-                per_ae, z_pred, Z_gt, Y_gt_fields, mask, w_latent, w_recon
+                per_ae, z_pred, z_p_seq, P_tgt_raw, mask, w_latent, w_recon
             )
             
-            # Presence Loss (BCE)
-            # Mask is 1 if person exists, 0 otherwise
             loss_presence = torch.nn.functional.binary_cross_entropy_with_logits(
                 pres_logits, mask.float()
             )
 
+            # 3. Anchor Losses (Autoencoder Reconstruction)
+            # This is the "Anti-Clobbering" mechanism.
+            loss_anchor_m = torch.tensor(0.0, device=device)
+            loss_anchor_p = torch.tensor(0.0, device=device)
+
+            if fine_tune and epoch >= warmup_epochs:
+                # Movie Recon Loss
+                m_rec = model.mov_ae.decoder(z_movie)
+                for f, pred, tgt in zip(model.mov_ae.fields, m_rec, M_raw):
+                    loss_anchor_m += f.compute_loss(pred, tgt) * f.weight
+                
+                # Person Recon Loss
+                # We have (B, Seq, D). We flatten to (B*Seq, D) and reconstruct P_tgt_raw (flattened)
+                B, Seq = z_p_seq.shape[:2]
+                z_p_flat = z_p_seq.reshape(B*Seq, -1)
+                p_rec_flat = model.per_ae.decoder(z_p_flat)
+                
+                # Flatten targets
+                flat_tgt = [t.reshape(-1, *t.shape[2:]) for t in P_tgt_raw]
+                
+                for f, pred, tgt in zip(model.per_ae.fields, p_rec_flat, flat_tgt):
+                    l = f.compute_loss(pred, tgt)
+                    loss_anchor_p += l * f.weight
+
             total_loss = (
                 w_latent * loss_latent +
                 w_recon * loss_recon +
-                w_presence * loss_presence
+                w_presence * loss_presence +
+                w_anchor * (loss_anchor_m + loss_anchor_p)
             )
             
             # Metrics
-            total_targets = mask.sum().item()
             preds_bin = (torch.sigmoid(pres_logits) > 0.5)
             correct_presence = ((preds_bin == mask).float().sum()) / mask.numel()
             
@@ -231,10 +374,16 @@ def main():
                 'loss_latent': loss_latent.item(),
                 'loss_recon': loss_recon.item(),
                 'loss_presence': loss_presence.item(),
+                'loss_anchor_m': loss_anchor_m.item(),
+                'loss_anchor_p': loss_anchor_p.item(),
                 'acc_presence': correct_presence.item()
             }
             
             total_loss.backward()
+            
+            # Clip Gradients to prevent explosion during early fine-tuning
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             opt.step()
             if sched: sched.step()
 
@@ -244,28 +393,27 @@ def main():
                 run_logger.add_scalar("loss/total", float(total_loss), global_step)
                 run_logger.add_scalar("loss/latent", log_metrics['loss_latent'], global_step)
                 run_logger.add_scalar("loss/recon", log_metrics['loss_recon'], global_step)
-                run_logger.add_scalar("loss/presence", log_metrics['loss_presence'], global_step)
+                run_logger.add_scalar("loss/anchor_m", log_metrics['loss_anchor_m'], global_step)
+                run_logger.add_scalar("loss/anchor_p", log_metrics['loss_anchor_p'], global_step)
                 run_logger.add_scalar("metric/acc_presence", log_metrics['acc_presence'], global_step)
-                run_logger.add_scalar("time/iter_sec", iter_time, global_step)
                 run_logger.tick()
 
             pbar.set_postfix(
                 loss=f"{total_loss.item():.4f}", 
                 lat=f"{log_metrics['loss_latent']:.3f}", 
-                pres=f"{log_metrics['acc_presence']:.3f}"
+                anc=f"{(log_metrics['loss_anchor_m']+log_metrics['loss_anchor_p']):.3f}"
             )
 
             if (global_step+1) % save_interval == 0:
                 save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch, global_step, cfg, None)
-                torch.save(model.state_dict(), Path(cfg.model_dir) / "SequenceDecoder.pt")
-
-            if hasattr(loader.dataset, "movies"):
-                sample_tconsts = loader.dataset.movies[: z_movies.size(0)]
-            else:
-                sample_tconsts = [""] * z_movies.size(0)
 
             if recon_logger:
-                recon_logger.step(global_step, z_movies.detach().cpu(), mask.detach().cpu(), run_logger, sample_tconsts)
+                if hasattr(loader.dataset, "movies"):
+                    sample_tconsts = loader.dataset.movies[: z_movie.size(0)]
+                else:
+                    sample_tconsts = [""] * z_movie.size(0)
+
+                recon_logger.step(global_step, z_movie.detach().cpu(), mask.detach().cpu(), run_logger, sample_tconsts)
 
             global_step += 1
             if stop_flag["stop"]: break
