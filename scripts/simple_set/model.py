@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from scripts.autoencoder.row_autoencoder import _FieldEncoders
+from scripts.autoencoder.row_autoencoder import _FieldEncoders, TransformerFieldDecoder
 
 class ResBlock(nn.Module):
     """
@@ -38,25 +38,32 @@ class HybridSetModel(nn.Module):
         super().__init__()
         self.fields = fields
         
-        # 1. Field Encoders & Aggregator
-        # This reuses the robust encoder logic from the Joint AE.
-        # It handles: Text(CNN), Categorical(Emb), Scalar(Proj) -> Transformer -> Pooling
+        # 1. Field Encoders & Aggregator (Inputs -> Latent)
         # Output is (B, latent_dim)
         self.field_encoder = _FieldEncoders(fields, latent_dim)
         
-        # 2. Projection to Trunk
+        # 2. Field Decoder (Latent -> Reconstructed Inputs)
+        # This reconstructs the original movie fields from the latent representation
+        self.field_decoder = TransformerFieldDecoder(
+            fields, 
+            latent_dim, 
+            num_layers=2, 
+            num_heads=4
+        )
+        
+        # 3. Projection to Trunk
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
         
-        # 3. Deep ResNet Trunk (Logic Core)
+        # 4. Deep ResNet Trunk (Logic Core)
         self.trunk = nn.Sequential(*[
             ResBlock(hidden_dim, dropout) for _ in range(depth)
         ])
         
-        # 4. Low-Rank Output Head
+        # 5. Low-Rank Output Head (People)
         self.people_bottleneck = nn.Linear(hidden_dim, output_rank, bias=False)
         self.people_expansion = nn.Linear(output_rank, num_people) 
         
-        # 5. Count Head
+        # 6. Count Head
         self.count_head = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.GELU(),
@@ -83,11 +90,16 @@ class HybridSetModel(nn.Module):
         Returns:
             people_logits: (B, P)
             count_pred: (B, 1)
+            recon_outputs: List[Tensor], one per field (reconstructed values/logits)
         """
         # Encode Fields -> Single Vector
         # z: (B, latent_dim)
         z = self.field_encoder(field_tensors)
         
+        # 1. Reconstruction Branch
+        recon_outputs = self.field_decoder(z)
+        
+        # 2. Prediction Branch (Trunk)
         # Project to Trunk Width
         feat = self.trunk_proj(z) # (B, hidden)
         
@@ -101,4 +113,4 @@ class HybridSetModel(nn.Module):
         # Count
         count_pred = self.count_head(feat)                # (B, 1)
         
-        return people_logits, count_pred
+        return people_logits, count_pred, recon_outputs

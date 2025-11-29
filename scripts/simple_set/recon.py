@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import textwrap
 import logging
+from prettytable import PrettyTable
 
 class HybridSetReconLogger:
     def __init__(
@@ -32,8 +33,8 @@ class HybridSetReconLogger:
         
         # We iterate through the dataset fields
         for f, tensor_val in zip(self.dataset.fields, field_tensors_sample):
-            # to_string usually expects numpy array
-            val_str = f.to_string(tensor_val.numpy())
+            # Using render_ground_truth as these are input tensors
+            val_str = f.render_ground_truth(tensor_val)
             
             if f.name == "primaryTitle":
                 title = val_str
@@ -51,6 +52,10 @@ class HybridSetReconLogger:
         wrapper = textwrap.TextWrapper(initial_indent=prefix, subsequent_indent=" " * 4, width=self.w)
         return wrapper.fill(full_str)
 
+    def _wrap_cell(self, text, width=40):
+        if not text: return ""
+        return "\n".join(textwrap.wrap(str(text), width=width))
+
     @torch.no_grad()
     def step(self, global_step: int, model, batch_inputs, targets, count_targets, run_logger):
         if (global_step + 1) % self.every != 0:
@@ -59,7 +64,7 @@ class HybridSetReconLogger:
         model.eval()
         
         # Forward pass
-        logits, pred_counts_scalar = model(batch_inputs)
+        logits, pred_counts_scalar, recon_outputs = model(batch_inputs)
         probs = torch.sigmoid(logits)
         
         B = logits.size(0)
@@ -69,13 +74,32 @@ class HybridSetReconLogger:
         log_output = []
         
         for i in sample_idxs:
-            # Decode Title from Input Tensors
-            # batch_inputs is a list of tensors [Field1(B,...), Field2(B,...)]
-            # We need to extract the i-th slice from each
-            sample_tensors = [t[i].cpu() for t in batch_inputs]
-            movie_str = self._decode_movie_title(sample_tensors)
+            # 1. Reconstruct Inputs Table
+            # Extract i-th sample from batch inputs and batch outputs
+            input_sample_tensors = [t[i].cpu() for t in batch_inputs]
+            recon_sample_tensors = [t[i].cpu() for t in recon_outputs]
             
-            # Gather Ground Truth & Predictions
+            # Use helpers to get title for the header
+            movie_str = self._decode_movie_title(input_sample_tensors)
+            
+            # Build PrettyTable for Metadata Reconstruction
+            table = PrettyTable(["Field", "Original", "Reconstructed"])
+            table.align["Field"] = "l"
+            table.align["Original"] = "l"
+            table.align["Reconstructed"] = "l"
+            
+            for f, in_t, out_t in zip(self.dataset.fields, input_sample_tensors, recon_sample_tensors):
+                # Clean API usage: Field knows how to render GT vs Pred
+                orig_str = f.render_ground_truth(in_t)
+                recon_str = f.render_prediction(out_t)
+                
+                table.add_row([
+                    f.name, 
+                    self._wrap_cell(orig_str, width=30), 
+                    self._wrap_cell(recon_str, width=30)
+                ])
+
+            # 2. Gather Ground Truth & Predictions for People
             true_indices_t = torch.nonzero(targets[i]).flatten()
             true_indices = set(true_indices_t.cpu().numpy().tolist())
             
@@ -106,6 +130,7 @@ class HybridSetReconLogger:
             stats = f"Count: True={true_count} | Pred={pred_count_val:.1f} | IoU={len(tp_idxs) / max(1, len(true_indices | pred_indices)):.2f}"
             
             log_output.append(header)
+            log_output.append(str(table)) # Add the reconstruction table
             log_output.append(stats)
             log_output.append("-" * 20)
             

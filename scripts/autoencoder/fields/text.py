@@ -109,10 +109,19 @@ class TextField(BaseField):
     def get_flag_padding_value(self):
         return torch.tensor([1.0], dtype=torch.float32)
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
-        arr = np.asarray(predicted_main)
-        if arr.ndim >= 2 and self.tokenizer is not None and arr.shape[-1] == self.tokenizer.get_vocab_size():
-            arr = np.argmax(arr, axis=-1)
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        # Prediction: (B, Len, Vocab) -> Argmax -> (B, Len)
+        if prediction_tensor.ndim >= 2 and self.tokenizer is not None and prediction_tensor.shape[-1] == self.tokenizer.get_vocab_size():
+            indices = torch.argmax(prediction_tensor, dim=-1)
+            return self.to_string(indices.detach().cpu().numpy())
+        return self.to_string(prediction_tensor.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        # Target: (B, Len) Indices
+        return self.to_string(target_tensor.detach().cpu().numpy())
+
+    def to_string(self, values: np.ndarray) -> str:
+        arr = np.asarray(values)
         if arr.ndim > 1:
             arr = arr.flatten()
         ids = arr.astype(int).tolist()

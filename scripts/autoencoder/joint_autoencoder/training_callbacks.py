@@ -103,68 +103,32 @@ class JointReconstructionLogger:
     def _recon_movie(self, z):
         z_t = torch.tensor(z, dtype=torch.float32, device=self.m_ae.device).unsqueeze(0)
         outs = self.joint.mov_dec(z_t)
-        outs = [o[0].detach().cpu().numpy() for o in outs]
+        #outs = [o[0].detach().cpu().numpy() for o in outs] 
+        # Keep as tensor to pass to render_prediction
         rec = {}
-        for f, arr in zip(self.m_ae.fields, outs):
-            rec[f.name] = self._tensor_to_string(f, arr)
+        for f, tensor in zip(self.m_ae.fields, outs):
+            # Pass the 0-th element (batch size 1)
+            rec[f.name] = f.render_prediction(tensor[0])
         return rec
 
     @torch.no_grad()
     def _recon_person(self, z):
         z_t = torch.tensor(z, dtype=torch.float32, device=self.p_ae.device).unsqueeze(0)
         outs = self.joint.per_dec(z_t)
-        outs = [o[0].detach().cpu().numpy() for o in outs]
         rec = {}
-        for f, arr in zip(self.p_ae.fields, outs):
-            rec[f.name] = self._tensor_to_string(f, arr)
+        for f, tensor in zip(self.p_ae.fields, outs):
+            rec[f.name] = f.render_prediction(tensor[0])
         return rec
-
-    def _tensor_to_string(self, field, main_tensor, flag_tensor=None):
-        try:
-            # Numeric digits: let the field distinguish digits vs logits by shape.
-            if isinstance(field, NumericDigitCategoryField):
-                arr = np.array(main_tensor)
-                return field.to_string(arr)
-
-            # Text-like fields: pass logits/id sequences directly.
-            if hasattr(field, "tokenizer") and field.tokenizer is not None:
-                return field.to_string(main_tensor, flag_tensor)
-
-            # Everything else: flatten to 1D and call to_string.
-            arr = np.array(main_tensor)
-            if arr.ndim > 1:
-                arr = arr.flatten()
-            return field.to_string(arr, flag_tensor)
-        except Exception:
-            return "[Conversion Error]"
 
     def _roundtrip_string(self, field, raw_value):
         try:
-            # Multi-label categoricals: transform gives a multi-hot vector.
-            if isinstance(field, MultiCategoryField):
-                t = field.transform(raw_value)
-                arr = t.detach().cpu().numpy().flatten().astype(float)
-                chosen = [
-                    (c, p)
-                    for c, p in zip(field.category_list, arr)
-                    if p >= 0.5
-                ]
-                if not chosen and len(arr) > 0:
-                    i = int(np.argmax(arr))
-                    chosen = [(field.category_list[i], arr[i])]
-                return " ".join(f"{c}:{p:.2f}" for c, p in chosen)
-
-            # Single-label categoricals: transform gives an index.
-            if isinstance(field, SingleCategoryField):
-                t = field.transform(raw_value)
-                idx = int(t.detach().cpu().numpy().flatten()[0])
-                if 0 <= idx < len(field.category_list):
-                    return field.category_list[idx]
-                return "[Unknown]"
-
-            # Everything else: transform, then use the usual string path.
+            # Transform raw value -> Tensor
             t = field.transform(raw_value)
-            return self._tensor_to_string(field, t)
+            
+            # For roundtrip, we treat the transformed tensor as "Ground Truth" 
+            # because transform() returns the dataset representation (indices/one-hot),
+            # NOT model logits.
+            return field.render_ground_truth(t)
         except Exception:
             return "[RT Error]"
 
@@ -243,8 +207,6 @@ class JointReconstructionLogger:
                 f"[{bar}]\n"
                 f"{tm}\n{tp}"
             )
-
-
 
 
 class TensorBoardPerBatchLogger:

@@ -60,11 +60,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in sorted_tconsts])
     
-    # Use the generator query logic from TitlesAutoencoder but filtered by our list
-    # We construct a query manually to ensure we get the fields in the order expected by row_by_tconst logic
-    # Actually, simpler: Use mov_ae.row_by_tconst if fast enough, or replicate query.
-    # Replicating query for batch speed:
-    
+    # Updated SQL to include principalCount
     sql = """
     SELECT 
         t.tconst,
@@ -74,7 +70,8 @@ def build_hybrid_cache(cfg: ProjectConfig):
         t.runtimeMinutes,
         t.averageRating,
         t.numVotes,
-        GROUP_CONCAT(g.genre, ',')
+        GROUP_CONCAT(g.genre, ','),
+        (SELECT COUNT(*) FROM principals pr WHERE pr.tconst = t.tconst)
     FROM titles t
     JOIN target_movies tm ON tm.tconst = t.tconst
     JOIN title_genres g ON g.tconst = t.tconst
@@ -106,6 +103,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
             "averageRating": r[5],
             "numVotes": r[6],
             "genres": r[7].split(",") if r[7] else [],
+            "principalCount": r[8]
         }
 
     valid_count = 0

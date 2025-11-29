@@ -309,7 +309,6 @@ def _field_to_state(f: BaseField) -> Dict[str, Any]:
                     if getattr(f, "total_positions", None) is not None
                     else 1
                 ),
-                # Save derived fields to help debugging/future loading
                 "mask_index": int(getattr(f, "mask_index", 10)),
                 "vocab_size": int(getattr(f, "vocab_size", 11)),
             }
@@ -420,10 +419,6 @@ def _apply_field_state(f: BaseField, st: Dict[str, Any]) -> None:
                 getattr(f, "total_positions", f.integer_digits),
             )
         )
-        
-        # CRITICAL FIX: Manually restore vocab_size and mask_index based on base.
-        # This prevents _ensure_finalized() from seeing None, triggering _finalize_stats(),
-        # and overwriting total_positions with 1 (due to empty data_points).
         f.mask_index = f.base
         f.vocab_size = f.base + 1
         return
@@ -606,8 +601,8 @@ class RowAutoencoder:
             outs = self.decoder(z)
         rec: Dict[str, str] = {}
         for f, o in zip(self.fields, outs):
-            arr = o.detach().cpu().numpy()[0]
-            rec[f.name] = f.to_string(arr)
+            # Use render_prediction as this comes from the model decoder
+            rec[f.name] = f.render_prediction(o[0])
         return rec
 
     def build_fields(self) -> List["BaseField"]:

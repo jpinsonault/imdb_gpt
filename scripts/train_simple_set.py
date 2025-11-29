@@ -186,6 +186,7 @@ def main():
     
     w_bce = float(cfg.hybrid_set_w_bce)
     w_count = float(cfg.hybrid_set_w_count)
+    w_recon = 1.0 # Reconstruction weight
     save_int = int(cfg.hybrid_set_save_interval)
 
     # 4. Loop
@@ -205,12 +206,19 @@ def main():
             model.train()
             opt.zero_grad()
             
-            logits, pred_counts = model(batch_inputs)
+            # Forward pass now returns reconstruction outputs
+            logits, pred_counts, recon_outputs = model(batch_inputs)
             
+            # 1. Prediction Losses
             loss_set = asymmetric_loss(logits, multi_hot_targets)
             loss_count = F.mse_loss(pred_counts, count_targets)
             
-            total_loss = w_bce * loss_set + w_count * loss_count
+            # 2. Reconstruction Loss
+            loss_recon = torch.tensor(0.0, device=device)
+            for f, pred, tgt in zip(ds.fields, recon_outputs, batch_inputs):
+                loss_recon = loss_recon + f.compute_loss(pred, tgt) * float(f.weight)
+            
+            total_loss = w_bce * loss_set + w_count * loss_count + w_recon * loss_recon
             
             total_loss.backward()
             opt.step()
@@ -232,6 +240,7 @@ def main():
                 run_logger.add_scalar("loss/total", total_loss.item(), global_step)
                 run_logger.add_scalar("loss/set_asymmetric", loss_set.item(), global_step)
                 run_logger.add_scalar("loss/count", loss_count.item(), global_step)
+                run_logger.add_scalar("loss/recon", loss_recon.item(), global_step)
                 run_logger.add_scalar("metric/pos_prob", pos_prob, global_step)
                 run_logger.add_scalar("metric/neg_prob", neg_prob, global_step)
                 run_logger.add_scalar("time/iter_sec", iter_time, global_step)
@@ -242,7 +251,7 @@ def main():
             pbar.set_postfix(
                 loss=f"{total_loss.item():.4f}", 
                 set=f"{loss_set.item():.4f}", 
-                cnt=f"{loss_count.item():.4f}",
+                recon=f"{loss_recon.item():.4f}",
                 pos=f"{pos_prob:.2f}"
             )
             

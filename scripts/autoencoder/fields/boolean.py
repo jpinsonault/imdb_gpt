@@ -46,8 +46,20 @@ class BooleanField(BaseField):
         v = 1.0 if v == 1.0 else 0.0
         return torch.tensor([v], dtype=torch.float32)
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
-        p = float(predicted_main.flatten()[0])
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        # Convert logits/tanh to 0.0-1.0 probability range
+        if self.use_bce_loss:
+            val = torch.sigmoid(prediction_tensor)
+        else:
+            # Tanh output (-1 to 1) -> (0 to 1) approx or just check sign
+            val = (torch.tanh(prediction_tensor) + 1) / 2
+        return self.to_string(val.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        return self.to_string(target_tensor.detach().cpu().numpy())
+
+    def to_string(self, values: np.ndarray) -> str:
+        p = float(values.flatten()[0])
         return "True" if p >= 0.5 else "False"
 
     def build_encoder(self, latent_dim: int) -> nn.Module:

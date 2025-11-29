@@ -7,6 +7,8 @@ from .fields import (
     NumericDigitCategoryField,
     TextField,
     MultiCategoryField,
+    ScalarField,
+    Scaling,
     BaseField,
 )
 from .row_autoencoder import RowAutoencoder
@@ -15,6 +17,7 @@ from .row_autoencoder import RowAutoencoder
 class TitlesAutoencoder(RowAutoencoder):
     def build_fields(self) -> list[BaseField]:
         return [
+            TextField("tconst"),
             TextField("primaryTitle"),
             NumericDigitCategoryField("startYear"),
             NumericDigitCategoryField("endYear"),
@@ -22,6 +25,7 @@ class TitlesAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("averageRating"),
             NumericDigitCategoryField("numVotes"),
             MultiCategoryField("genres"),
+            NumericDigitCategoryField("principalCount"),
         ]
 
     def row_generator(self):
@@ -38,7 +42,8 @@ class TitlesAutoencoder(RowAutoencoder):
                     t.runtimeMinutes,
                     t.averageRating,
                     t.numVotes,
-                    GROUP_CONCAT(g.genre, ',')
+                    GROUP_CONCAT(g.genre, ','),
+                    (SELECT COUNT(*) FROM principals pr WHERE pr.tconst = t.tconst)
                 {movie_from_join()}
                 WHERE
                     {movie_where_clause()}
@@ -48,7 +53,7 @@ class TitlesAutoencoder(RowAutoencoder):
                 """,
                 (self.config.movie_limit,),
             )
-            for tconst, primaryTitle, startYear, endYear, runtime, rating, votes, genres in c:
+            for tconst, primaryTitle, startYear, endYear, runtime, rating, votes, genres, p_count in c:
                 yield {
                     "tconst": tconst,
                     "primaryTitle": primaryTitle,
@@ -58,6 +63,7 @@ class TitlesAutoencoder(RowAutoencoder):
                     "averageRating": rating,
                     "numVotes": votes,
                     "genres": genres.split(","),
+                    "principalCount": p_count,
                 }
 
 
@@ -73,7 +79,8 @@ class TitlesAutoencoder(RowAutoencoder):
                     t.runtimeMinutes,
                     t.averageRating,
                     t.numVotes,
-                    GROUP_CONCAT(g.genre, ',')
+                    GROUP_CONCAT(g.genre, ','),
+                    (SELECT COUNT(*) FROM principals pr WHERE pr.tconst = t.tconst)
                 FROM titles t
                 LEFT JOIN title_genres g ON g.tconst = t.tconst
                 WHERE t.tconst = ?
@@ -93,16 +100,19 @@ class TitlesAutoencoder(RowAutoencoder):
             "averageRating": r[4],
             "numVotes": r[5],
             "genres": r[6].split(",") if r[6] else [],
+            "principalCount": r[7],
         }
 
 
 class PeopleAutoencoder(RowAutoencoder):
     def build_fields(self) -> List[BaseField]:
         return [
+            TextField("nconst"),
             TextField("primaryName"),
             NumericDigitCategoryField("birthYear"),
             NumericDigitCategoryField("deathYear"),
             MultiCategoryField("professions"),
+            NumericDigitCategoryField("titleCount"),
         ]
 
     def row_generator(self):
@@ -115,7 +125,9 @@ class PeopleAutoencoder(RowAutoencoder):
                     p.primaryName,
                     p.birthYear,
                     p.deathYear,
-                    GROUP_CONCAT(pp.profession, ',') AS professions
+                    GROUP_CONCAT(pp.profession, ',') AS professions,
+                    (SELECT COUNT(*) FROM principals pr WHERE pr.nconst = p.nconst),
+                    p.nconst
                 {people_from_join()}
                 WHERE
                     {people_where_clause()}
@@ -129,6 +141,8 @@ class PeopleAutoencoder(RowAutoencoder):
                     "birthYear": row[1],
                     "deathYear": row[2],
                     "professions": row[3].split(",") if row[3] else None,
+                    "titleCount": row[4],
+                    "nconst": row[5],
                 }
 
 
@@ -141,7 +155,8 @@ class PeopleAutoencoder(RowAutoencoder):
                     p.primaryName,
                     p.birthYear,
                     p.deathYear,
-                    GROUP_CONCAT(pp.profession, ',')
+                    GROUP_CONCAT(pp.profession, ','),
+                    (SELECT COUNT(*) FROM principals pr WHERE pr.nconst = p.nconst)
                 FROM people p
                 LEFT JOIN people_professions pp ON pp.nconst = p.nconst
                 WHERE p.nconst = ?
@@ -157,4 +172,6 @@ class PeopleAutoencoder(RowAutoencoder):
             "birthYear": r[1],
             "deathYear": r[2],
             "professions": r[3].split(",") if r[3] else None,
+            "titleCount": r[4],
+            "nconst": nconst,
         }

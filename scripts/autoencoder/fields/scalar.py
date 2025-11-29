@@ -94,8 +94,10 @@ class ScalarField(BaseField):
             t = self.scaling.log_transform(x)
         return torch.tensor([t], dtype=torch.float32)
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
-        v = float(predicted_main.flatten()[0])
+    def to_string(self, values: np.ndarray) -> str:
+        v = float(values.flatten()[0])
+        # Both predictions and ground truth are in the "transformed" space (e.g. log space).
+        # We un-transform them here for display.
         if self.scaling == Scaling.NONE:
             v = self.scaling.none_untransform(v)
         elif self.scaling == Scaling.NORMALIZE:

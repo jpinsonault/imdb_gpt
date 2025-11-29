@@ -53,18 +53,26 @@ class MultiCategoryField(BaseField):
     def transform_target(self, raw_value):
         return self._transform(raw_value if raw_value is not None else [])
 
-    def to_string(
-        self,
-        predicted_main: np.ndarray,
-        predicted_flag: Optional[np.ndarray] = None,
-        threshold: float = 0.5,
-    ) -> str:
-        logits = np.asarray(predicted_main).flatten().astype(float)
-        probs = 1.0 / (1.0 + np.exp(-logits))
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        # Predictions are logits -> Apply Sigmoid
+        probs = torch.sigmoid(prediction_tensor)
+        return self.to_string(probs.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        # Targets are 0.0 or 1.0 -> Pass through
+        return self.to_string(target_tensor.detach().cpu().numpy())
+
+    def to_string(self, values: np.ndarray, threshold: float = 0.5) -> str:
+        # Takes Probabilities or Binary targets
+        probs = np.asarray(values).flatten().astype(float)
         chosen = [(c, p) for c, p in zip(self.category_list, probs) if p >= threshold]
-        if not chosen and len(probs) > 0:
+        
+        # If no categories passed threshold, pick the highest probability one
+        # (Only if the input isn't all zeros, which might happen in empty GT)
+        if not chosen and np.max(probs) > 0:
             i = int(np.argmax(probs))
             chosen = [(self.category_list[i], probs[i])]
+            
         return " ".join(f"{c}:{p:.2f}" for c, p in chosen)
 
     def build_encoder(self, latent_dim: int) -> nn.Module:
@@ -138,9 +146,22 @@ class SingleCategoryField(BaseField):
     def transform(self, raw_value):
         return self._transform(raw_value)
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
-        vec = predicted_main.flatten()
-        idx = int(np.argmax(vec))
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        # Prediction: (B, NumClasses) logits -> Argmax
+        idx = torch.argmax(prediction_tensor, dim=-1)
+        return self.to_string(idx.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        # Target: (B, 1) index
+        return self.to_string(target_tensor.detach().cpu().numpy())
+
+    def to_string(self, values: np.ndarray) -> str:
+        vec = values.flatten()
+        if vec.size == 1:
+            idx = int(vec[0])
+        else:
+            idx = int(np.argmax(vec))
+            
         if 0 <= idx < len(self.category_list):
             return self.category_list[idx]
         return "[Unknown]"

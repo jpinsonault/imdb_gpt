@@ -133,7 +133,7 @@ class NumericDigitCategoryField(BaseField):
             v = float(raw_value)
         except (ValueError, TypeError):
             return True
-        if math.isnan(v) and not self.has_nan:
+        if math.isnan(v):
             return True
         return False
 
@@ -141,15 +141,22 @@ class NumericDigitCategoryField(BaseField):
         self._ensure_finalized()
 
         if self._is_missing(raw_value):
-            return self.get_base_padding_value()
+            if self.has_nan:
+                return self._encode_nan()
+            else:
+                return self.get_base_padding_value()
 
         try:
             v = float(raw_value)
         except (ValueError, TypeError):
+            if self.has_nan:
+                return self._encode_nan()
             return self.get_base_padding_value()
 
         if math.isnan(v):
-            return self._encode_nan()
+            if self.has_nan:
+                return self._encode_nan()
+            return self.get_base_padding_value()
 
         return self._encode_numeric(v)
 
@@ -159,14 +166,21 @@ class NumericDigitCategoryField(BaseField):
     def transform_target(self, raw_value):
         return self._transform(raw_value)
 
-    def to_string(self, predicted_tensor: np.ndarray, flag_tensor: Optional[np.ndarray] = None) -> str:
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        # Prediction: (B, P, Vocab) -> Argmax
+        if prediction_tensor.ndim >= 2 and prediction_tensor.shape[-1] in (self.base, self.vocab_size):
+            indices = torch.argmax(prediction_tensor, dim=-1)
+            return self.to_string(indices.detach().cpu().numpy())
+        return self.to_string(prediction_tensor.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        # Target: (B, P) Indices
+        return self.to_string(target_tensor.detach().cpu().numpy())
+
+    def to_string(self, values: np.ndarray) -> str:
         self._ensure_finalized()
 
-        arr = np.asarray(predicted_tensor)
-
-        if arr.ndim >= 2 and arr.shape[-1] in (self.base, self.vocab_size):
-            arr = np.argmax(arr, axis=-1)
-
+        arr = np.asarray(values)
         if arr.ndim > 1:
             arr = arr.flatten()
 
@@ -180,8 +194,9 @@ class NumericDigitCategoryField(BaseField):
         idx = 0
 
         if self.has_nan:
-            if idx < len(digits) and digits[idx] == 1:
-                return "NaN"
+            if idx < len(digits):
+                if digits[idx] == 1:
+                    return "NaN"
             idx += 1
 
         negative = False
@@ -227,7 +242,7 @@ class NumericDigitCategoryField(BaseField):
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         self._ensure_finalized()
         B, P, V = pred.shape
-        mask_id = int(self.mask_index) if self.mask_index is not None else -1000
+        mask_id = int(self.mask_index) if self.mask_index is not None else -100
         return F.cross_entropy(
             pred.reshape(B * P, V),
             target.reshape(B * P).long(),

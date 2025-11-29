@@ -30,8 +30,27 @@ class BaseField:
     def build_decoder(self, latent_dim: int) -> nn.Module:
         raise NotImplementedError
 
-    def to_string(self, predicted_main: np.ndarray, predicted_flag: Optional[np.ndarray] = None) -> str:
+    def to_string(self, value: np.ndarray) -> str:
+        """
+        Low-level formatting. Converts a processed numpy array (probs, indices, or values) to string.
+        """
         raise NotImplementedError
+    
+    def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
+        """
+        High-level wrapper. Takes raw model output (logits/normalized), processes it (sigmoid/argmax/unscale),
+        and returns a string.
+        """
+        # Default behavior: detach, cpu, numpy, stringify
+        return self.to_string(prediction_tensor.detach().cpu().numpy())
+
+    def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
+        """
+        High-level wrapper. Takes dataset target (indices/normalized), processes it,
+        and returns a string.
+        """
+        # Default behavior: detach, cpu, numpy, stringify
+        return self.to_string(target_tensor.detach().cpu().numpy())
 
     def print_stats(self):
         raise NotImplementedError
