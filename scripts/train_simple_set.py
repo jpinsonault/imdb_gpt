@@ -215,8 +215,12 @@ def main():
             
             # 2. Reconstruction Loss
             loss_recon = torch.tensor(0.0, device=device)
+            field_losses = {}
+
             for f, pred, tgt in zip(ds.fields, recon_outputs, batch_inputs):
-                loss_recon = loss_recon + f.compute_loss(pred, tgt) * float(f.weight)
+                f_loss = f.compute_loss(pred, tgt) * float(f.weight)
+                loss_recon = loss_recon + f_loss
+                field_losses[f.name] = f_loss.item()
             
             total_loss = w_bce * loss_set + w_count * loss_count + w_recon * loss_recon
             
@@ -241,6 +245,10 @@ def main():
                 run_logger.add_scalar("loss/set_asymmetric", loss_set.item(), global_step)
                 run_logger.add_scalar("loss/count", loss_count.item(), global_step)
                 run_logger.add_scalar("loss/recon", loss_recon.item(), global_step)
+                
+                # Log per-field losses under a separate header
+                run_logger.add_field_losses("recon_field", field_losses)
+
                 run_logger.add_scalar("metric/pos_prob", pos_prob, global_step)
                 run_logger.add_scalar("metric/neg_prob", neg_prob, global_step)
                 run_logger.add_scalar("time/iter_sec", iter_time, global_step)

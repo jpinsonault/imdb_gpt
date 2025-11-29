@@ -7,10 +7,18 @@ import torch.nn.functional as F
 from .base import BaseField
 
 class NumericDigitCategoryField(BaseField):
-    def __init__(self, name: str, base: int = 10, fraction_digits: int = 0, optional: bool = False):
+    def __init__(
+        self, 
+        name: str, 
+        base: int = 10, 
+        fraction_digits: int = 0, 
+        strip_nonnumeric: bool = False,
+        optional: bool = False
+    ):
         super().__init__(name, optional)
         self.base = int(base)
         self.fraction_digits = int(fraction_digits)
+        self.strip_nonnumeric = strip_nonnumeric
         self.data_points = []
         self.has_negative = False
         self.has_nan = False
@@ -19,7 +27,21 @@ class NumericDigitCategoryField(BaseField):
         self.mask_index: Optional[int] = None
         self.vocab_size: Optional[int] = None
 
+    def _clean_value(self, raw_value):
+        """Helper to strip non-numeric characters if configured."""
+        if raw_value is None:
+            return None
+        if self.strip_nonnumeric:
+            # Filter keeps only digits, returns iterator, join back to string
+            # This handles 'tt12345' -> '12345' or 'nm0001' -> '0001'
+            s = str(raw_value)
+            cleaned = "".join(filter(str.isdigit, s))
+            return cleaned if cleaned else None
+        return raw_value
+
     def _accumulate_stats(self, raw_value):
+        raw_value = self._clean_value(raw_value)
+
         if raw_value is None:
             self.has_nan = True
             return
@@ -139,6 +161,9 @@ class NumericDigitCategoryField(BaseField):
 
     def _transform(self, raw_value):
         self._ensure_finalized()
+        
+        # Clean value before checking missing or encoding
+        raw_value = self._clean_value(raw_value)
 
         if self._is_missing(raw_value):
             if self.has_nan:
@@ -229,6 +254,9 @@ class NumericDigitCategoryField(BaseField):
         s = f"{int_val}"
         if self.fraction_digits > 0:
             s += "." + f"{frac_val:0{self.fraction_digits}d}"
+        
+        # Note: If strip_nonnumeric was True, we don't automatically add the prefix back here.
+        # The reconstruction is purely the numeric part.
         return ("-" if negative else "") + s
 
     def build_encoder(self, latent_dim: int) -> nn.Module:

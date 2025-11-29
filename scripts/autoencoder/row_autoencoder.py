@@ -297,6 +297,7 @@ def _field_to_state(f: BaseField) -> Dict[str, Any]:
             {
                 "base": int(getattr(f, "base", 10)),
                 "fraction_digits": int(getattr(f, "fraction_digits", 0)),
+                "strip_nonnumeric": bool(getattr(f, "strip_nonnumeric", False)),
                 "has_negative": bool(getattr(f, "has_negative", False)),
                 "has_nan": bool(getattr(f, "has_nan", False)),
                 "integer_digits": int(
@@ -405,6 +406,9 @@ def _apply_field_state(f: BaseField, st: Dict[str, Any]) -> None:
         f.base = int(st.get("base", getattr(f, "base", 10)))
         f.fraction_digits = int(
             st.get("fraction_digits", getattr(f, "fraction_digits", 0))
+        )
+        f.strip_nonnumeric = bool(
+            st.get("strip_nonnumeric", getattr(f, "strip_nonnumeric", False))
         )
         f.has_negative = bool(
             st.get("has_negative", getattr(f, "has_negative", False))

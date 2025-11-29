@@ -17,7 +17,7 @@ from .row_autoencoder import RowAutoencoder
 class TitlesAutoencoder(RowAutoencoder):
     def build_fields(self) -> list[BaseField]:
         return [
-            TextField("tconst"),
+            NumericDigitCategoryField("tconst", strip_nonnumeric=True),
             TextField("primaryTitle"),
             NumericDigitCategoryField("startYear"),
             NumericDigitCategoryField("endYear"),
@@ -107,7 +107,7 @@ class TitlesAutoencoder(RowAutoencoder):
 class PeopleAutoencoder(RowAutoencoder):
     def build_fields(self) -> List[BaseField]:
         return [
-            TextField("nconst"),
+            NumericDigitCategoryField("nconst", strip_nonnumeric=True),
             TextField("primaryName"),
             NumericDigitCategoryField("birthYear"),
             NumericDigitCategoryField("deathYear"),
