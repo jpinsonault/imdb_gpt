@@ -1,3 +1,5 @@
+# scripts/autoencoder/imdb_row_autoencoders.py
+
 from typing import List
 import sqlite3
 
@@ -38,7 +40,8 @@ class TitlesAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("averageRating"),
             NumericDigitCategoryField("numVotes"),
             MultiCategoryField("genres"),
-            NumericDigitCategoryField("principalCount"),
+            # Renamed from principalCount to peopleCount
+            NumericDigitCategoryField("peopleCount"),
         ]
 
     def row_generator(self):

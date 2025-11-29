@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import torch
 import json
+from collections import Counter
 from pathlib import Path
 from tqdm import tqdm
 from config import ProjectConfig
@@ -12,12 +13,16 @@ from scripts.sql_filters import movie_select_clause, map_movie_row
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# --- KNOBS ---
+MIN_PERSON_FREQUENCY = 3  # A person must appear in at least this many movies
+MIN_PEOPLE_PER_MOVIE = 1  # A movie must have at least this many valid people
+# -------------
+
 def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.data_dir) / "imdb.db"
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
     
     # 1. Setup Movie Fields using the Autoencoder class
-    # We use this class to manage stats, tokenizers, and transformations
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
     mov_ae.accumulate_stats()
@@ -33,35 +38,51 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute("SELECT tconst, nconst FROM edges")
     raw_edges = cur.fetchall()
     
-    # 4. Map Data
+    # 4. Filter Data (The Knobs)
+    logging.info("Filtering edges...")
+    
+    # A. Count appearances of each person
+    person_counts = Counter(n for t, n in raw_edges)
+    
+    # B. Identify valid people (Knob: MIN_PERSON_FREQUENCY)
+    valid_people = {n for n, c in person_counts.items() if c >= MIN_PERSON_FREQUENCY}
+    logging.info(f"People filtering: {len(person_counts)} total -> {len(valid_people)} valid (>= {MIN_PERSON_FREQUENCY} appearances)")
+    
+    # C. Group by movie, excluding invalid people
     movie_to_people = {}
-    all_nconsts = set()
-    all_tconsts = set()
+    for t, n in raw_edges:
+        if n in valid_people:
+            if t not in movie_to_people:
+                movie_to_people[t] = []
+            movie_to_people[t].append(n)
+            
+    # D. Identify valid movies (Knob: MIN_PEOPLE_PER_MOVIE)
+    final_movie_to_people = {
+        t: p_list for t, p_list in movie_to_people.items() 
+        if len(p_list) >= MIN_PEOPLE_PER_MOVIE
+    }
     
-    for t, n in tqdm(raw_edges, desc="Grouping edges"):
-        if t not in movie_to_people:
-            movie_to_people[t] = []
-        movie_to_people[t].append(n)
-        all_nconsts.add(n)
-        all_tconsts.add(t)
+    all_tconsts = sorted(list(final_movie_to_people.keys()))
+    
+    # Re-calculate final person vocabulary based ONLY on surviving movies
+    final_nconsts_set = set()
+    for p_list in final_movie_to_people.values():
+        final_nconsts_set.update(p_list)
         
-    sorted_nconsts = sorted(list(all_nconsts))
-    sorted_tconsts = sorted(list(all_tconsts)) # Ensure deterministic order
-    
+    sorted_nconsts = sorted(list(final_nconsts_set))
     nconst_to_idx = {n: i for i, n in enumerate(sorted_nconsts)}
+    
+    num_movies = len(all_tconsts)
     num_people = len(sorted_nconsts)
     
-    logging.info(f"Vocab: {len(sorted_tconsts)} movies, {num_people} people.")
+    logging.info(f"Final Vocab: {num_movies} movies, {num_people} people.")
+    logging.info(f"Dropped {len(person_counts) - num_people} people and {len(set(t for t,n in raw_edges)) - num_movies} movies during filtering.")
     
     # 5. Precompute Movie Field Tensors
-    # We cannot store raw text efficiently, so we store the tensor outputs of field.transform()
-    
-    # Bulk fetch movie data
     logging.info("Fetching movie metadata...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
-    cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in sorted_tconsts])
+    cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in all_tconsts])
     
-    # Use centralized SQL clause
     sql = f"""
     SELECT 
         {movie_select_clause(alias='t', genre_alias='g')}
@@ -80,29 +101,44 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # Target indices for people
     target_indices_list = []
     
-    # Metadata for Recon
-    idx_to_person_name = {} # Load later
-    
     logging.info("Transforming movie rows...")
     
-    valid_count = 0
-    
-    for r in tqdm(cur, total=len(sorted_tconsts), desc="Processing movies"):
+    # Fetch all relevant rows first to ensure we process them in the sorted order of `all_tconsts`
+    fetched_rows = {}
+    for r in cur:
         row_dict = map_movie_row(r)
-        tconst = row_dict["tconst"]
+        fetched_rows[row_dict["tconst"]] = row_dict
+
+    valid_count = 0
+    missing_count = 0
+    
+    for tconst in tqdm(all_tconsts, desc="Stacking data"):
+        if tconst not in fetched_rows:
+            missing_count += 1
+            continue
+            
+        row_dict = fetched_rows[tconst]
+        
+        # --- CRITICAL FIX ---
+        # Override the SQL-derived 'peopleCount' (which is raw from DB) 
+        # with the ACTUAL filtered count for this specific dataset.
+        people = final_movie_to_people[tconst]
+        row_dict["peopleCount"] = len(people)
+        # --------------------
         
         # Transform fields
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
-            # Transform returns a tensor. Clone to CPU to be safe.
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
         # Get targets
-        people = movie_to_people.get(tconst, [])
         p_idxs = [nconst_to_idx[n] for n in people]
         target_indices_list.append(p_idxs)
         valid_count += 1
+
+    if missing_count > 0:
+        logging.warning(f"{missing_count} movies were in edge list but missing metadata in titles table.")
 
     # Convert lists of tensors to stacked tensors
     logging.info("Stacking tensors...")
@@ -114,6 +150,8 @@ def build_hybrid_cache(cfg: ProjectConfig):
 
     # 6. Fetch Person Names for Recon
     logging.info("Fetching person names...")
+    idx_to_person_name = {}
+    
     cur.execute("CREATE TEMPORARY TABLE temp_people (nconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO temp_people (nconst) VALUES (?)", [(n,) for n in sorted_nconsts])
     cur.execute("SELECT p.nconst, p.primaryName FROM people p JOIN temp_people tp ON tp.nconst = p.nconst")
@@ -124,7 +162,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
     conn.close()
     
-    # 7. Save Field Config state so we can rebuild the model correctly
+    # 7. Save Field Config state
     field_configs = {}
     for f in mov_ae.fields:
         from scripts.autoencoder.row_autoencoder import _field_to_state

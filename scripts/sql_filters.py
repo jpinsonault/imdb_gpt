@@ -16,7 +16,7 @@ def movie_select_clause(alias="t", genre_alias="g") -> str:
     5: averageRating
     6: numVotes
     7: genres (comma separated)
-    8: principalCount (subquery)
+    8: peopleCount (subquery) -- Renamed from principalCount
     """
     return f"""
     {alias}.tconst,
@@ -62,7 +62,7 @@ def map_movie_row(r) -> dict:
         "averageRating": r[5],
         "numVotes": r[6],
         "genres": r[7].split(",") if r[7] else [],
-        "principalCount": r[8],
+        "peopleCount": r[8],
     }
 
 def map_person_row(r) -> dict:
@@ -106,9 +106,9 @@ def movie_where_clause() -> str:
         "AND t.startYear >= 1850 "
         "AND t.averageRating IS NOT NULL "
         "AND t.runtimeMinutes IS NOT NULL "
-        "AND t.runtimeMinutes >= 5 "
+        "AND t.runtimeMinutes >= 10 "
         "AND t.titleType IN ('movie','tvSeries','tvMovie','tvMiniSeries') "
-        "AND t.numVotes >= 10"
+        "AND t.numVotes >= 20"
     )
 
 def movie_group_by() -> str:
@@ -121,7 +121,8 @@ def people_from_join() -> str:
     return "FROM people p LEFT JOIN people_professions pp ON pp.nconst = p.nconst"
 
 def people_where_clause() -> str:
-    return "p.birthYear IS NOT NULL"
+    # Added check for birthYear >= 1800
+    return "p.birthYear IS NOT NULL AND p.birthYear >= 1800"
 
 def people_group_by() -> str:
     return "GROUP BY p.nconst"

@@ -5,12 +5,12 @@ pairs for rows that pass the **same quality filters** as the movie & people
 autoencoders.  In particular we now require:
 
     • non‑NULL   t.averageRating
-    • non‑NULL   t.runtimeMinutes   AND  t.runtimeMinutes ≥ 5
-    • non‑NULL   t.startYear        AND  t.startYear ≥ 1850
+    • non‑NULL   t.runtimeMinutes    AND  t.runtimeMinutes ≥ 5
+    • non‑NULL   t.startYear         AND  t.startYear ≥ 1850
     •            t.titleType ∈ {'movie','tvSeries','tvMovie','tvMiniSeries'}
     •            t.numVotes ≥ 10
-    • at least   1 genre           (INNER JOIN title_genres)
-    • non‑NULL   p.birthYear
+    • at least   1 genre            (INNER JOIN title_genres)
+    • non‑NULL   p.birthYear        AND  p.birthYear >= 1800
 """
 
 from __future__ import annotations
@@ -95,7 +95,8 @@ def estimate_edges(conn: sqlite3.Connection, sample_size: int = 1_000, *, seed: 
             FROM principals pr
             JOIN people p ON p.nconst = pr.nconst
             WHERE pr.tconst = ?
-              AND p.birthYear IS NOT NULL
+              AND p.birthYear IS NOT NULL 
+              AND p.birthYear >= 1800
             """,
             (t,),
         ).fetchone()[0]
@@ -131,6 +132,7 @@ def stream_and_insert_edges(conn: sqlite3.Connection, *, chunk_size: int = INSER
         JOIN   people            p  ON p.nconst  = pr.nconst
         WHERE  {MOVIE_FILTER_CLAUSE}
           AND  p.birthYear IS NOT NULL
+          AND  p.birthYear >= 1800
         GROUP BY pr.tconst, pr.nconst     -- collapse duplicates from multi‑genres
         """
     )
