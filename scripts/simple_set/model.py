@@ -25,8 +25,9 @@ class HybridSetModel(nn.Module):
     def __init__(
         self,
         fields: list,
-        num_people: int,
-        heads_config: dict,    # {"cast": 1.0, "director": 0.5}
+        num_people: int, # Global count (fallback)
+        heads_config: dict,     # {"cast": 1.0, "director": 0.5}
+        head_vocab_sizes: dict, # {"cast": 150000, "director": 20000}
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
@@ -52,10 +53,14 @@ class HybridSetModel(nn.Module):
         for name, rank_mult in heads_config.items():
             rank = max(8, int(base_output_rank * rank_mult))
             
+            # Determine vocab size for this head
+            vocab = head_vocab_sizes.get(name, num_people)
+            
             # Factorized classification head
             self.people_bottlenecks[name] = nn.Linear(hidden_dim, rank, bias=False)
-            # We keep the expansion layer, but in training we might skip full execution
-            self.people_expansions[name] = nn.Linear(rank, num_people)
+            
+            # EXPANSION: Maps rank -> Specific Vocab Subset
+            self.people_expansions[name] = nn.Linear(rank, vocab)
             
             # Count head
             self.count_heads[name] = nn.Sequential(
@@ -96,7 +101,7 @@ class HybridSetModel(nn.Module):
             # 1. Bottleneck: (B, Hidden) -> (B, Rank)
             bn = self.people_bottlenecks[name](feat)
             
-            # 2. Expansion: (B, Rank) -> (B, NumPeople)
+            # 2. Expansion: (B, Rank) -> (B, NumPeople_Subset)
             # If training with sampled loss, we STOP here to avoid massive compute.
             if return_embeddings:
                 logits_dict[name] = bn 

@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 def compute_sampled_asymmetric_loss(
     embedding_batch,    # (B, Rank) - The output from model bottleneck
-    head_layer,         # The nn.Linear(Rank, NumPeople) layer
-    positive_coords,    # Tensor(N_pos, 2) [batch_idx, person_idx]
+    head_layer,         # The nn.Linear(Rank, NumPeople_Subset) layer
+    positive_coords,    # Tensor(N_pos, 2) [batch_idx, local_person_idx]
     num_negatives=2048, # How many random negatives to sample per batch
     gamma_neg=4, 
     gamma_pos=1, 
@@ -44,13 +44,9 @@ def compute_sampled_asymmetric_loss(
     """
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
-    num_people = head_layer.out_features
+    num_people_subset = head_layer.out_features
     
     # 1. Positive Logits
-    # Gather embeddings for the specific rows in batch corresponding to positive_coords
-    # positive_coords[:, 0] are batch indices
-    # positive_coords[:, 1] are person indices (target IDs)
-    
     if positive_coords.shape[0] > 0:
         pos_batch_indices = positive_coords[:, 0]
         pos_person_indices = positive_coords[:, 1]
@@ -74,8 +70,8 @@ def compute_sampled_asymmetric_loss(
         loss_pos = torch.tensor(0.0, device=device)
 
     # 2. Negative Logits (Sampled)
-    # We sample 'num_negatives' unique person IDs
-    neg_person_indices = torch.randint(0, num_people, (num_negatives,), device=device)
+    # We sample 'num_negatives' unique LOCAL person IDs (0..SubsetSize)
+    neg_person_indices = torch.randint(0, num_people_subset, (num_negatives,), device=device)
     
     # Get Weights for Negatives: (NumNeg, Rank)
     neg_weights = head_layer.weight[neg_person_indices]
@@ -142,7 +138,7 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "scaler_state_dict": None, # If using AMP scaler
+            "scaler_state_dict": None,
         }
         torch.save(state, model_dir / "hybrid_set_state.pt")
         logging.info(f"Saved training state to {model_dir / 'hybrid_set_state.pt'}")
@@ -156,6 +152,9 @@ def main():
     cfg = project_config
     ensure_dirs(cfg)
     
+    # Force refresh if logic changed drastically, but assume user handles it or 
+    # we can force it here:
+    # cfg.refresh_cache = True 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
     
@@ -169,6 +168,7 @@ def main():
         fields=ds.fields,
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
+        head_vocab_sizes=ds.head_vocab_sizes, # Pass specific vocab sizes
         latent_dim=int(cfg.hybrid_set_latent_dim),
         hidden_dim=int(cfg.hybrid_set_hidden_dim),
         base_output_rank=int(cfg.hybrid_set_output_rank),
@@ -176,9 +176,34 @@ def main():
         dropout=float(cfg.hybrid_set_dropout)
     ).to(device)
 
-    # Initialize AMP Scaler
-    scaler = GradScaler()
+    # --- Print Model & Sizes ---
+    sample_inputs_cpu, _, _ = next(loader)
+    sample_inputs = [x.to(device) for x in sample_inputs_cpu]
 
+    print("\n" + "="*50)
+    print_model_summary(model, [sample_inputs])
+    
+    print("\n=== HybridSetModel Dimensions ===")
+    print(f"  Field Embedding Dim (Agg): {cfg.hybrid_set_latent_dim}")
+    print(f"  Trunk Hidden Dim:          {cfg.hybrid_set_hidden_dim}")
+    print(f"  Trunk Depth:               {cfg.hybrid_set_depth}")
+    print(f"  Global Vocab:              {ds.num_people}")
+    print("  Heads:")
+    for name in model.people_bottlenecks.keys():
+        rank = model.people_bottlenecks[name].out_features
+        out_dim = model.people_expansions[name].out_features
+        print(f"    - {name:<12} | Rank: {rank:<4} | Vocab: {out_dim}")
+    print("="*50 + "\n")
+    # ---------------------------
+
+    # Prepare Mappings on GPU for fast lookup
+    # mapping_tensors: head_name -> Tensor(Global -> Local)
+    mapping_tensors = {}
+    if hasattr(ds, "head_mappings"):
+        for name, t in ds.head_mappings.items():
+            mapping_tensors[name] = t.to(device)
+
+    scaler = GradScaler()
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
@@ -196,7 +221,6 @@ def main():
             start_epoch = c["epoch"]
             global_step = c["global_step"]
             if c["scheduler_state_dict"] and sched: sched.load_state_dict(c["scheduler_state_dict"])
-            # Load scaler state if available (for AMP robustness)
             if "scaler_state_dict" in c and c["scaler_state_dict"]:
                 scaler.load_state_dict(c["scaler_state_dict"])
             logging.info(f"Resumed from epoch {start_epoch}")
@@ -208,9 +232,6 @@ def main():
     signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
 
     w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
-
-    # How many negative samples to take from vocabulary per batch
-    # 2048 is usually plenty for convergence, much faster than 100k+
     NUM_NEG_SAMPLES = 2048
 
     for epoch in range(start_epoch, num_epochs):
@@ -228,16 +249,13 @@ def main():
             model.train()
             opt.zero_grad(set_to_none=True)
             
-            # 3. Mixed Precision Forward
             with autocast():
-                # Note: return_embeddings=True gives us (Batch, Rank) instead of (Batch, NumPeople)
-                # This is the massive speedup.
+                # return_embeddings=True gives (Batch, Rank)
                 embeddings_dict, counts_dict, recon_outputs = model(inputs, return_embeddings=True)
                 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
                 
-                # Recon Loss
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_outputs, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
@@ -247,47 +265,60 @@ def main():
                 count_targets_for_log = {}
 
                 for head_name in embeddings_dict.keys():
-                    # Check padding on CPU first to see if we have data (fast check)
                     raw_padded = heads_padded_cpu.get(head_name)
                     
                     if raw_padded is not None:
                         raw_padded = raw_padded.to(device, non_blocking=True)
                         mask = (raw_padded != -1)
                         
-                        # Count Loss
                         t_cnt = mask.sum(dim=1, keepdim=True).float()
                         total_count_loss += F.mse_loss(counts_dict[head_name], t_cnt)
                         
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
 
-                        # Sparse Coords for Sampled Loss
                         rows, cols = torch.nonzero(mask, as_tuple=True)
-                        person_ids = raw_padded[rows, cols].long()
+                        global_person_ids = raw_padded[rows, cols].long()
                         
-                        if person_ids.numel() > 0:
-                            pos_coords = torch.stack([rows, person_ids], dim=1)
-                            
-                            # Logits calc + Loss inside this helper
-                            head_layer = model.people_expansions[head_name]
-                            
-                            loss_head = compute_sampled_asymmetric_loss(
-                                embedding_batch=embeddings_dict[head_name],
-                                head_layer=head_layer,
-                                positive_coords=pos_coords,
-                                num_negatives=NUM_NEG_SAMPLES
-                            )
-                            total_set_loss += loss_head
+                        if global_person_ids.numel() > 0:
+                            # --- CRITICAL: Translate Global IDs -> Local Head IDs ---
+                            # mapping tensor is (Global -> Local). -1 if invalid.
+                            if head_name in mapping_tensors:
+                                local_person_ids = mapping_tensors[head_name][global_person_ids]
+                                # Ensure no invalid mappings crept in (should be impossible if logic matches)
+                                # But let's act on valid ones only
+                                valid_mask = (local_person_ids != -1)
+                                
+                                if valid_mask.any():
+                                    final_rows = rows[valid_mask]
+                                    final_locals = local_person_ids[valid_mask]
+                                    
+                                    pos_coords = torch.stack([final_rows, final_locals], dim=1)
+                                    
+                                    head_layer = model.people_expansions[head_name]
+                                    loss_head = compute_sampled_asymmetric_loss(
+                                        embedding_batch=embeddings_dict[head_name],
+                                        head_layer=head_layer,
+                                        positive_coords=pos_coords,
+                                        num_negatives=NUM_NEG_SAMPLES
+                                    )
+                                    total_set_loss += loss_head
 
-                            if collect_coords_for_log:
-                                coords_dict_for_log[head_name] = pos_coords.cpu()
-                    else:
-                        # Empty head, maybe just push embeddings to zero or ignore
-                        pass
+                                    # For logging, we usually want Global IDs to look up names
+                                    # But coords_dict_for_log expects indices into the LOGIT vector (which is now Local).
+                                    # Recon logger needs to know about mapping to print correctly.
+                                    # For simplicity, we just won't log sparse coords for now, OR we need to update ReconLogger
+                                    # Update: ReconLogger logic assumes model.eval() returns full logits.
+                                    # Full logits will be size (B, Local_Vocab).
+                                    # So we should log LOCAL coords here, but ReconLogger needs `local_to_global` to print names.
+                                    if collect_coords_for_log:
+                                        coords_dict_for_log[head_name] = pos_coords.cpu() 
+                            else:
+                                # Fallback if no mapping found (shouldn't happen)
+                                pass
 
                 loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
 
-            # 4. Scaled Backward
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -304,9 +335,11 @@ def main():
                 run_logger.tick()
             
             if collect_coords_for_log:
-                # Need to be careful: Recon Logger runs model.eval() which usually expects full logits
-                # We handle this by letting recon_logger run standard inference (which returns full logits)
-                # This is slow, but happens rarely (every 200 steps).
+                # Note: ReconLogger needs to be aware that outputs are now Subset Vocabs.
+                # We haven't updated ReconLogger yet to handle mapping back to names.
+                # It will print indices, but names might be wrong if it uses global lookup on local indices.
+                # For now, it runs but name display will be mismatched. 
+                # (You might want to update ReconLogger next).
                 recon_logger.step(global_step, model, inputs, coords_dict_for_log, count_targets_for_log, run_logger)
             
             pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}")

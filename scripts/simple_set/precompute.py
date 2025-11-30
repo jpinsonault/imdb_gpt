@@ -67,10 +67,15 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # Bucket by Movie -> Head -> List[Person]
     movie_data = defaultdict(lambda: defaultdict(set))
     
+    # Track which people appear in which head to build subsets
+    # head -> set(nconst)
+    head_populations = defaultdict(set)
+
     for tconst, nconst, category in raw_rows:
         if nconst in valid_people:
             head = _map_category_to_head(category)
             movie_data[tconst][head].add(nconst)
+            head_populations[head].add(nconst)
             
     # Identify valid movies
     final_tconsts = []
@@ -81,20 +86,46 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
     final_tconsts.sort()
     
-    # Build Final Vocab
+    # Build Final Global Vocab
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
             final_nconsts_set.update(p_set)
             
     sorted_nconsts = sorted(list(final_nconsts_set))
-    nconst_to_idx = {n: i for i, n in enumerate(sorted_nconsts)}
+    nconst_to_global_idx = {n: i for i, n in enumerate(sorted_nconsts)}
     
     num_movies = len(final_tconsts)
     num_people = len(sorted_nconsts)
     
-    logging.info(f"Final Vocab: {num_movies} movies, {num_people} people.")
+    logging.info(f"Final Vocab: {num_movies} movies, {num_people} global people.")
     
+    # --- Build Head Subsets & Mappings ---
+    # We create a mapping tensor for each head: Mapping[Global_ID] -> Local_ID
+    # If Global_ID is not in that head, value is -1.
+    head_mappings = {} # head_name -> Tensor(num_people)
+    head_vocab_sizes = {} # head_name -> int
+
+    logging.info("Building head-specific subsets and mappings...")
+    for head, nconsts in head_populations.items():
+        # Only include nconsts that survived the global filter
+        valid_head_nconsts = [n for n in nconsts if n in nconst_to_global_idx]
+        valid_head_nconsts.sort() # Ensure deterministic order
+        
+        local_vocab_size = len(valid_head_nconsts)
+        head_vocab_sizes[head] = local_vocab_size
+        
+        # Create Mapping Tensor: Default -1
+        # Size = Global Vocab Size
+        mapping_tensor = torch.full((num_people,), -1, dtype=torch.long)
+        
+        for local_idx, nconst in enumerate(valid_head_nconsts):
+            global_idx = nconst_to_global_idx[nconst]
+            mapping_tensor[global_idx] = local_idx
+            
+        head_mappings[head] = mapping_tensor
+        logging.info(f"  Head '{head}': {local_vocab_size} people ({local_vocab_size/num_people:.1%} of global).")
+
     # 5. Precompute Movie Field Tensors
     logging.info("Fetching movie metadata...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
@@ -112,12 +143,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     
     field_data = [[] for _ in mov_ae.fields]
     
-    # --- PADDED TENSOR CONSTRUCTION ---
-    # We build dense (NumMovies, MaxLen) tensors per head.
-    # This is much faster to slice in Python than ragged lists.
-
-    # Temporary storage: head -> list of lists (one list of person_idxs per movie)
-    # We initialize with empty lists for all movies to preserve order
+    # Temporary storage: head -> list of lists (one list of GLOBAL idxs per movie)
     temp_heads_lists = defaultdict(lambda: [[] for _ in range(num_movies)])
     
     fetched_rows = {}
@@ -141,9 +167,9 @@ def build_hybrid_cache(cfg: ProjectConfig):
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
-        # 2. Collect Indices per Head
+        # 2. Collect Indices per Head (Store GLOBAL indices here)
         for head_name, nconst_set in heads_data.items():
-            idxs = [nconst_to_idx[n] for n in nconst_set if n in nconst_to_idx]
+            idxs = [nconst_to_global_idx[n] for n in nconst_set if n in nconst_to_global_idx]
             if idxs:
                 temp_heads_lists[head_name][idx] = idxs
 
@@ -153,26 +179,23 @@ def build_hybrid_cache(cfg: ProjectConfig):
         stacked = torch.stack(field_data[i])
         stacked_fields.append(stacked)
 
-    # Build Padded Tensors
+    # Build Padded Tensors (Using GLOBAL indices)
+    # We store global indices in the dataset. We will map them to local indices during training.
     heads_padded = {}
     logging.info("Building padded target tensors...")
     
     for head, lists in temp_heads_lists.items():
         max_len = max(len(l) for l in lists) if lists else 0
-        max_len = max(1, max_len) # Ensure at least 1 column
+        max_len = max(1, max_len) 
         
-        # Use int32 to save space (vocab is usually < 2B)
-        # Fill with PADDING_IDX (-1)
         padded_tensor = torch.full((num_movies, max_len), PADDING_IDX, dtype=torch.int32)
         
         for i, idx_list in enumerate(lists):
             if idx_list:
-                # Copy into tensor row
                 length = len(idx_list)
                 padded_tensor[i, :length] = torch.tensor(idx_list, dtype=torch.int32)
                 
         heads_padded[head] = padded_tensor
-        logging.info(f"Head '{head}': shape {tuple(padded_tensor.shape)}")
 
     # 6. Fetch Names
     logging.info("Fetching person names...")
@@ -182,8 +205,8 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute("SELECT p.nconst, p.primaryName FROM people p JOIN temp_people tp ON tp.nconst = p.nconst")
     
     for n, name in cur:
-        if n in nconst_to_idx:
-            idx_to_person_name[nconst_to_idx[n]] = name
+        if n in nconst_to_global_idx:
+            idx_to_person_name[nconst_to_global_idx[n]] = name
             
     conn.close()
     
@@ -194,9 +217,11 @@ def build_hybrid_cache(cfg: ProjectConfig):
         field_configs[f.name] = _field_to_state(f)
 
     payload = {
-        "num_people": num_people,
+        "num_people": num_people, # Global count
         "stacked_fields": stacked_fields,   
-        "heads_padded": heads_padded,       # New Padded Format
+        "heads_padded": heads_padded,       # Stores Global Indices
+        "head_mappings": head_mappings,     # New: Tensor[Global] -> Local
+        "head_vocab_sizes": head_vocab_sizes, # New: Local sizes
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
         "field_names": [f.name for f in mov_ae.fields]
