@@ -12,21 +12,19 @@ class HybridSetDataset(Dataset):
         logging.info(f"Loading hybrid dataset from {cache_path}...")
         data = torch.load(cache_path, map_location="cpu")
         
-        # Stacked fields: List[Tensor]
+        # Raw Inputs: List[Tensor] 
         self.stacked_fields = data["stacked_fields"] 
-        # heads_padded[head] = Tensor(NumMovies, MaxLen) filled with -1 (Global Indices)
+
+        # Targets: Dict[Head, Tensor]
         self.heads_padded = data["heads_padded"] 
         
-        # Mappings for efficiency (Global -> Local)
         self.head_mappings = data.get("head_mappings", {})
         self.head_vocab_sizes = data.get("head_vocab_sizes", {})
         
-        # Pin memory for faster GPU transfer
         if torch.cuda.is_available():
             logging.info("Pinning dataset memory...")
             self.stacked_fields = [t.pin_memory() for t in self.stacked_fields]
             self.heads_padded = {k: v.pin_memory() for k, v in self.heads_padded.items()}
-            # Pin mappings too
             self.head_mappings = {k: v.pin_memory() for k, v in self.head_mappings.items()}
         
         self.num_people = data["num_people"]
@@ -50,10 +48,6 @@ class HybridSetDataset(Dataset):
 
 
 class FastInfiniteLoader:
-    """
-    A lightweight iterator that replaces DataLoader for in-memory tensor datasets.
-    It slices the tensors directly on the main thread, avoiding multiprocessing overheads.
-    """
     def __init__(self, dataset: HybridSetDataset, batch_size: int, shuffle: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -81,7 +75,7 @@ class FastInfiniteLoader:
         # Slice Inputs (List of Tensors)
         inputs = [t[batch_idx] for t in self.dataset.stacked_fields]
         
-        # Slice Heads (Dict of Tensors) - these are GLOBAL indices
+        # Slice Heads (Dict of Tensors)
         heads_padded_batch = {k: v[batch_idx] for k, v in self.dataset.heads_padded.items()}
         
         return inputs, heads_padded_batch, batch_idx
@@ -90,5 +84,4 @@ class FastInfiniteLoader:
         return (self.n + self.batch_size - 1) // self.batch_size
 
 def collate_hybrid_set(batch_indices, dataset):
-    # Compatibility shim if needed
     pass

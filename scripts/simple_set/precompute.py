@@ -19,10 +19,6 @@ PADDING_IDX = -1          # Value used to pad the dense tensors
 # -------------
 
 def _map_category_to_head(category: str) -> str | None:
-    """
-    Maps raw categories to specific heads. 
-    Returns None for categories we don't track (like 'producer', 'editor', 'crew').
-    """
     category = (category or "").lower().strip()
     if category in ('actor', 'actress', 'self'):
         return 'cast'
@@ -36,7 +32,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.db_path)
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
     
-    # 1. Setup Movie Fields
+    # 1. Setup Movie Fields to learn stats (Vocab, etc.)
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
     mov_ae.accumulate_stats()
@@ -54,24 +50,15 @@ def build_hybrid_cache(cfg: ProjectConfig):
     FROM principals p
     JOIN edges e ON e.tconst = p.tconst AND e.nconst = p.nconst
     """
-    try:
-        cur.execute(sql_edges)
-        raw_rows = cur.fetchall()
-    except sqlite3.OperationalError:
-        logging.error("Could not query joined edges. Ensure 'edges' and 'principals' tables exist.")
-        raise
+    cur.execute(sql_edges)
+    raw_rows = cur.fetchall()
     
     # 4. Filter Data
     logging.info("Filtering and bucketing...")
     person_counts = Counter(r[1] for r in raw_rows)
     valid_people = {n for n, c in person_counts.items() if c >= MIN_PERSON_FREQUENCY}
-    logging.info(f"People filtering: {len(person_counts)} total -> {len(valid_people)} valid")
     
-    # Bucket by Movie -> Head -> List[Person]
     movie_data = defaultdict(lambda: defaultdict(set))
-    
-    # Track which people appear in which head to build subsets
-    # head -> set(nconst)
     head_populations = defaultdict(set)
 
     for tconst, nconst, category in raw_rows:
@@ -81,24 +68,19 @@ def build_hybrid_cache(cfg: ProjectConfig):
                 movie_data[tconst][head].add(nconst)
                 head_populations[head].add(nconst)
             
-    # Identify valid movies
     final_tconsts = []
-    skipped_count = 0
     
     for tconst, heads in movie_data.items():
         # STRICT FILTER: Must have Cast AND Director
         has_cast = len(heads.get('cast', [])) > 0
         has_director = len(heads.get('director', [])) > 0
-        
         if has_cast and has_director:
             final_tconsts.append(tconst)
-        else:
-            skipped_count += 1
             
     final_tconsts.sort()
-    logging.info(f"Movie filtering: Kept {len(final_tconsts)} valid movies (Skipped {skipped_count} missing cast/director).")
+    logging.info(f"Movie filtering: Kept {len(final_tconsts)} valid movies.")
     
-    # Build Final Global Vocab (Recalculate based on filtered movies)
+    # Build Final Global Vocab
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
@@ -110,36 +92,27 @@ def build_hybrid_cache(cfg: ProjectConfig):
     num_movies = len(final_tconsts)
     num_people = len(sorted_nconsts)
     
-    logging.info(f"Final Vocab: {num_movies} movies, {num_people} global people.")
-    
     # --- Build Head Subsets & Mappings ---
-    # We create a mapping tensor for each head: Mapping[Global_ID] -> Local_ID
-    # If Global_ID is not in that head, value is -1.
-    head_mappings = {} # head_name -> Tensor(num_people)
-    head_vocab_sizes = {} # head_name -> int
+    head_mappings = {} 
+    head_vocab_sizes = {} 
 
-    logging.info("Building head-specific subsets and mappings...")
+    logging.info("Building head-specific subsets...")
     for head, nconsts in head_populations.items():
-        # Only include nconsts that survived the global filter
         valid_head_nconsts = [n for n in nconsts if n in nconst_to_global_idx]
-        valid_head_nconsts.sort() # Ensure deterministic order
+        valid_head_nconsts.sort()
         
         local_vocab_size = len(valid_head_nconsts)
         head_vocab_sizes[head] = local_vocab_size
         
-        # Create Mapping Tensor: Default -1
-        # Size = Global Vocab Size
         mapping_tensor = torch.full((num_people,), -1, dtype=torch.long)
-        
         for local_idx, nconst in enumerate(valid_head_nconsts):
             global_idx = nconst_to_global_idx[nconst]
             mapping_tensor[global_idx] = local_idx
             
         head_mappings[head] = mapping_tensor
-        logging.info(f"  Head '{head}': {local_vocab_size} people ({local_vocab_size/num_people:.1%} of global).")
 
-    # 5. Precompute Movie Field Tensors
-    logging.info("Fetching movie metadata...")
+    # 5. Precompute Movie Field Tensors (RAW DATA)
+    logging.info("Stacking raw field tensors...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in final_tconsts])
     
@@ -154,8 +127,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute(sql_meta)
     
     field_data = [[] for _ in mov_ae.fields]
-    
-    # Temporary storage: head -> list of lists (one list of GLOBAL idxs per movie)
     temp_heads_lists = defaultdict(lambda: [[] for _ in range(num_movies)])
     
     fetched_rows = {}
@@ -163,50 +134,39 @@ def build_hybrid_cache(cfg: ProjectConfig):
         row_dict = map_movie_row(r)
         fetched_rows[row_dict["tconst"]] = row_dict
         
-    for idx, tconst in enumerate(tqdm(final_tconsts, desc="Stacking data")):
+    for idx, tconst in enumerate(tqdm(final_tconsts, desc="Stacking")):
         row_dict = fetched_rows.get(tconst)
         if not row_dict: continue
             
         heads_data = movie_data[tconst]
+        row_dict["peopleCount"] = sum(len(s) for s in heads_data.values())
         
-        # Override peopleCount (recalculate based on filtered heads)
-        total_p = sum(len(s) for s in heads_data.values())
-        row_dict["peopleCount"] = total_p
-        
-        # 1. Stack Fields
+        # Stack Fields (Raw transformations)
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
-        # 2. Collect Indices per Head (Store GLOBAL indices here)
+        # Collect Indices
         for head_name, nconst_set in heads_data.items():
             idxs = [nconst_to_global_idx[n] for n in nconst_set if n in nconst_to_global_idx]
             if idxs:
                 temp_heads_lists[head_name][idx] = idxs
 
-    # Stack Input Fields
     stacked_fields = []
     for i, field in enumerate(mov_ae.fields):
         stacked = torch.stack(field_data[i])
         stacked_fields.append(stacked)
 
-    # Build Padded Tensors (Using GLOBAL indices)
-    # We store global indices in the dataset. We will map them to local indices during training.
+    # Build Padded Targets
     heads_padded = {}
-    logging.info("Building padded target tensors...")
-    
     for head, lists in temp_heads_lists.items():
-        max_len = max(len(l) for l in lists) if lists else 0
-        max_len = max(1, max_len) 
-        
+        max_len = max(1, max(len(l) for l in lists) if lists else 0)
         padded_tensor = torch.full((num_movies, max_len), PADDING_IDX, dtype=torch.int32)
-        
         for i, idx_list in enumerate(lists):
             if idx_list:
                 length = len(idx_list)
                 padded_tensor[i, :length] = torch.tensor(idx_list, dtype=torch.int32)
-                
         heads_padded[head] = padded_tensor
 
     # 6. Fetch Names
@@ -222,18 +182,19 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
     conn.close()
     
-    # 7. Field Stats
+    # 7. Field Stats & Save
+    # We DO NOT encode latents here. We save field configs so the model can build the encoder from scratch.
     field_configs = {}
     for f in mov_ae.fields:
         from scripts.autoencoder.row_autoencoder import _field_to_state
         field_configs[f.name] = _field_to_state(f)
 
     payload = {
-        "num_people": num_people, # Global count
-        "stacked_fields": stacked_fields,   
-        "heads_padded": heads_padded,       # Stores Global Indices
-        "head_mappings": head_mappings,     # New: Tensor[Global] -> Local
-        "head_vocab_sizes": head_vocab_sizes, # New: Local sizes
+        "num_people": num_people, 
+        "stacked_fields": stacked_fields,   # Raw Inputs
+        "heads_padded": heads_padded,       # Global Indices
+        "head_mappings": head_mappings,     
+        "head_vocab_sizes": head_vocab_sizes,
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
         "field_names": [f.name for f in mov_ae.fields]

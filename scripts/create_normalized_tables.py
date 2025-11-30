@@ -286,6 +286,51 @@ def populate_principals_and_characters(conn):
     conn.commit()
 
 
+def create_performance_indices(conn):
+    """
+    Creates indices to speed up stats accumulation, training queries, and edge filtering.
+    """
+    print("Creating performance indices... (this may take a minute)")
+    
+    # 1. Accelerate 'movie_where_clause'
+    # Used extensively to filter valid movies during stats & edge building.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_titles_filter 
+        ON titles (titleType, startYear, numVotes, runtimeMinutes, averageRating);
+    """)
+
+    # 2. Accelerate 'people_where_clause'
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_people_filter 
+        ON people (birthYear);
+    """)
+
+    # 3. Principals Lookups
+    # nconst index is critical for "Finding movies for a person"
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_principals_nconst 
+        ON principals (nconst);
+    """)
+    
+    # Note: principals(tconst) is implicitly covered by the PK (tconst, ordering)
+    # for equality checks, but having a dedicated index can sometimes help sorts.
+    # We'll stick to nconst as it's the missing reverse lookup.
+
+    # 4. Accelerate Joins on supporting tables
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_title_genres_tconst 
+        ON title_genres (tconst);
+    """)
+    
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_people_professions_nconst 
+        ON people_professions (nconst);
+    """)
+
+    conn.commit()
+    print("Indices created.")
+
+
 if __name__ == '__main__':
     # 1. Target Database (Normalized)
     db_path = Path(project_config.db_path)
@@ -311,5 +356,8 @@ if __name__ == '__main__':
     populate_crew(conn)
     populate_principals_and_characters(conn)
 
+    # 3) Create Indices for Performance
+    create_performance_indices(conn)
+
     conn.close()
-    print("Normalized tables created and populated successfully.")
+    print("Normalized tables created, populated, and indexed successfully.")

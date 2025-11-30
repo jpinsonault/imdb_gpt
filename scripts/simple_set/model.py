@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from scripts.autoencoder.row_autoencoder import _FieldEncoders, TransformerFieldDecoder
+from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder, _FieldEncoders
 
 class ResBlock(nn.Module):
     def __init__(self, dim, dropout=0.0):
@@ -25,9 +25,9 @@ class HybridSetModel(nn.Module):
     def __init__(
         self,
         fields: list,
-        num_people: int, # Global count (fallback)
-        heads_config: dict,     # {"cast": 1.0, "director": 0.5}
-        head_vocab_sizes: dict, # {"cast": 150000, "director": 20000}
+        num_people: int, 
+        heads_config: dict,     
+        head_vocab_sizes: dict, 
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
@@ -37,32 +37,30 @@ class HybridSetModel(nn.Module):
         super().__init__()
         self.fields = fields
         self.heads_config = heads_config
+        self.latent_dim = latent_dim
         
-        # 1. Encoders
+        # 1. Learnable Encoder (Trained from Scratch)
         self.field_encoder = _FieldEncoders(fields, latent_dim)
+        
+        # 2. Decoder (Regularizer)
         self.field_decoder = TransformerFieldDecoder(fields, latent_dim, num_layers=2, num_heads=4)
         
+        # 3. Trunk
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
         self.trunk = nn.Sequential(*[ResBlock(hidden_dim, dropout) for _ in range(depth)])
         
-        # 2. Multi-Heads
+        # 4. Multi-Heads
         self.people_bottlenecks = nn.ModuleDict()
         self.people_expansions = nn.ModuleDict()
         self.count_heads = nn.ModuleDict()
         
         for name, rank_mult in heads_config.items():
             rank = max(8, int(base_output_rank * rank_mult))
-            
-            # Determine vocab size for this head
             vocab = head_vocab_sizes.get(name, num_people)
             
-            # Factorized classification head
             self.people_bottlenecks[name] = nn.Linear(hidden_dim, rank, bias=False)
-            
-            # EXPANSION: Maps rank -> Specific Vocab Subset
             self.people_expansions[name] = nn.Linear(rank, vocab)
             
-            # Count head
             self.count_heads[name] = nn.Sequential(
                 nn.Linear(hidden_dim, 256),
                 nn.GELU(),
@@ -85,12 +83,15 @@ class HybridSetModel(nn.Module):
     def forward(self, field_tensors: list, return_embeddings: bool = False):
         """
         Args:
-            return_embeddings: If True, returns the bottleneck features (rank) instead of 
-                               projecting to full vocab size. Used for Sampled Loss.
+            field_tensors: List[Tensor] - Raw input fields
         """
+        # 1. Encode fields to Latent Z (E2E training)
         z = self.field_encoder(field_tensors)
+        
+        # 2. Decode Z (Regularization)
         recon_outputs = self.field_decoder(z)
         
+        # 3. Trunk
         feat = self.trunk_proj(z)
         feat = self.trunk(feat)
         
@@ -98,18 +99,14 @@ class HybridSetModel(nn.Module):
         counts_dict = {}
         
         for name in self.people_bottlenecks.keys():
-            # 1. Bottleneck: (B, Hidden) -> (B, Rank)
             bn = self.people_bottlenecks[name](feat)
             
-            # 2. Expansion: (B, Rank) -> (B, NumPeople_Subset)
-            # If training with sampled loss, we STOP here to avoid massive compute.
             if return_embeddings:
                 logits_dict[name] = bn 
             else:
                 logits = self.people_expansions[name](bn)
                 logits_dict[name] = logits
             
-            # Count
             cnt = self.count_heads[name](feat)
             counts_dict[name] = cnt
             
