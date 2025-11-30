@@ -1,43 +1,40 @@
 # scripts/precompute_edges_table.py
-"""
-Populate an `edges` table that only contains (movie tconst, person nconst)
-pairs for rows that pass the **same quality filters** as the movie & people
-autoencoders.  In particular we now require:
-
-    • non‑NULL   t.averageRating
-    • non‑NULL   t.runtimeMinutes    AND  t.runtimeMinutes ≥ 5
-    • non‑NULL   t.startYear         AND  t.startYear ≥ 1850
-    •            t.titleType ∈ {'movie','tvSeries','tvMovie','tvMiniSeries'}
-    •            t.numVotes ≥ 10
-    • at least   1 genre            (INNER JOIN title_genres)
-    • non‑NULL   p.birthYear        AND  p.birthYear >= 1800
-"""
-
 from __future__ import annotations
-import sqlite3, hashlib, random, sys
+import sqlite3
+import hashlib
+import sys
 from pathlib import Path
 from tqdm import tqdm
 from config import project_config
 from scripts.sql_filters import movie_where_clause
 
+# --------------------------------------------------------------------------- #
+# Helpers & Setup
+# --------------------------------------------------------------------------- #
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
 def _hash32(txt: str) -> int:
-    """Fast deterministic 32‑bit hash for shardable integer keys"""
+    """Fast deterministic 32‑bit hash for shardable integer keys."""
+    if txt is None:
+        return 0
     return int(hashlib.md5(txt.encode(), usedforsecurity=False).hexdigest()[:8], 16)
 
+def register_adapters(conn: sqlite3.Connection):
+    """
+    Register the python hash function as a SQL function so we can 
+    compute hashes entirely inside the DB engine (much faster).
+    """
+    conn.create_function("calc_hash", 1, _hash32)
 
 # --------------------------------------------------------------------------- #
-# [1] blank / reset the table
+# [1] Schema Setup
 # --------------------------------------------------------------------------- #
+
 def create_edges_table(conn: sqlite3.Connection) -> None:
-    print("\n[1/4] Creating empty `edges` table …")
+    print("\n[1/5] Creating `edges` schema...")
     conn.execute("DROP TABLE IF EXISTS edges;")
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS edges (
+        CREATE TABLE edges (
             edgeId       INTEGER PRIMARY KEY AUTOINCREMENT,
             tconst       TEXT NOT NULL,
             nconst       TEXT NOT NULL,
@@ -47,151 +44,159 @@ def create_edges_table(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_tconst  ON edges(tconst);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_nconst  ON edges(nconst);")
+    # We delay index creation until AFTER insertion for max speed
     conn.commit()
-    print("    ✓ table & indices ready")
-
 
 # --------------------------------------------------------------------------- #
-# [2] estimate row count (optional, just to show progress)
+# [2 & 3] Pre-Filtering (The Speed Boost)
 # --------------------------------------------------------------------------- #
-MOVIE_FILTER_CLAUSE = movie_where_clause()
 
-def estimate_edges(conn: sqlite3.Connection, sample_size: int = 1_000, *, seed: int = 1234) -> int:
-    print("\n[2/4] Estimating edges from a movie sample …")
+def create_valid_filters(conn: sqlite3.Connection):
+    """
+    Creates temporary tables for valid movies and people.
+    This avoids re-scanning the massive text tables during the join.
+    """
+    print("[2/5] Pre-filtering Valid Movies...")
+    
+    # We use the centralized filter logic
+    movie_filter = movie_where_clause()
+    
+    conn.execute("DROP TABLE IF EXISTS temp_valid_movies")
+    
+    # Create a simple list of tconsts that pass all criteria
+    conn.execute(f"""
+        CREATE TEMPORARY TABLE temp_valid_movies AS
+        SELECT t.tconst
+        FROM titles t
+        JOIN title_genres g ON g.tconst = t.tconst
+        WHERE {movie_filter}
+        GROUP BY t.tconst
+        HAVING COUNT(g.genre) > 0
+    """)
+    conn.execute("CREATE INDEX idx_tvm_tconst ON temp_valid_movies(tconst)")
+    
+    count_m = conn.execute("SELECT COUNT(*) FROM temp_valid_movies").fetchone()[0]
+    print(f"      -> Found {count_m:,} valid movies.")
 
-    # candidate movies that pass **all** filters (same as TitlesAutoencoder)
-    all_titles = [
-        r[0]
-        for r in conn.execute(
-            f"""
-            SELECT t.tconst
-            FROM titles t
-            INNER JOIN title_genres g ON g.tconst = t.tconst
-            WHERE {MOVIE_FILTER_CLAUSE}
-            GROUP BY t.tconst
-            HAVING COUNT(g.genre) > 0
-            """
-        )
-    ]
+    print("[3/5] Pre-filtering Valid People...")
+    conn.execute("DROP TABLE IF EXISTS temp_valid_people")
+    
+    # Filter people by birthYear criteria
+    conn.execute("""
+        CREATE TEMPORARY TABLE temp_valid_people AS
+        SELECT nconst
+        FROM people p
+        WHERE p.birthYear IS NOT NULL 
+          AND p.birthYear >= 1800
+    """)
+    conn.execute("CREATE INDEX idx_tvp_nconst ON temp_valid_people(nconst)")
+    
+    count_p = conn.execute("SELECT COUNT(*) FROM temp_valid_people").fetchone()[0]
+    print(f"      -> Found {count_p:,} valid people.")
+    conn.commit()
 
-    total_movies = len(all_titles)
-    print(f"      movies passing filters: {total_movies:,}")
+# --------------------------------------------------------------------------- #
+# [4] Bulk Insertion with Progress
+# --------------------------------------------------------------------------- #
 
-    if not total_movies:
-        print("      (no candidate movies ‑‑ returning estimate 0)")
-        return 0
-
-    random.seed(seed)
-    sample = random.sample(all_titles, k=min(sample_size, total_movies))
-
-    counts: list[int] = []
+def batch_insert_edges(conn: sqlite3.Connection, batch_size=10_000):
+    print("[4/5] Computing and Inserting Edges...")
+    
+    # 1. Get list of valid movies to iterate over
+    # We iterate over movies (tconst) rather than raw rows to keep batches logical
     cur = conn.cursor()
-    for t in tqdm(sample, desc="      sampling", unit="movie", leave=False):
-        num_people = cur.execute(
-            """
-            SELECT COUNT(DISTINCT pr.nconst)
-            FROM principals pr
-            JOIN people p ON p.nconst = pr.nconst
-            WHERE pr.tconst = ?
-              AND p.birthYear IS NOT NULL 
-              AND p.birthYear >= 1800
-            """,
-            (t,),
-        ).fetchone()[0]
-        counts.append(num_people)
-
-    avg = sum(counts) / len(counts)
-    est_edges = int(round(avg * total_movies))
-
-    print(f"        • sample avg : {avg:.2f} people/movie")
-    print(f"        • est. edges : {est_edges:,}\n")
-    return est_edges
-
-
-# --------------------------------------------------------------------------- #
-# [3] stream through principals & insert
-# --------------------------------------------------------------------------- #
-INSERT_CHUNK = 10_000
-
-def stream_and_insert_edges(conn: sqlite3.Connection, *, chunk_size: int = INSERT_CHUNK) -> None:
-    print("[3/4] Running edge insertion …")
-
-    read_cur  = conn.cursor()
-    write_cur = conn.cursor()
-
-    # The heavy lifting query – mirrors Titles/PeopleAutoencoder filters
-    read_cur.execute(
-        f"""
-        SELECT pr.tconst,
-               pr.nconst
-        FROM   principals        pr
-        JOIN   titles            t  ON t.tconst  = pr.tconst
-        JOIN   title_genres      g  ON g.tconst  = t.tconst   -- ensures ≥1 genre
-        JOIN   people            p  ON p.nconst  = pr.nconst
-        WHERE  {MOVIE_FILTER_CLAUSE}
-          AND  p.birthYear IS NOT NULL
-          AND  p.birthYear >= 1800
-        GROUP BY pr.tconst, pr.nconst     -- collapse duplicates from multi‑genres
-        """
-    )
-
-    bar_format = "{l_bar}{bar}| {n_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-
-    batch: list[tuple[str, str, int, int]] = []
+    cur.execute("SELECT tconst FROM temp_valid_movies")
+    all_movies = [r[0] for r in cur.fetchall()]
+    
     total_inserted = 0
-
-    try:
-        for tconst, nconst in tqdm(read_cur, unit="edge", bar_format=bar_format):
-            batch.append((tconst, nconst, _hash32(tconst), _hash32(nconst)))
-            if len(batch) == chunk_size:
-                write_cur.executemany(
-                    "INSERT INTO edges (tconst, nconst, movie_hash, person_hash) VALUES (?,?,?,?);",
-                    batch,
-                )
-                conn.commit()
-                total_inserted += len(batch)
-                batch.clear()
-
-        # final flush
-        if batch:
-            write_cur.executemany(
-                "INSERT INTO edges (tconst, nconst, movie_hash, person_hash) VALUES (?,?,?,?);",
-                batch,
-            )
-            conn.commit()
-            total_inserted += len(batch)
-
-    except KeyboardInterrupt:
-        print("\n!! Interrupted – committing current chunk …")
-        if batch:
-            write_cur.executemany(
-                "INSERT INTO edges (tconst, nconst, movie_hash, person_hash) VALUES (?,?,?,?);",
-                batch,
-            )
-            conn.commit()
-            total_inserted += len(batch)
-        print(f"      ✓ partial commit ({total_inserted:,} edges) done.")
-        sys.exit(0)
-
-    print(f"      ✓ finished – {total_inserted:,} edges inserted.")
-
+    
+    # 2. Process in chunks
+    # This SQL query does the heavy lifting:
+    #   - Joins principals ONLY against our small temp tables
+    #   - Calculates the hash using the registered Python function
+    #   - Inserts directly
+    insert_sql = """
+        INSERT INTO edges (tconst, nconst, movie_hash, person_hash)
+        SELECT 
+            pr.tconst, 
+            pr.nconst, 
+            calc_hash(pr.tconst), 
+            calc_hash(pr.nconst)
+        FROM principals pr
+        -- Filter by our pre-computed valid lists
+        INNER JOIN temp_valid_people vp ON vp.nconst = pr.nconst
+        WHERE pr.tconst IN ({seq})
+        GROUP BY pr.tconst, pr.nconst
+    """
+    
+    # Using tqdm to show progress through the MOVIE list
+    pbar = tqdm(total=len(all_movies), unit="movies", desc="Processing")
+    
+    for i in range(0, len(all_movies), batch_size):
+        chunk = all_movies[i : i + batch_size]
+        if not chunk:
+            break
+            
+        # Create placeholders for the IN clause
+        placeholders = ",".join(["?"] * len(chunk))
+        query = insert_sql.format(seq=placeholders)
+        
+        cur.execute(query, chunk)
+        total_inserted += cur.rowcount
+        conn.commit()
+        
+        pbar.update(len(chunk))
+        pbar.set_postfix(edges=f"{total_inserted:,}")
+        
+    pbar.close()
+    print(f"      -> Inserted {total_inserted:,} edges.")
 
 # --------------------------------------------------------------------------- #
-# main CLI helper
+# [5] Indexing
 # --------------------------------------------------------------------------- #
-def main() -> None:
+
+def create_indices(conn: sqlite3.Connection):
+    print("[5/5] Building Indices (this may take a moment)...")
+    conn.execute("CREATE INDEX idx_edges_tconst ON edges(tconst);")
+    conn.execute("CREATE INDEX idx_edges_nconst ON edges(nconst);")
+    conn.commit()
+    print("      -> Indices built.")
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
     db_path = Path(project_config.data_dir) / "imdb.db"
+    
+    # Connect with optimizations
     conn = sqlite3.connect(db_path)
-
-    create_edges_table(conn)
-    estimate_edges(conn, sample_size=1_000, seed=1234)
-    stream_and_insert_edges(conn, chunk_size=INSERT_CHUNK)
-
-    conn.close()
-    print("\n[4/4] All done – `edges` table ready.\n")
-
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA cache_size = -64000") # ~64MB cache
+    
+    try:
+        register_adapters(conn)
+        create_edges_table(conn)
+        create_valid_filters(conn)
+        batch_insert_edges(conn, batch_size=25_000)
+        create_indices(conn)
+        
+        # --- Cleanup Section with Logging ---
+        print("[Cleanup] Dropping temporary tables...")
+        conn.execute("DROP TABLE IF EXISTS temp_valid_movies")
+        conn.execute("DROP TABLE IF EXISTS temp_valid_people")
+        
+        print("[Cleanup] Vacuuming database to reclaim disk space (this takes a while)...")
+        conn.execute("VACUUM") 
+        
+        print("\nAll done. `edges` table ready and optimized.")
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
