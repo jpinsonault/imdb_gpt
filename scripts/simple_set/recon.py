@@ -13,9 +13,41 @@ class HybridSetReconLogger:
         self.num_samples = num_samples
         self.w = table_width
         self.threshold = threshold
+        
+        # [Fix 1] Build Inverse Mappings (Local -> Global) for correct name lookup
+        self.inverse_mappings = self._build_inverse_mappings()
 
-    def _get_name(self, idx):
-        return self.dataset.idx_to_name.get(idx, f"ID:{idx}")
+    def _build_inverse_mappings(self):
+        """
+        Inverts the dataset.head_mappings (Global -> Local) to (Local -> Global)
+        so we can look up names from model predictions.
+        """
+        inv_maps = {}
+        if not hasattr(self.dataset, "head_mappings"):
+            return inv_maps
+
+        for head, mapping_tensor in self.dataset.head_mappings.items():
+            # mapping_tensor: index=Global, value=Local (-1 if not in head)
+            # We want: index=Local, value=Global
+            
+            # 1. Find valid entries
+            valid_mask = (mapping_tensor != -1)
+            global_indices = torch.nonzero(valid_mask).squeeze(1)
+            local_indices = mapping_tensor[global_indices]
+            
+            # 2. Create inverse array
+            max_local = local_indices.max().item() if local_indices.numel() > 0 else 0
+            # Initialize with -1
+            inverse = torch.full((max_local + 1,), -1, dtype=torch.long)
+            
+            # 3. Populate
+            inverse[local_indices] = global_indices
+            inv_maps[head] = inverse
+            
+        return inv_maps
+
+    def _get_name(self, global_idx):
+        return self.dataset.idx_to_name.get(global_idx, f"ID:{global_idx}")
 
     def _decode_movie_title(self, field_tensors):
         title, year = "???", ""
@@ -35,7 +67,7 @@ class HybridSetReconLogger:
     def step(self, global_step, model, inputs, coords_dict, count_targets, run_logger):
         """
         inputs: List[Tensor(B, ...)]
-        coords_dict: {head_name: Tensor(N_sparse, 2)} [row_idx, col_idx]
+        coords_dict: {head_name: Tensor(N_sparse, 2)} [row_idx, local_col_idx]
         """
         if (global_step + 1) % self.every != 0: return
         
@@ -56,12 +88,12 @@ class HybridSetReconLogger:
         output_log = []
         
         # Iterate 0..num_samples (since we sliced, these correspond to the chosen indices)
-        for local_idx, global_idx in enumerate(indices):
+        for local_slice_idx, global_batch_idx in enumerate(indices):
             
             # --- Metadata ---
-            # Inputs are already sliced, so use local_idx
-            inp_sample = [t[local_idx].cpu() for t in sliced_inputs]
-            rec_sample = [t[local_idx].cpu() for t in recon_outputs]
+            # Inputs are already sliced, so use local_slice_idx
+            inp_sample = [t[local_slice_idx].cpu() for t in sliced_inputs]
+            rec_sample = [t[local_slice_idx].cpu() for t in recon_outputs]
             movie_title = self._decode_movie_title(inp_sample)
             
             t = PrettyTable(["Field", "Orig", "Recon"])
@@ -74,45 +106,61 @@ class HybridSetReconLogger:
             
             # --- Heads ---
             for head in logits_dict.keys():
-                # Reconstruct True Indices for this sample `global_idx`
-                # We need to look up the original coords using the global batch index
-                true_idxs = set()
+                inv_map = self.inverse_mappings.get(head)
+                
+                # Reconstruct True Indices for this sample `global_batch_idx`
+                # coords_dict has [batch_idx, local_person_idx]
+                true_local_idxs = set()
                 coords = coords_dict.get(head)
                 if coords is not None:
                     if coords.device.type != 'cpu': coords = coords.cpu()
                     
-                    # Filter coords where batch_index == global_idx
-                    mask = (coords[:, 0] == global_idx)
+                    # Filter coords where batch_index == global_batch_idx
+                    mask = (coords[:, 0] == global_batch_idx)
                     if mask.any():
-                        true_idxs = set(coords[mask, 1].numpy().tolist())
+                        true_local_idxs = set(coords[mask, 1].numpy().tolist())
 
                 # Counts
                 tgt_cnt_t = count_targets.get(head)
-                true_count = tgt_cnt_t[global_idx].item() if tgt_cnt_t is not None else 0.0
-                pred_count = counts_dict[head][local_idx].item()
+                true_count = tgt_cnt_t[global_batch_idx].item() if tgt_cnt_t is not None else 0.0
+                pred_count = counts_dict[head][local_slice_idx].item()
 
                 # Get Preds (Dense)
-                # local_idx corresponds to the sliced logits
-                probs = torch.sigmoid(logits_dict[head][local_idx])
+                # local_slice_idx corresponds to the sliced logits
+                probs = torch.sigmoid(logits_dict[head][local_slice_idx])
                 
                 # Fast top-k / thresholding on CPU
-                # We only transfer one row of probs to CPU
                 probs_cpu = probs.float().cpu().numpy()
-                pred_idxs = set(np.where(probs_cpu > self.threshold)[0])
+                pred_local_idxs = set(np.where(probs_cpu > self.threshold)[0])
                 
-                tp = true_idxs & pred_idxs
-                fp = pred_idxs - true_idxs
-                fn = true_idxs - pred_idxs
+                tp_local = true_local_idxs & pred_local_idxs
+                fp_local = pred_local_idxs - true_local_idxs
+                fn_local = true_local_idxs - pred_local_idxs
                 
                 def fmt(idx_set):
-                    l = sorted([(self._get_name(x), probs_cpu[x]) for x in idx_set], key=lambda x:x[1], reverse=True)
-                    return l[:10]
+                    # Convert Local Index -> Global Index -> Name
+                    items = []
+                    for local_idx in idx_set:
+                        p_val = probs_cpu[local_idx]
+                        if inv_map is not None and local_idx < len(inv_map):
+                            global_idx = inv_map[local_idx].item()
+                            if global_idx != -1:
+                                name = self._get_name(global_idx)
+                            else:
+                                name = f"UnkLocal:{local_idx}"
+                        else:
+                            name = f"UnkLocal:{local_idx}"
+                        items.append((name, p_val))
+                    
+                    # Sort by probability
+                    items.sort(key=lambda x:x[1], reverse=True)
+                    return items[:10]
                 
                 output_log.append(f"\n--- Head: {head.upper()} ---")
                 output_log.append(f"Count: True={int(true_count)} Pred={pred_count:.1f}")
-                output_log.append(self._format_list(fmt(tp), "[+] Match"))
-                output_log.append(self._format_list(fmt(fp), "[x] FalsePos"))
-                output_log.append(self._format_list(fmt(fn), "[-] Missed"))
+                output_log.append(self._format_list(fmt(tp_local), "[+] Match"))
+                output_log.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
+                output_log.append(self._format_list(fmt(fn_local), "[-] Missed"))
                 
         full_text = "\n".join(output_log)
         print(full_text)

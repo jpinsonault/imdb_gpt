@@ -95,8 +95,7 @@ class ProjectConfig:
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,
-        "writer": 0.5,
-        "crew": 0.5
+        "writer": 0.5
     })
 
     # Image AE / Siren (unchanged)

@@ -40,16 +40,23 @@ def compute_sampled_asymmetric_loss(
 ):
     """
     Computes Asymmetric Loss using only Positive targets + Random Negative samples.
-    Avoids creating (B, NumPeople) dense tensors.
+    Includes Fix 2 (Edge-based normalization) and Fix 3 (Collision masking).
     """
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
     num_people_subset = head_layer.out_features
     
-    # 1. Positive Logits
+    # --- 1. Positive Logits ---
+    loss_pos = torch.tensor(0.0, device=device)
+    num_pos_edges = 0
+    
+    pos_person_indices = None
+    pos_batch_indices = None
+
     if positive_coords.shape[0] > 0:
         pos_batch_indices = positive_coords[:, 0]
         pos_person_indices = positive_coords[:, 1]
+        num_pos_edges = pos_batch_indices.shape[0]
         
         # Get the Embeddings: (N_pos, Rank)
         pos_embs = embedding_batch[pos_batch_indices]
@@ -64,12 +71,12 @@ def compute_sampled_asymmetric_loss(
         # Pos Loss
         p_pos = torch.sigmoid(pos_logits)
         pos_weight_factor = (1 - p_pos).pow(gamma_pos)
-        loss_pos = -torch.log(p_pos.clamp(min=eps)) * pos_weight_factor
-        loss_pos = loss_pos.sum()
-    else:
-        loss_pos = torch.tensor(0.0, device=device)
+        loss_pos_raw = -torch.log(p_pos.clamp(min=eps)) * pos_weight_factor
+        
+        # [Fix 2] Normalize by number of positive edges, not batch size
+        loss_pos = loss_pos_raw.sum() / max(1.0, float(num_pos_edges))
 
-    # 2. Negative Logits (Sampled)
+    # --- 2. Negative Logits (Sampled) ---
     # We sample 'num_negatives' unique LOCAL person IDs (0..SubsetSize)
     neg_person_indices = torch.randint(0, num_people_subset, (num_negatives,), device=device)
     
@@ -81,18 +88,38 @@ def compute_sampled_asymmetric_loss(
     # (B, Rank) @ (Rank, NumNeg) -> (B, NumNeg)
     neg_logits = embedding_batch @ neg_weights.t() + neg_biases
     
-    # Neg Loss
+    # Neg Loss calculation
     p_neg = torch.sigmoid(neg_logits)
     p_neg_clipped = p_neg.clone()
     p_neg_clipped[p_neg < clip] = 0.0
     neg_weight_factor = p_neg_clipped.pow(gamma_neg)
-    loss_neg = -torch.log((1 - p_neg).clamp(min=eps)) * neg_weight_factor
+    loss_neg_matrix = -torch.log((1 - p_neg).clamp(min=eps)) * neg_weight_factor
     
-    # Sum over negatives, average over batch
-    loss_neg = loss_neg.sum()
+    # [Fix 3] Collision Masking
+    # If a sampled negative is actually a positive for a specific batch item, we must zero the loss.
+    if pos_person_indices is not None:
+        # Check overlaps: (N_pos, 1) == (1, NumNeg) -> (N_pos, NumNeg)
+        # This creates a boolean matrix of where true positives match sampled negatives
+        collisions = (pos_person_indices.unsqueeze(1) == neg_person_indices.unsqueeze(0))
+        
+        # If any collisions exist
+        if collisions.any():
+            # Find coordinates of collisions in the (N_pos, NumNeg) matrix
+            match_pos_idx, match_neg_idx = torch.nonzero(collisions, as_tuple=True)
+            
+            # Map back to batch index using pos_batch_indices
+            affected_batch_idxs = pos_batch_indices[match_pos_idx]
+            
+            # Create a mask for the final loss matrix (B, NumNeg)
+            # Initialize to 1 (valid), set collisions to 0 (invalid)
+            # We can zero out the loss directly in the matrix
+            loss_neg_matrix[affected_batch_idxs, match_neg_idx] = 0.0
 
-    # Normalize by batch size
-    return (loss_pos + loss_neg) / batch_size
+    # Sum over negatives, average over batch
+    # We normalize negatives by batch size because they represent the "background" signal
+    loss_neg = loss_neg_matrix.sum() / batch_size
+
+    return loss_pos + loss_neg
 
 # -----------------------------
 

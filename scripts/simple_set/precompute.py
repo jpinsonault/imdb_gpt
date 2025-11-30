@@ -15,11 +15,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # --- KNOBS ---
 MIN_PERSON_FREQUENCY = 3  # A person must appear in at least this many movies
-MIN_PEOPLE_PER_MOVIE = 1  # A movie must have at least this many valid people
 PADDING_IDX = -1          # Value used to pad the dense tensors
 # -------------
 
-def _map_category_to_head(category: str) -> str:
+def _map_category_to_head(category: str) -> str | None:
+    """
+    Maps raw categories to specific heads. 
+    Returns None for categories we don't track (like 'producer', 'editor', 'crew').
+    """
     category = (category or "").lower().strip()
     if category in ('actor', 'actress', 'self'):
         return 'cast'
@@ -27,7 +30,7 @@ def _map_category_to_head(category: str) -> str:
         return 'director'
     if category == 'writer':
         return 'writer'
-    return 'crew'
+    return None
 
 def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.db_path)
@@ -74,19 +77,28 @@ def build_hybrid_cache(cfg: ProjectConfig):
     for tconst, nconst, category in raw_rows:
         if nconst in valid_people:
             head = _map_category_to_head(category)
-            movie_data[tconst][head].add(nconst)
-            head_populations[head].add(nconst)
+            if head is not None:
+                movie_data[tconst][head].add(nconst)
+                head_populations[head].add(nconst)
             
     # Identify valid movies
     final_tconsts = []
+    skipped_count = 0
+    
     for tconst, heads in movie_data.items():
-        total_people = sum(len(s) for s in heads.values())
-        if total_people >= MIN_PEOPLE_PER_MOVIE:
+        # STRICT FILTER: Must have Cast AND Director
+        has_cast = len(heads.get('cast', [])) > 0
+        has_director = len(heads.get('director', [])) > 0
+        
+        if has_cast and has_director:
             final_tconsts.append(tconst)
+        else:
+            skipped_count += 1
             
     final_tconsts.sort()
+    logging.info(f"Movie filtering: Kept {len(final_tconsts)} valid movies (Skipped {skipped_count} missing cast/director).")
     
-    # Build Final Global Vocab
+    # Build Final Global Vocab (Recalculate based on filtered movies)
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
@@ -157,7 +169,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
         heads_data = movie_data[tconst]
         
-        # Override peopleCount
+        # Override peopleCount (recalculate based on filtered heads)
         total_p = sum(len(s) for s in heads_data.values())
         row_dict["peopleCount"] = total_p
         
