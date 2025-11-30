@@ -282,8 +282,8 @@ def main():
             opt_embed.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda'):
-                # E2E Forward
-                logits_dict, counts_dict, recon_outputs, (z_enc, z_table) = model(
+                # E2E Forward (Now returns Dual Reconstructions)
+                logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table) = model(
                     field_tensors=inputs, 
                     batch_indices=indices_cpu, 
                     return_embeddings=True
@@ -292,15 +292,19 @@ def main():
                 total_set_loss = 0.0
                 total_count_loss = 0.0
                 
-                # A. Decoder Regularization (Reconstruction)
-                # Ensure the Table Latent (z_table) can reconstruct the inputs
+                # A. Decoder Regularization (Dual Path)
                 recon_loss = 0.0
-                for f, p, t in zip(ds.fields, recon_outputs, inputs):
+                # 1. Table reconstruction (Memory integrity)
+                for f, p, t in zip(ds.fields, recon_table, inputs):
+                    recon_loss += f.compute_loss(p, t) * float(f.weight)
+                # 2. Encoder reconstruction (Perception validity)
+                for f, p, t in zip(ds.fields, recon_enc, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
                 
-                # B. Alignment Loss (Distillation)
-                # Encoder tries to predict the Table Latent.
-                # z_table.detach() prevents encoder from dragging the table.
+                # Average the two paths so gradient magnitude is similar to before
+                recon_loss = recon_loss * 0.5 
+
+                # B. Alignment Loss (MSE)
                 align_loss = F.mse_loss(z_enc, z_table.detach())
 
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
@@ -388,6 +392,7 @@ def main():
                 run_logger.tick()
             
             if collect_coords_for_log:
+                # Note: We pass recon_table to logger (implicit, as recon_logger calls model() internally)
                 recon_logger.step(global_step, model, inputs, indices_cpu, coords_dict_for_log, count_targets_for_log, run_logger)
             
             pbar.set_postfix(

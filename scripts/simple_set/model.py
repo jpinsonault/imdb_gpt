@@ -27,12 +27,12 @@ class HybridSetModel(nn.Module):
         self,
         fields: list,
         num_people: int, 
-        heads_config: dict,       
+        heads_config: dict,        
         head_vocab_sizes: dict, 
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
-        depth: int = 12,        
+        depth: int = 12,         
         dropout: float = 0.0,
         num_movies: int = 0
     ):
@@ -113,7 +113,7 @@ class HybridSetModel(nn.Module):
             field_tensors: List[Tensor] - Raw input fields
             batch_indices: Tensor[Batch] - Global indices of movies (Required)
         Returns:
-            logits_dict, counts_dict, recon_outputs, (z_enc, z_table)
+            logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table)
         """
         if batch_indices is None:
             raise ValueError("batch_indices is required for Embedding Table lookup.")
@@ -125,13 +125,17 @@ class HybridSetModel(nn.Module):
         # B. Encode Fields (Perception)
         z_enc = self.field_encoder(field_tensors)
         
-        # C. Decode / Regularize
-        # We decode from the TABLE latent to ensure the table stays grounded in field semantics.
-        # (i.e. The table must contain enough info to reconstruct the title/year/etc)
-        recon_outputs = self.field_decoder(z_table)
+        # C. Decode / Regularize (Dual Path)
+        # 1. Decode Table: Ensures Table holds semantic info (Memory Integrity)
+        recon_table = self.field_decoder(z_table)
         
-        # D. Trunk & Heads
-        # The Trunk uses the TABLE latent for the main task (people prediction)
+        # 2. Decode Encoder: Ensures Encoder generates valid latents (Perception Validity)
+        # This allows gradients to flow from the Decoder -> Encoder directly.
+        recon_enc = self.field_decoder(z_enc)
+        
+        # D. Trunk & Heads (Driven by Table Memory)
+        # We generally want the Table to drive the set prediction task
+        # so the Table becomes the "Master Key"
         feat = self.trunk_proj(z_table)
         feat = self.trunk(feat)
         
@@ -149,4 +153,4 @@ class HybridSetModel(nn.Module):
             cnt = self.count_heads[name](feat)
             counts_dict[name] = cnt
             
-        return logits_dict, counts_dict, recon_outputs, (z_enc, z_table)
+        return logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table)

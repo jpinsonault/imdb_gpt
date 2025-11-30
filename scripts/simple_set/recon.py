@@ -87,9 +87,12 @@ class HybridSetReconLogger:
         
         # 3. Run model ONLY on the slice (Cheap!)
         # We allow full dense expansion here because batch size is tiny (e.g. 3)
-        # Unpack 4 return values
-        logits_dict, counts_dict, recon_outputs, _ = model(sliced_inputs, batch_indices=sliced_batch_indices)
+        # UPDATED: Unpack 5 return values
+        logits_dict, counts_dict, recon_table, recon_enc, _ = model(sliced_inputs, batch_indices=sliced_batch_indices)
         
+        # We visualize the Table Reconstruction (Memory) to ensure the table learned the movie stats
+        recon_outputs = recon_table 
+
         output_log = []
         
         # Iterate 0..num_samples (since we sliced, these correspond to the chosen indices)
@@ -101,7 +104,7 @@ class HybridSetReconLogger:
             rec_sample = [t[local_slice_idx].cpu() for t in recon_outputs]
             movie_title = self._decode_movie_title(inp_sample)
             
-            t = PrettyTable(["Field", "Orig", "Recon"])
+            t = PrettyTable(["Field", "Orig", "Recon (Table)"])
             t.align = "l"
             for f, orig, rec in zip(self.dataset.fields, inp_sample, rec_sample):
                 t.add_row([f.name, f.render_ground_truth(orig)[:40], f.render_prediction(rec)[:40]])
