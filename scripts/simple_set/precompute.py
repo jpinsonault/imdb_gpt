@@ -14,8 +14,9 @@ from scripts.sql_filters import movie_select_clause, map_movie_row
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # --- KNOBS ---
-MIN_PERSON_FREQUENCY = 3  # A person must appear in at least this many movies (across all roles)
+MIN_PERSON_FREQUENCY = 3  # A person must appear in at least this many movies
 MIN_PEOPLE_PER_MOVIE = 1  # A movie must have at least this many valid people
+PADDING_IDX = -1          # Value used to pad the dense tensors
 # -------------
 
 def _map_category_to_head(category: str) -> str:
@@ -32,7 +33,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.db_path)
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
     
-    # 1. Setup Movie Fields using the Autoencoder class
+    # 1. Setup Movie Fields
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
     mov_ae.accumulate_stats()
@@ -111,12 +112,13 @@ def build_hybrid_cache(cfg: ProjectConfig):
     
     field_data = [[] for _ in mov_ae.fields]
     
-    # --- RAGGED TENSOR CONSTRUCTION ---
-    # Instead of list-of-dicts, we build 1D flat arrays + offsets for each head
-    # This allows O(1) slicing in the dataloader without iterating Python objects
-    
-    # Temporary storage
-    temp_heads = defaultdict(list) # head -> list of (movie_idx, list_of_person_idxs)
+    # --- PADDED TENSOR CONSTRUCTION ---
+    # We build dense (NumMovies, MaxLen) tensors per head.
+    # This is much faster to slice in Python than ragged lists.
+
+    # Temporary storage: head -> list of lists (one list of person_idxs per movie)
+    # We initialize with empty lists for all movies to preserve order
+    temp_heads_lists = defaultdict(lambda: [[] for _ in range(num_movies)])
     
     fetched_rows = {}
     for r in cur:
@@ -139,13 +141,11 @@ def build_hybrid_cache(cfg: ProjectConfig):
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
-        # 2. Collect Ragged Data
+        # 2. Collect Indices per Head
         for head_name, nconst_set in heads_data.items():
             idxs = [nconst_to_idx[n] for n in nconst_set if n in nconst_to_idx]
             if idxs:
-                # We store just the list of indices. 
-                # We will flatten this later.
-                temp_heads[head_name].append((idx, idxs))
+                temp_heads_lists[head_name][idx] = idxs
 
     # Stack Input Fields
     stacked_fields = []
@@ -153,54 +153,26 @@ def build_hybrid_cache(cfg: ProjectConfig):
         stacked = torch.stack(field_data[i])
         stacked_fields.append(stacked)
 
-    # Flatten Targets into Ragged Tensors (Values + Offsets)
-    # structure: heads_ragged[head] = {'flat': Tensor, 'offsets': Tensor, 'lengths': Tensor}
-    # Offsets array size = num_movies + 1. 
-    # offsets[i] -> start index for movie i. 
-    # offsets[i+1] -> end index for movie i.
+    # Build Padded Tensors
+    heads_padded = {}
+    logging.info("Building padded target tensors...")
     
-    heads_ragged = {}
-    
-    logging.info("Flattening target indices into tensors...")
-    
-    # We need to ensure every movie has an entry in the offsets, even if empty.
-    # The temp_heads only contains non-empty entries.
-    
-    unique_heads = list(temp_heads.keys())
-    
-    for head in unique_heads:
-        # 1. Create lists for all movies (dense list of lists)
-        # Using a list comprehension is faster than dict lookups in a loop
-        # But we need to map back to the movie index `idx` from the loop above.
+    for head, lists in temp_heads_lists.items():
+        max_len = max(len(l) for l in lists) if lists else 0
+        max_len = max(1, max_len) # Ensure at least 1 column
         
-        # Re-organize temp_heads into a dense lookup
-        # movie_idx -> [p1, p2...]
-        dense_map = {}
-        for m_idx, p_list in temp_heads[head]:
-            dense_map[m_idx] = p_list
-            
-        flat_values = []
-        lengths = []
+        # Use int32 to save space (vocab is usually < 2B)
+        # Fill with PADDING_IDX (-1)
+        padded_tensor = torch.full((num_movies, max_len), PADDING_IDX, dtype=torch.int32)
         
-        for i in range(num_movies):
-            p_list = dense_map.get(i, [])
-            flat_values.extend(p_list)
-            lengths.append(len(p_list))
-            
-        # Convert to tensors
-        flat_tensor = torch.tensor(flat_values, dtype=torch.long)
-        lengths_tensor = torch.tensor(lengths, dtype=torch.long)
-        
-        # Compute offsets (cumulative sum)
-        # offsets[0] = 0, offsets[1] = len(movie_0), etc.
-        offsets_tensor = torch.zeros(num_movies + 1, dtype=torch.long)
-        offsets_tensor[1:] = torch.cumsum(lengths_tensor, dim=0)
-        
-        heads_ragged[head] = {
-            "flat": flat_tensor,
-            "offsets": offsets_tensor,
-            "lengths": lengths_tensor # Useful for counts
-        }
+        for i, idx_list in enumerate(lists):
+            if idx_list:
+                # Copy into tensor row
+                length = len(idx_list)
+                padded_tensor[i, :length] = torch.tensor(idx_list, dtype=torch.int32)
+                
+        heads_padded[head] = padded_tensor
+        logging.info(f"Head '{head}': shape {tuple(padded_tensor.shape)}")
 
     # 6. Fetch Names
     logging.info("Fetching person names...")
@@ -224,7 +196,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     payload = {
         "num_people": num_people,
         "stacked_fields": stacked_fields,   
-        "heads_ragged": heads_ragged,       # Optimized sparse storage
+        "heads_padded": heads_padded,       # New Padded Format
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
         "field_names": [f.name for f in mov_ae.fields]

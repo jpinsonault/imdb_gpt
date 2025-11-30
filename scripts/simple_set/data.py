@@ -13,8 +13,8 @@ class HybridSetDataset(Dataset):
         data = torch.load(cache_path, map_location="cpu")
         
         self.stacked_fields = data["stacked_fields"] 
-        # heads_ragged[head] = {'flat': T, 'offsets': T, 'lengths': T}
-        self.heads_ragged = data["heads_ragged"] 
+        # heads_padded[head] = Tensor(NumMovies, MaxLen) filled with -1
+        self.heads_padded = data["heads_padded"] 
         
         self.num_people = data["num_people"]
         self.idx_to_name = data["idx_to_person_name"]
@@ -37,78 +37,51 @@ class HybridSetDataset(Dataset):
 
 def collate_hybrid_set(batch_indices, dataset):
     """
-    Optimized Collate:
+    Optimized Collate using Padded Tensors:
     1. Slices inputs (fast).
-    2. Slices ragged target arrays to get indices (fast).
-    3. Returns coordinates (indices) for sparse construction on GPU.
+    2. Slices padded target arrays (fast).
+    3. Uses masked selection to generate sparse coords without Python loops.
     """
     # 1. Inputs
     indices_t = torch.tensor(batch_indices, dtype=torch.long)
     batch_inputs = [t[indices_t] for t in dataset.stacked_fields]
     
     # 2. Targets (Sparse Coordinates)
-    # We want to return:
-    #   coords_dict[head] -> Tensor(N_total_targets, 2) where cols are [batch_idx, person_idx]
+    # Return:
+    #   coords_dict[head] -> Tensor(N_total_targets, 2) [batch_idx, person_idx]
     #   counts_dict[head] -> Tensor(B, 1)
     
     coords_dict = {}
     counts_dict = {}
     
-    for head, ragged in dataset.heads_ragged.items():
-        flat = ragged['flat']
-        offsets = ragged['offsets']
-        lengths = ragged['lengths']
+    for head, padded_tensor in dataset.heads_padded.items():
+        # Slice the batch: (B, MaxLen)
+        batch_padded = padded_tensor[indices_t]
         
-        # A. Counts (Easy slicing)
-        # lengths is (NumMovies,), we slice (B,)
-        batch_lengths = lengths[indices_t]
-        counts_dict[head] = batch_lengths.float().unsqueeze(1)
+        # Create mask for valid entries (not -1)
+        mask = (batch_padded != -1)
         
-        # B. Indices (Complex slicing optimized)
-        # We need to extract the segments for each batch item from `flat`.
-        # Since the batch_indices might be random (shuffled), the segments are scattered.
+        # A. Counts: Simply sum the mask
+        counts = mask.sum(dim=1, keepdim=True).float()
+        counts_dict[head] = counts
         
-        # Get start/end for each item in batch
-        starts = offsets[indices_t]
-        ends = offsets[indices_t + 1]
+        # B. Indices: Vectorized coordinate generation
+        # torch.nonzero returns indices where mask is True.
+        # Since we want (batch_idx, person_idx), we construct it manually 
+        # to ensure we get the values from batch_padded.
         
-        # We create a mask or index selection.
-        # Since PyTorch doesn't have a vectorized "slice multiple ranges" easily without padding,
-        # we can use a loop in Python (fast enough for batch size 512) or 
-        # use repeat_interleave if we want pure torch.
+        # This gets us the indices (row_in_batch, col_in_padded)
+        nonzero_indices = torch.nonzero(mask, as_tuple=True)
+        row_indices = nonzero_indices[0] 
+        col_indices = nonzero_indices[1]
         
-        # repeat_interleave approach:
-        # Create row indices: [0, 0, 0, 1, 2, 2...]
-        row_indices = torch.repeat_interleave(
-            torch.arange(len(batch_indices), dtype=torch.long), 
-            batch_lengths
-        )
+        # Extract actual person IDs using the mask/indices
+        person_ids = batch_padded[row_indices, col_indices]
         
-        if row_indices.numel() > 0:
-            # Construct the gather indices for the 'flat' tensor.
-            # We need to generate [start[0]...end[0], start[1]...end[1], ...]
-            # This logic is tricky to vectorize fully efficiently.
-            # A semi-vectorized approach:
-            
-            # 1. Create a base ranges tensor
-            # This is often the bottleneck. 
-            # Fastest Python-loop approach usually wins for Ragged tensors in Dataloaders:
-            
-            gathered_values = []
-            for i, (s, e) in enumerate(zip(starts.tolist(), ends.tolist())):
-                if e > s:
-                    gathered_values.append(flat[s:e])
-            
-            if gathered_values:
-                col_indices = torch.cat(gathered_values)
-                # Ensure row_indices matches col_indices length (it should by definition)
-                assert row_indices.size(0) == col_indices.size(0)
-                
-                # Stack: (N, 2) -> [row, col]
-                coords = torch.stack([row_indices, col_indices], dim=1)
-                coords_dict[head] = coords
-            else:
-                coords_dict[head] = torch.empty((0, 2), dtype=torch.long)
+        # We generally want coords to be int64 (Long) for downstream embedding lookups
+        if person_ids.numel() > 0:
+            coords = torch.stack([row_indices, person_ids.long()], dim=1)
+            coords_dict[head] = coords
         else:
             coords_dict[head] = torch.empty((0, 2), dtype=torch.long)
 
