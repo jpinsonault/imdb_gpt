@@ -97,6 +97,9 @@ def compute_sampled_asymmetric_loss(
 # -----------------------------
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
+    """
+    Creates a learning rate scheduler.
+    """
     if total_steps is None: return None
     total_steps = max(1, int(total_steps))
     schedule = (schedule or "").lower()
@@ -113,7 +116,9 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
         s = int(step)
         if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
         if s >= total_steps: return min_factor
+        if w_steps >= total_steps: return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
         decay = 0.5 * (1.0 + math.cos(math.pi * t))
         return min_factor + (1.0 - min_factor) * decay
 
@@ -121,7 +126,9 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
         s = int(step)
         if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
         if s >= total_steps: return min_factor
+        if w_steps >= total_steps: return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
         return max(min_factor, 1.0 - (1.0 - min_factor) * t)
 
     lr_lambda = cosine_lambda if schedule == "cosine" else linear_lambda
@@ -209,7 +216,16 @@ def main():
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
-    sched = make_lr_scheduler(opt, batches_per_epoch * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
+    
+    # Scheduler: Cosine is standard for this. Steps per batch.
+    sched = make_lr_scheduler(
+        opt, 
+        total_steps=batches_per_epoch * num_epochs, 
+        schedule=cfg.lr_schedule, 
+        warmup_steps=cfg.lr_warmup_steps, 
+        warmup_ratio=cfg.lr_warmup_ratio, 
+        min_factor=cfg.lr_min_factor
+    )
 
     start_epoch, global_step = 0, 0
     ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
@@ -263,6 +279,9 @@ def main():
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
                 coords_dict_for_log = {}
                 count_targets_for_log = {}
+                
+                # Metrics for this batch
+                head_metrics = {}
 
                 for head_name in embeddings_dict.keys():
                     raw_padded = heads_padded_cpu.get(head_name)
@@ -272,7 +291,11 @@ def main():
                         mask = (raw_padded != -1)
                         
                         t_cnt = mask.sum(dim=1, keepdim=True).float()
-                        total_count_loss += F.mse_loss(counts_dict[head_name], t_cnt)
+                        
+                        # Count Loss per head
+                        c_loss = F.mse_loss(counts_dict[head_name], t_cnt)
+                        total_count_loss += c_loss
+                        head_metrics[f"{head_name}_count"] = c_loss.detach()
                         
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
@@ -282,11 +305,8 @@ def main():
                         
                         if global_person_ids.numel() > 0:
                             # --- CRITICAL: Translate Global IDs -> Local Head IDs ---
-                            # mapping tensor is (Global -> Local). -1 if invalid.
                             if head_name in mapping_tensors:
                                 local_person_ids = mapping_tensors[head_name][global_person_ids]
-                                # Ensure no invalid mappings crept in (should be impossible if logic matches)
-                                # But let's act on valid ones only
                                 valid_mask = (local_person_ids != -1)
                                 
                                 if valid_mask.any():
@@ -303,18 +323,11 @@ def main():
                                         num_negatives=NUM_NEG_SAMPLES
                                     )
                                     total_set_loss += loss_head
+                                    head_metrics[f"{head_name}_bce"] = loss_head.detach()
 
-                                    # For logging, we usually want Global IDs to look up names
-                                    # But coords_dict_for_log expects indices into the LOGIT vector (which is now Local).
-                                    # Recon logger needs to know about mapping to print correctly.
-                                    # For simplicity, we just won't log sparse coords for now, OR we need to update ReconLogger
-                                    # Update: ReconLogger logic assumes model.eval() returns full logits.
-                                    # Full logits will be size (B, Local_Vocab).
-                                    # So we should log LOCAL coords here, but ReconLogger needs `local_to_global` to print names.
                                     if collect_coords_for_log:
                                         coords_dict_for_log[head_name] = pos_coords.cpu() 
                             else:
-                                # Fallback if no mapping found (shouldn't happen)
                                 pass
 
                 loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
@@ -329,20 +342,25 @@ def main():
             
             if run_logger:
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
-                run_logger.add_scalar("loss/set", total_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/count_total", total_count_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
+                
+                # Log Learning Rate
+                current_lr = opt.param_groups[0]['lr']
+                run_logger.add_scalar("lr/group_0", current_lr, global_step)
+
+                # Log Per-Head Breakdown
+                for k, v in head_metrics.items():
+                    run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
+
                 run_logger.tick()
             
             if collect_coords_for_log:
-                # Note: ReconLogger needs to be aware that outputs are now Subset Vocabs.
-                # We haven't updated ReconLogger yet to handle mapping back to names.
-                # It will print indices, but names might be wrong if it uses global lookup on local indices.
-                # For now, it runs but name display will be mismatched. 
-                # (You might want to update ReconLogger next).
                 recon_logger.step(global_step, model, inputs, coords_dict_for_log, count_targets_for_log, run_logger)
             
-            pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.2e}")
             global_step += 1
             
             if global_step % int(cfg.hybrid_set_save_interval) == 0:
