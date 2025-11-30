@@ -71,27 +71,27 @@ class ProjectConfig:
     seq_decoder_w_recon: float = 1.0
     seq_decoder_w_presence: float = 1.0
 
-    # --- Hybrid Set Model Settings ---
     hybrid_set_epochs: int = 100
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0 
     
     # Architecture
-    hybrid_set_latent_dim: int = 128      # Output of Transformer Aggregator
-    hybrid_set_hidden_dim: int = 1024     # Width of ResNet Trunk
-    hybrid_set_depth: int = 12            # Depth of ResNet Trunk
-    hybrid_set_output_rank: int = 64      # Base Rank for output heads
+    hybrid_set_latent_dim: int = 128
+    hybrid_set_hidden_dim: int = 1024
+    hybrid_set_depth: int = 12
+    hybrid_set_output_rank: int = 64
     hybrid_set_dropout: float = 0.0
     
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05
     
+    # [NEW] Focal Loss Gamma (Minimal Improvement)
+    hybrid_set_focal_gamma: float = 4.0
+    
     hybrid_set_save_interval: int = 500
     hybrid_set_recon_interval: int = 200
 
-    # Defines which heads to build and their relative rank multipliers
-    # e.g., Cast is complex (1.0), Director is simpler (0.5)
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,

@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
@@ -26,63 +27,53 @@ from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def compute_sampled_asymmetric_loss(
-    embedding_batch,    
-    head_layer,         
-    positive_coords,    
-    num_negatives=2048, 
-    gamma_neg=4, 
-    gamma_pos=1, 
-    clip=0.05, 
-    eps=1e-8
+def compute_dense_focal_loss(
+    embedding_batch, 
+    head_layer, 
+    raw_padded_indices, 
+    mapping_tensor, 
+    vocab_size,
+    gamma=2.0
 ):
+    """
+    A minimal improvement over BCE: Dense Focal Loss.
+    
+    Why: In a vocab of 10,000 people, a movie only has ~5 cast members.
+    Standard BCE is dominated by the 9,995 'easy' negatives (zeros).
+    Focal loss down-weights these easy negatives using (1 - p_t)^gamma,
+    preventing the model from just predicting 'zero' everywhere.
+    """
     device = embedding_batch.device
-    batch_size = embedding_batch.shape[0]
-    num_people_subset = head_layer.out_features
-    
-    loss_pos = torch.tensor(0.0, device=device)
-    num_pos_edges = 0
-    
-    pos_person_indices = None
-    pos_batch_indices = None
+    B = embedding_batch.shape[0]
 
-    if positive_coords.shape[0] > 0:
-        pos_batch_indices = positive_coords[:, 0]
-        pos_person_indices = positive_coords[:, 1]
-        num_pos_edges = pos_batch_indices.shape[0]
-        
-        pos_embs = embedding_batch[pos_batch_indices]
-        pos_weights = head_layer.weight[pos_person_indices]
-        pos_biases = head_layer.bias[pos_person_indices] if head_layer.bias is not None else 0.0
-        
-        pos_logits = (pos_embs * pos_weights).sum(dim=1) + pos_biases
-        
-        p_pos = torch.sigmoid(pos_logits)
-        pos_weight_factor = (1 - p_pos).pow(gamma_pos)
-        loss_pos_raw = -torch.log(p_pos.clamp(min=eps)) * pos_weight_factor
-        loss_pos = loss_pos_raw.sum() / max(1.0, float(num_pos_edges))
+    # 1. Compute Logits
+    logits = head_layer(embedding_batch)
 
-    neg_person_indices = torch.randint(0, num_people_subset, (num_negatives,), device=device)
-    neg_weights = head_layer.weight[neg_person_indices]
-    neg_biases = head_layer.bias[neg_person_indices] if head_layer.bias is not None else 0.0
+    # 2. Create Dense Targets
+    targets = torch.zeros((B, vocab_size), device=device, dtype=torch.float32)
+    valid_mask = (raw_padded_indices != -1)
     
-    neg_logits = embedding_batch @ neg_weights.t() + neg_biases
-    
-    p_neg = torch.sigmoid(neg_logits)
-    p_neg_clipped = p_neg.clone()
-    p_neg_clipped[p_neg < clip] = 0.0
-    neg_weight_factor = p_neg_clipped.pow(gamma_neg)
-    loss_neg_matrix = -torch.log((1 - p_neg).clamp(min=eps)) * neg_weight_factor
-    
-    if pos_person_indices is not None:
-        collisions = (pos_person_indices.unsqueeze(1) == neg_person_indices.unsqueeze(0))
-        if collisions.any():
-            match_pos_idx, match_neg_idx = torch.nonzero(collisions, as_tuple=True)
-            affected_batch_idxs = pos_batch_indices[match_pos_idx]
-            loss_neg_matrix[affected_batch_idxs, match_neg_idx] = 0.0
+    if valid_mask.any():
+        rows, cols = torch.nonzero(valid_mask, as_tuple=True)
+        global_ids = raw_padded_indices[rows, cols].long()
+        local_ids = mapping_tensor[global_ids]
+        
+        map_mask = (local_ids != -1)
+        final_rows = rows[map_mask]
+        final_locals = local_ids[map_mask]
+        
+        targets[final_rows, final_locals] = 1.0
 
-    loss_neg = loss_neg_matrix.sum() / batch_size
-    return loss_pos + loss_neg
+    # 3. Compute BCE (element-wise, no reduction yet)
+    bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    
+    # 4. Apply Focal Term
+    pt = torch.exp(-bce_loss) # pt is the probability of the *true* class
+    focal_term = (1.0 - pt).pow(gamma)
+    
+    # 5. Weighted Loss
+    return (focal_term * bce_loss).mean()
+
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None: return None
@@ -150,9 +141,8 @@ def main():
     cfg = project_config
     ensure_dirs(cfg)
     
-    # E2E Training requires fresh cache of RAW fields if forcing new run
     if args.no_resume:
-        cfg.refresh_cache = False  # DO NOT refresh cache, just reset weights
+        cfg.refresh_cache = False  
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
@@ -180,18 +170,6 @@ def main():
 
     print("\n" + "="*50)
     print_model_summary(model, [sample_inputs])
-    
-    print("\n=== HybridSetModel Dimensions (End-to-End) ===")
-    print(f"  Input:                 Raw Fields")
-    print(f"  Learned Latent Dim:    {cfg.hybrid_set_latent_dim}")
-    print(f"  Trunk Hidden Dim:      {cfg.hybrid_set_hidden_dim}")
-    print(f"  Trunk Depth:           {cfg.hybrid_set_depth}")
-    print(f"  Global Vocab:          {ds.num_people}")
-    print("  Heads:")
-    for name in model.people_bottlenecks.keys():
-        rank = model.people_bottlenecks[name].out_features
-        out_dim = model.people_expansions[name].out_features
-        print(f"    - {name:<12} | Rank: {rank:<4} | Vocab: {out_dim}")
     print("="*50 + "\n")
     # ---------------------------
 
@@ -239,33 +217,27 @@ def main():
     signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
 
     w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
-    NUM_NEG_SAMPLES = 2048
+    focal_gamma = float(cfg.hybrid_set_focal_gamma)
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         
         for _ in pbar:
             iter_start = time.perf_counter()
-            
-            # 1. Fetch data (RAW FIELDS)
             inputs_cpu, heads_padded_cpu, _ = next(loader)
-            
-            # 2. Transfer to GPU
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
             
             model.train()
             opt.zero_grad(set_to_none=True)
             
             with autocast():
-                # E2E: Pass raw inputs to model. 
-                # Model encodes them -> Z -> Trunk -> Heads
                 embeddings_dict, counts_dict, recon_outputs = model(inputs, return_embeddings=True)
                 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
-                
-                # Decoder Regularization Loss: Compare decoded fields to inputs
                 recon_loss = 0.0
+                
+                # Recon Loss
                 for f, p, t in zip(ds.fields, recon_outputs, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
                 
@@ -290,35 +262,32 @@ def main():
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
 
-                        # Set Loss
-                        rows, cols = torch.nonzero(mask, as_tuple=True)
-                        global_person_ids = raw_padded[rows, cols].long()
-                        
-                        if global_person_ids.numel() > 0:
-                            if head_name in mapping_tensors:
-                                local_person_ids = mapping_tensors[head_name][global_person_ids]
-                                valid_mask = (local_person_ids != -1)
-                                
-                                if valid_mask.any():
-                                    final_rows = rows[valid_mask]
-                                    final_locals = local_person_ids[valid_mask]
-                                    
-                                    pos_coords = torch.stack([final_rows, final_locals], dim=1)
-                                    
-                                    head_layer = model.people_expansions[head_name]
-                                    loss_head = compute_sampled_asymmetric_loss(
-                                        embedding_batch=embeddings_dict[head_name],
-                                        head_layer=head_layer,
-                                        positive_coords=pos_coords,
-                                        num_negatives=NUM_NEG_SAMPLES
-                                    )
-                                    total_set_loss += loss_head
-                                    head_metrics[f"{head_name}_bce"] = loss_head.detach()
+                        # --- DENSE FOCAL LOSS ---
+                        if head_name in mapping_tensors:
+                            head_layer = model.people_expansions[head_name]
+                            vocab_size = head_layer.out_features
+                            
+                            loss_head = compute_dense_focal_loss(
+                                embedding_batch=embeddings_dict[head_name],
+                                head_layer=head_layer,
+                                raw_padded_indices=raw_padded,
+                                mapping_tensor=mapping_tensors[head_name],
+                                vocab_size=vocab_size,
+                                gamma=focal_gamma
+                            )
+                            
+                            total_set_loss += loss_head
+                            head_metrics[f"{head_name}_focal"] = loss_head.detach()
 
-                                    if collect_coords_for_log:
-                                        coords_dict_for_log[head_name] = pos_coords.cpu() 
+                            if collect_coords_for_log:
+                                rows, cols = torch.nonzero(mask, as_tuple=True)
+                                global_ids = raw_padded[rows, cols].long()
+                                local_ids = mapping_tensors[head_name][global_ids]
+                                valid_map = (local_ids != -1)
+                                coords_dict_for_log[head_name] = torch.stack(
+                                    [rows[valid_map], local_ids[valid_map]], dim=1
+                                ).cpu()
 
-                # Combine losses
                 loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
 
             scaler.scale(loss).backward()
@@ -334,7 +303,6 @@ def main():
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
                 run_logger.add_scalar("loss/count_total", total_count_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
-                run_logger.add_scalar("time/iter", iter_time, global_step)
                 current_lr = opt.param_groups[0]['lr']
                 run_logger.add_scalar("lr/group_0", current_lr, global_step)
                 for k, v in head_metrics.items():
