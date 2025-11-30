@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder, _FieldEncoders
 
@@ -32,7 +33,7 @@ class HybridSetModel(nn.Module):
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
-        depth: int = 12,         
+        depth: int = 12,          
         dropout: float = 0.0,
         num_movies: int = 0
     ):
@@ -120,9 +121,12 @@ class HybridSetModel(nn.Module):
 
         # A. Lookup Table Latent (Memory)
         # Note: self.movie_embeddings might be on CPU. We handle the move to GPU here.
-        z_table = self.movie_embeddings(batch_indices.cpu()).to(self.trunk_proj.weight.device)
+        # FIX: Normalize the table latent to place it on the same hypersphere as the Encoder (which uses LayerNorm)
+        raw_z_table = self.movie_embeddings(batch_indices.cpu()).to(self.trunk_proj.weight.device)
+        z_table = F.normalize(raw_z_table, p=2, dim=-1)
 
         # B. Encode Fields (Perception)
+        # _FieldEncoders ends with LayerNorm, so z_enc is already roughly unit length
         z_enc = self.field_encoder(field_tensors)
         
         # C. Decode / Regularize (Dual Path)

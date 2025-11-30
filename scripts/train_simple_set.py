@@ -27,18 +27,93 @@ from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+class FieldMasker:
+    """
+    Applies field dropout to simulate partial information during training.
+    """
+    def __init__(self, fields, device, probability=0.0, always_drop_names=None):
+        self.fields = fields
+        self.device = device
+        self.prob = probability
+        self.num_fields = len(fields)
+        
+        # Identify indices to always drop (like 'tconst' which is a leak)
+        self.always_drop_indices = []
+        if always_drop_names:
+            for i, f in enumerate(fields):
+                if f.name in always_drop_names:
+                    self.always_drop_indices.append(i)
+        
+        # Precompute padding tensors on device
+        self.pad_values = []
+        for f in self.fields:
+            self.pad_values.append(f.get_base_padding_value().to(device))
+
+    def __call__(self, inputs):
+        """
+        inputs: List[Tensor], where inputs[i] corresponds to self.fields[i]
+        """
+        # Always mask 'always_drop_indices' regardless of probability
+        
+        B = inputs[0].shape[0]
+        
+        # 1. Create Bernoulli Mask (1 = keep, 0 = drop)
+        keep_prob = 1.0 - self.prob
+        mask = torch.bernoulli(torch.full((B, self.num_fields), keep_prob, device=self.device))
+        
+        # 2. Enforce Always Drop
+        for idx in self.always_drop_indices:
+            mask[:, idx] = 0.0
+            
+        # 3. Safety: Force at least one field to be kept per sample.
+        # We don't want to force-keep 'always_drop' fields though.
+        valid_indices = [i for i in range(self.num_fields) if i not in self.always_drop_indices]
+        
+        if valid_indices:
+            # Check rows where everything is 0
+            all_dropped = (mask.sum(dim=1) == 0)
+            if all_dropped.any():
+                # For completely empty rows, pick one random valid field to keep
+                rows_to_fix = torch.nonzero(all_dropped).squeeze(1)
+                
+                # Pick random index from valid_indices for each row
+                rand_select = torch.randint(0, len(valid_indices), (rows_to_fix.size(0),), device=self.device)
+                
+                # Map back to global field indices
+                valid_tensor = torch.tensor(valid_indices, device=self.device)
+                indices_to_keep = valid_tensor[rand_select]
+                
+                mask[rows_to_fix, indices_to_keep] = 1.0
+        
+        masked_inputs = []
+        for i, (x, pad_val) in enumerate(zip(inputs, self.pad_values)):
+            # x shape: (B, D1, D2...)
+            # mask shape: (B,) -> reshape for broadcasting
+            m_col = mask[:, i]
+            
+            # View mask as (B, 1, 1...) to match dimensions of x
+            view_shape = [B] + [1] * (x.dim() - 1)
+            m_view = m_col.view(*view_shape)
+            
+            # Mix: (x * mask) + (pad * (1 - mask))
+            # Cast mask to input dtype to prevent Float/Long type mismatch error
+            m_typed = m_view.to(x.dtype)
+            pad_typed = pad_val.unsqueeze(0).to(x.dtype)
+
+            x_masked = x * m_typed + pad_typed * (1 - m_typed)
+            masked_inputs.append(x_masked)
+            
+        return masked_inputs
+
 def compute_sampled_asymmetric_loss(
     embedding_batch,    
     head_layer,          
-    positive_coords,     
+    positive_coords,      
     num_negatives=2048, 
     gamma_neg=2.0,  # Focus on hard negatives
     gamma_pos=0.0,  # Do NOT downweight positives
     eps=1e-8
 ):
-    """
-    Computes BCE loss over specific positive coordinates and random negative samples.
-    """
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
     num_vocab = head_layer.out_features
@@ -48,16 +123,12 @@ def compute_sampled_asymmetric_loss(
         pos_b_idx = positive_coords[:, 0]
         pos_p_idx = positive_coords[:, 1]
         
-        # Gather embeddings for the specific batch items involved in positives
         pos_embs = embedding_batch[pos_b_idx] 
-        # Gather weights/biases for the specific positive targets
         pos_w = head_layer.weight[pos_p_idx]
         pos_b = head_layer.bias[pos_p_idx] if head_layer.bias is not None else 0.0
         
-        # Dot product
         pos_logits = (pos_embs * pos_w).sum(dim=1) + pos_b
         
-        # Asymmetric Loss on Positives
         pos_probs = torch.sigmoid(pos_logits)
         pos_loss_raw = -torch.log(pos_probs.clamp(min=eps))
         if gamma_pos > 0:
@@ -68,16 +139,12 @@ def compute_sampled_asymmetric_loss(
         loss_pos = torch.tensor(0.0, device=device)
 
     # --- NEGATIVES ---
-    # We sample indices [0, vocab_size]
     neg_p_idx = torch.randint(0, num_vocab, (num_negatives,), device=device)
-    
     neg_w = head_layer.weight[neg_p_idx]
     neg_b = head_layer.bias[neg_p_idx] if head_layer.bias is not None else 0.0
     
-    # Calculate logits for ALL batch items against THESE negatives
     neg_logits = embedding_batch @ neg_w.t() + neg_b
     
-    # Asymmetric Loss on Negatives
     neg_probs = torch.sigmoid(neg_logits)
     neg_loss_raw = -torch.log((1 - neg_probs).clamp(min=eps))
     
@@ -193,21 +260,15 @@ def main():
     # 1. Move Network to GPU, Enforce CPU Embeddings
     logging.info("Initializing Split Optimization (Net=GPU, Table=CPU)...")
     model.to(device)
-    
-    # Explicitly move embedding table back to CPU to ensure memory constraints
-    # (PyTorch .to() moves everything recursively, so we undo that for the table)
     model.movie_embeddings.to("cpu")
     
     # 2. Setup Optimizers
-    # Network parameters (everything except the table)
     params_net = [p for n, p in model.named_parameters() if "movie_embeddings" not in n]
     opt_net = torch.optim.AdamW(params_net, lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
     
-    # Embedding parameters
     params_embed = [model.movie_embeddings.weight]
     opt_embed = torch.optim.AdamW(params_embed, lr=float(cfg.hybrid_set_table_lr))
 
-    # --- Print Model & Sizes ---
     sample_inputs_cpu, _, sample_idx = next(loader)
     sample_inputs = [x.to(device) for x in sample_inputs_cpu]
     
@@ -226,7 +287,6 @@ def main():
 
     num_epochs = int(cfg.hybrid_set_epochs)
     
-    # Scheduler applies to the Network optimizer
     sched = make_lr_scheduler(
         opt_net, 
         total_steps=batches_per_epoch * num_epochs, 
@@ -265,24 +325,34 @@ def main():
     w_recon = 1.0
     NUM_NEG_SAMPLES = 2048
 
+    # --- INIT FIELD MASKER ---
+    # We explicitly drop 'tconst' to prevent leakage.
+    # The model must learn to identify the movie latent from other metadata.
+    field_masker = FieldMasker(
+        fields=ds.fields, 
+        device=device, 
+        probability=float(getattr(cfg, "hybrid_set_field_dropout", 0.0)),
+        always_drop_names=["tconst"]
+    )
+    logging.info(f"Field Dropout: {field_masker.prob}. Always drop: {field_masker.always_drop_indices}")
+
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         
         for _ in pbar:
             iter_start = time.perf_counter()
             
-            # 1. Fetch data
             inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
-            
-            # 2. Transfer Inputs to GPU (Indices stay CPU for Table lookup)
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
+            
+            # Apply Masking
+            inputs = field_masker(inputs)
             
             model.train()
             opt_net.zero_grad(set_to_none=True)
             opt_embed.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda'):
-                # E2E Forward (Now returns Dual Reconstructions)
                 logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table) = model(
                     field_tensors=inputs, 
                     batch_indices=indices_cpu, 
@@ -292,19 +362,13 @@ def main():
                 total_set_loss = 0.0
                 total_count_loss = 0.0
                 
-                # A. Decoder Regularization (Dual Path)
                 recon_loss = 0.0
-                # 1. Table reconstruction (Memory integrity)
                 for f, p, t in zip(ds.fields, recon_table, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
-                # 2. Encoder reconstruction (Perception validity)
                 for f, p, t in zip(ds.fields, recon_enc, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
-                
-                # Average the two paths so gradient magnitude is similar to before
                 recon_loss = recon_loss * 0.5 
 
-                # B. Alignment Loss (MSE)
                 align_loss = F.mse_loss(z_enc, z_table.detach())
 
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
@@ -312,16 +376,13 @@ def main():
                 count_targets_for_log = {}
                 head_metrics = {}
 
-                # C. Set Prediction (Trunk + Heads)
                 for head_name in logits_dict.keys():
                     raw_padded = heads_padded_cpu.get(head_name)
-                    
                     if raw_padded is not None:
                         raw_padded = raw_padded.to(device, non_blocking=True)
                         mask = (raw_padded != -1)
                         t_cnt = mask.sum(dim=1, keepdim=True).float()
                         
-                        # Count Loss
                         c_loss = F.mse_loss(counts_dict[head_name], t_cnt)
                         total_count_loss += c_loss
                         head_metrics[f"{head_name}_count"] = c_loss.detach()
@@ -329,17 +390,14 @@ def main():
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
 
-                        # Set Loss (Sampled BCE)
                         rows, cols = torch.nonzero(mask, as_tuple=True)
                         global_person_ids = raw_padded[rows, cols].long()
-                        
                         pos_coords = torch.empty((0, 2), dtype=torch.long, device=device)
 
                         if global_person_ids.numel() > 0:
                             if head_name in mapping_tensors:
                                 local_person_ids = mapping_tensors[head_name][global_person_ids]
                                 valid_mask = (local_person_ids != -1)
-                                
                                 if valid_mask.any():
                                     final_rows = rows[valid_mask]
                                     final_locals = local_person_ids[valid_mask]
@@ -361,24 +419,17 @@ def main():
                         if collect_coords_for_log:
                             coords_dict_for_log[head_name] = pos_coords.cpu() 
 
-                # Combine losses
                 loss = (w_bce * total_set_loss) + \
                        (w_count * total_count_loss) + \
                        (w_recon * recon_loss) + \
                        (w_align * align_loss)
 
             scaler.scale(loss).backward()
-            
-            # Step Network (GPU)
             scaler.step(opt_net)
-            
-            # Step Embeddings (CPU)
             opt_embed.step()
-
             scaler.update()
             
             if sched: sched.step()
-            
             iter_time = time.perf_counter() - iter_start
             
             if run_logger:
@@ -392,7 +443,6 @@ def main():
                 run_logger.tick()
             
             if collect_coords_for_log:
-                # Note: We pass recon_table to logger (implicit, as recon_logger calls model() internally)
                 recon_logger.step(global_step, model, inputs, indices_cpu, coords_dict_for_log, count_targets_for_log, run_logger)
             
             pbar.set_postfix(
