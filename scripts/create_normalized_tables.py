@@ -114,6 +114,7 @@ def create_normalized_schema(conn):
 def populate_titles_and_genres(conn):
     # Insert into titles with ratings included
     # We do a LEFT JOIN on raw_title_ratings so that titles with no rating remain valid
+    # Reads from attached 'raw' database
     insert_titles = """
     INSERT INTO titles (
         tconst,
@@ -138,14 +139,14 @@ def populate_titles_and_genres(conn):
         b.runtimeMinutes,
         r.averageRating,
         r.numVotes
-    FROM raw_title_basics b
-    LEFT JOIN raw_title_ratings r ON b.tconst = r.tconst;
+    FROM raw.raw_title_basics b
+    LEFT JOIN raw.raw_title_ratings r ON b.tconst = r.tconst;
     """
     conn.execute(insert_titles)
 
     # Now populate title_genres
     cursor = conn.cursor()
-    cursor.execute("SELECT tconst, genres FROM raw_title_basics WHERE genres IS NOT NULL;")
+    cursor.execute("SELECT tconst, genres FROM raw.raw_title_basics WHERE genres IS NOT NULL;")
     rows = cursor.fetchall()
     for (tconst, genres_str) in tqdm(rows, desc="Populating title_genres"):
         genres = genres_str.split(',')
@@ -178,8 +179,8 @@ def populate_episodes(conn):
         e.episodeNumber,
         r.averageRating,
         r.numVotes
-    FROM raw_title_episode e
-    LEFT JOIN raw_title_ratings r ON e.tconst = r.tconst;
+    FROM raw.raw_title_episode e
+    LEFT JOIN raw.raw_title_ratings r ON e.tconst = r.tconst;
     """
     conn.execute(insert_episodes)
     conn.commit()
@@ -190,13 +191,13 @@ def populate_people(conn):
     insert_people = """
     INSERT INTO people (nconst, primaryName, birthYear, deathYear)
     SELECT nconst, primaryName, birthYear, deathYear
-    FROM raw_name_basics;
+    FROM raw.raw_name_basics;
     """
     conn.execute(insert_people)
 
     # Split primaryProfession => people_professions
     cursor = conn.cursor()
-    cursor.execute("SELECT nconst, primaryProfession FROM raw_name_basics WHERE primaryProfession IS NOT NULL;")
+    cursor.execute("SELECT nconst, primaryProfession FROM raw.raw_name_basics WHERE primaryProfession IS NOT NULL;")
     rows = cursor.fetchall()
     for (nconst, prof_string) in tqdm(rows, desc="Populating people_professions"):
         profs = prof_string.split(',')
@@ -209,7 +210,7 @@ def populate_people(conn):
                 """, (nconst, p))
 
     # Split knownForTitles => people_known_for
-    cursor.execute("SELECT nconst, knownForTitles FROM raw_name_basics WHERE knownForTitles IS NOT NULL;")
+    cursor.execute("SELECT nconst, knownForTitles FROM raw.raw_name_basics WHERE knownForTitles IS NOT NULL;")
     rows = cursor.fetchall()
     for (nconst, kft_string) in tqdm(rows, desc="Populating people_known_for"):
         tconsts = kft_string.split(',')
@@ -227,7 +228,7 @@ def populate_people(conn):
 def populate_crew(conn):
     # Expand raw_title_crew's comma-separated directors/writers into multiple rows
     cursor = conn.cursor()
-    cursor.execute("SELECT tconst, directors, writers FROM raw_title_crew;")
+    cursor.execute("SELECT tconst, directors, writers FROM raw.raw_title_crew;")
     rows = cursor.fetchall()
     for (tconst, directors_str, writers_str) in tqdm(rows, desc="Populating crew"):
         if directors_str and directors_str != '\\N':
@@ -255,7 +256,7 @@ def populate_principals_and_characters(conn):
     insert_principals = """
     INSERT INTO principals (tconst, ordering, nconst, category, job)
     SELECT tconst, ordering, nconst, category, job
-    FROM raw_title_principals;
+    FROM raw.raw_title_principals;
     """
     conn.execute(insert_principals)
 
@@ -263,7 +264,7 @@ def populate_principals_and_characters(conn):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT tconst, ordering, nconst, characters
-        FROM raw_title_principals
+        FROM raw.raw_title_principals
         WHERE characters IS NOT NULL
     """)
     rows = cursor.fetchall()
@@ -286,15 +287,24 @@ def populate_principals_and_characters(conn):
 
 
 if __name__ == '__main__':
-    data_dir = Path(project_config.data_dir)
-    db_path = data_dir / 'imdb.db'
+    # 1. Target Database (Normalized)
+    db_path = Path(project_config.db_path)
+    # 2. Source Database (Raw)
+    raw_db_path = Path(project_config.raw_db_path)
 
+    print(f"Creating normalized tables in: {db_path}")
+    print(f"Reading raw data from:       {raw_db_path}")
+
+    # Connect to training/normalized DB
     conn = sqlite3.connect(db_path)
+
+    # Attach the raw DB to this connection
+    conn.execute(f"ATTACH DATABASE '{raw_db_path}' AS raw")
 
     # 1) Create the new normalized schema (with averageRating/numVotes in titles + episodes)
     create_normalized_schema(conn)
 
-    # 2) Populate each table
+    # 2) Populate each table using attached raw DB
     populate_titles_and_genres(conn)
     populate_episodes(conn)
     populate_people(conn)

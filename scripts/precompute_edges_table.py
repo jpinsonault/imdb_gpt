@@ -167,7 +167,10 @@ def create_indices(conn: sqlite3.Connection):
 # --------------------------------------------------------------------------- #
 
 def main():
-    db_path = Path(project_config.data_dir) / "imdb.db"
+    # Updated to use the config path
+    db_path = Path(project_config.db_path)
+    
+    print(f"Connecting to training database: {db_path}")
     
     # Connect with optimizations
     conn = sqlite3.connect(db_path)

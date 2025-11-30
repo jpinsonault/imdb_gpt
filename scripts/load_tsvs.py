@@ -304,6 +304,8 @@ def load_db_files(db_path, file_paths):
     """
     Create new raw_* tables and load IMDb data files into them.
     """
+    print(f"Loading raw data into: {db_path}")
+    
     if file_paths.get('title_basics'):
         load_raw_title_basics(db_path, file_paths['title_basics'])
 
@@ -330,10 +332,13 @@ def load_db_files(db_path, file_paths):
 
 
 if __name__ == '__main__':
+    # Use raw_db_path for loading raw data
+    db_path = Path(project_config.raw_db_path)
     data_dir = Path(project_config.data_dir)
-    db_path = data_dir / 'imdb.db'
-    
     tsv_dir = data_dir / 'imdb_tsvs'
+    
+    # Ensure parent dir exists
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_paths = {
         'title_basics'    : tsv_dir / 'title.basics.tsv',

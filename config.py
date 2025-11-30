@@ -7,7 +7,11 @@ from pathlib import Path
 @dataclass
 class ProjectConfig:
     data_dir: str = "data"
-    db_path: str = "data/imdb.db"
+    
+    # --- Database Paths ---
+    raw_db_path: str = "data/raw.db"    # For raw TSV imports
+    db_path: str = "data/imdb.db"       # For normalized training tables & edges
+    
     model_dir: str = "models"
 
     batch_size: int = 512

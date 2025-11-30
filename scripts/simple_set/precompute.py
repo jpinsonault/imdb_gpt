@@ -19,7 +19,8 @@ MIN_PEOPLE_PER_MOVIE = 1  # A movie must have at least this many valid people
 # -------------
 
 def build_hybrid_cache(cfg: ProjectConfig):
-    db_path = Path(cfg.data_dir) / "imdb.db"
+    # Updated to use cfg.db_path
+    db_path = Path(cfg.db_path)
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
     
     # 1. Setup Movie Fields using the Autoencoder class
@@ -35,8 +36,12 @@ def build_hybrid_cache(cfg: ProjectConfig):
     
     # 3. Get valid edges (Movie <-> Person)
     logging.info("Fetching edges...")
-    cur.execute("SELECT tconst, nconst FROM edges")
-    raw_edges = cur.fetchall()
+    try:
+        cur.execute("SELECT tconst, nconst FROM edges")
+        raw_edges = cur.fetchall()
+    except sqlite3.OperationalError:
+        logging.error("Could not find 'edges' table. Did you run 'scripts/precompute_edges_table.py'?")
+        raise
     
     # 4. Filter Data (The Knobs)
     logging.info("Filtering edges...")
