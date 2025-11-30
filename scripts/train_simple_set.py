@@ -12,9 +12,10 @@ from pathlib import Path
 from dataclasses import asdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+import torch.amp 
 
 from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
@@ -37,7 +38,6 @@ def compute_sampled_asymmetric_loss(
 ):
     """
     Computes BCE loss over specific positive coordinates and random negative samples.
-    Uses Asymmetric/Focal logic to handle sparsity.
     """
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
@@ -57,8 +57,7 @@ def compute_sampled_asymmetric_loss(
         # Dot product
         pos_logits = (pos_embs * pos_w).sum(dim=1) + pos_b
         
-        # Asymmetric Loss on Positives (Usually simple BCE, gamma=0)
-        # Loss = -log(p) * (1-p)^gamma
+        # Asymmetric Loss on Positives
         pos_probs = torch.sigmoid(pos_logits)
         pos_loss_raw = -torch.log(pos_probs.clamp(min=eps))
         if gamma_pos > 0:
@@ -76,36 +75,25 @@ def compute_sampled_asymmetric_loss(
     neg_b = head_layer.bias[neg_p_idx] if head_layer.bias is not None else 0.0
     
     # Calculate logits for ALL batch items against THESE negatives
-    # (Batch, Dim) @ (Negs, Dim).T -> (Batch, Negs)
     neg_logits = embedding_batch @ neg_w.t() + neg_b
     
-    # Asymmetric Loss on Negatives (Focal, gamma=2 to suppress easy negatives)
-    # Target is 0. Loss = -log(1-p) * p^gamma
+    # Asymmetric Loss on Negatives
     neg_probs = torch.sigmoid(neg_logits)
     neg_loss_raw = -torch.log((1 - neg_probs).clamp(min=eps))
     
     if gamma_neg > 0:
         neg_loss_raw = neg_loss_raw * (neg_probs.pow(gamma_neg))
         
-    # Masking Collisions: If we accidentally sampled a True Positive as a Negative
+    # Masking Collisions
     if positive_coords.shape[0] > 0:
-        # Expand dims to compare: (NumPos, 1) vs (1, NumNeg)
         collisions = (pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0))
         if collisions.any():
-            # Find which batch index corresponds to the positive collision
-            # c_pos_idx is index into 'pos_coords', c_neg_idx is index into 'neg_p_idx'
             c_pos_idx, c_neg_idx = torch.nonzero(collisions, as_tuple=True)
-            
-            # Get the actual batch row involved
             colliding_batch_rows = pos_b_idx[c_pos_idx]
-            
-            # Zero out the loss for (batch_row, neg_col)
             neg_loss_raw[colliding_batch_rows, c_neg_idx] = 0.0
 
     loss_neg = neg_loss_raw.sum()
 
-    # Normalize by Batch Size (standard) rather than number of edges, 
-    # to keep loss scale consistent regardless of sparsity.
     return (loss_pos + loss_neg) / batch_size
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -143,7 +131,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     lr_lambda = cosine_lambda if schedule == "cosine" else linear_lambda
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_epoch)
 
-def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config):
+def save_checkpoint(model_dir, model, opt_net, opt_embed, scheduler, epoch, global_step, config):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
         with open(model_dir / "hybrid_set_config.json", "w") as f:
@@ -152,9 +140,9 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "epoch": epoch,
             "global_step": global_step,
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            "opt_net_state_dict": opt_net.state_dict(),
+            "opt_embed_state_dict": opt_embed.state_dict() if opt_embed else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "scaler_state_dict": None,
         }
         torch.save(state, model_dir / "hybrid_set_state.pt")
         logging.info(f"Saved training state to {model_dir / 'hybrid_set_state.pt'}")
@@ -174,13 +162,16 @@ def main():
     cfg = project_config
     ensure_dirs(cfg)
     
-    # E2E Training requires fresh cache of RAW fields if forcing new run
     if args.no_resume:
-        cfg.refresh_cache = False  # DO NOT refresh cache, just reset weights
+        cfg.refresh_cache = False 
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
     
+    # We use ds.num_items to represent num_movies
+    num_movies = len(ds)
+    logging.info(f"Dataset contains {num_movies} items.")
+
     loader = FastInfiniteLoader(ds, batch_size=cfg.batch_size, shuffle=True)
     batches_per_epoch = len(loader)
 
@@ -195,44 +186,49 @@ def main():
         hidden_dim=int(cfg.hybrid_set_hidden_dim),
         base_output_rank=int(cfg.hybrid_set_output_rank),
         depth=int(cfg.hybrid_set_depth),
-        dropout=float(cfg.hybrid_set_dropout)
-    ).to(device)
+        dropout=float(cfg.hybrid_set_dropout),
+        num_movies=num_movies
+    )
+
+    # 1. Move Network to GPU, Enforce CPU Embeddings
+    logging.info("Initializing Split Optimization (Net=GPU, Table=CPU)...")
+    model.to(device)
+    
+    # Explicitly move embedding table back to CPU to ensure memory constraints
+    # (PyTorch .to() moves everything recursively, so we undo that for the table)
+    model.movie_embeddings.to("cpu")
+    
+    # 2. Setup Optimizers
+    # Network parameters (everything except the table)
+    params_net = [p for n, p in model.named_parameters() if "movie_embeddings" not in n]
+    opt_net = torch.optim.AdamW(params_net, lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
+    
+    # Embedding parameters
+    params_embed = [model.movie_embeddings.weight]
+    opt_embed = torch.optim.AdamW(params_embed, lr=float(cfg.hybrid_set_table_lr))
 
     # --- Print Model & Sizes ---
-    sample_inputs_cpu, _, _ = next(loader)
+    sample_inputs_cpu, _, sample_idx = next(loader)
     sample_inputs = [x.to(device) for x in sample_inputs_cpu]
-
-    print("\n" + "="*50)
-    print_model_summary(model, [sample_inputs])
     
-    print("\n=== HybridSetModel Dimensions (End-to-End) ===")
-    print(f"  Input:                  Raw Fields")
-    print(f"  Learned Latent Dim:     {cfg.hybrid_set_latent_dim}")
-    print(f"  Trunk Hidden Dim:       {cfg.hybrid_set_hidden_dim}")
-    print(f"  Trunk Depth:            {cfg.hybrid_set_depth}")
-    print(f"  Global Vocab:           {ds.num_people}")
-    print("  Heads:")
-    for name in model.people_bottlenecks.keys():
-        rank = model.people_bottlenecks[name].out_features
-        out_dim = model.people_expansions[name].out_features
-        print(f"    - {name:<12} | Rank: {rank:<4} | Vocab: {out_dim}")
+    print("\n" + "="*50)
+    print_model_summary(model, {"field_tensors": sample_inputs, "batch_indices": sample_idx})
     print("="*50 + "\n")
-    # ---------------------------
 
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):
         for name, t in ds.head_mappings.items():
             mapping_tensors[name] = t.to(device)
 
-    scaler = GradScaler()
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
+    scaler = torch.amp.GradScaler('cuda')
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
     
+    # Scheduler applies to the Network optimizer
     sched = make_lr_scheduler(
-        opt, 
+        opt_net, 
         total_steps=batches_per_epoch * num_epochs, 
         schedule=cfg.lr_schedule, 
         warmup_steps=cfg.lr_warmup_steps, 
@@ -246,12 +242,13 @@ def main():
         try:
             c = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(c["model_state_dict"])
-            opt.load_state_dict(c["optimizer_state_dict"])
+            opt_net.load_state_dict(c["opt_net_state_dict"])
+            if c.get("opt_embed_state_dict"):
+                opt_embed.load_state_dict(c["opt_embed_state_dict"])
+                
             start_epoch = c["epoch"]
             global_step = c["global_step"]
             if c["scheduler_state_dict"] and sched: sched.load_state_dict(c["scheduler_state_dict"])
-            if "scaler_state_dict" in c and c["scaler_state_dict"]:
-                scaler.load_state_dict(c["scaler_state_dict"])
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
             logging.error(f"Resume failed: {e}")
@@ -262,7 +259,10 @@ def main():
     stop_flag = {"stop": False}
     signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
 
-    w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
+    w_bce = float(cfg.hybrid_set_w_bce)
+    w_count = float(cfg.hybrid_set_w_count)
+    w_align = float(cfg.hybrid_set_w_align)
+    w_recon = 1.0
     NUM_NEG_SAMPLES = 2048
 
     for epoch in range(start_epoch, num_epochs):
@@ -271,34 +271,45 @@ def main():
         for _ in pbar:
             iter_start = time.perf_counter()
             
-            # 1. Fetch data (RAW FIELDS)
-            inputs_cpu, heads_padded_cpu, _ = next(loader)
+            # 1. Fetch data
+            inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
             
-            # 2. Transfer to GPU
+            # 2. Transfer Inputs to GPU (Indices stay CPU for Table lookup)
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
             
             model.train()
-            opt.zero_grad(set_to_none=True)
+            opt_net.zero_grad(set_to_none=True)
+            opt_embed.zero_grad(set_to_none=True)
             
-            with autocast():
-                # E2E: Pass raw inputs to model. 
-                # Model encodes them -> Z -> Trunk -> Heads
-                embeddings_dict, counts_dict, recon_outputs = model(inputs, return_embeddings=True)
+            with torch.amp.autocast('cuda'):
+                # E2E Forward
+                logits_dict, counts_dict, recon_outputs, (z_enc, z_table) = model(
+                    field_tensors=inputs, 
+                    batch_indices=indices_cpu, 
+                    return_embeddings=True
+                )
                 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
                 
-                # Decoder Regularization Loss: Compare decoded fields to inputs
+                # A. Decoder Regularization (Reconstruction)
+                # Ensure the Table Latent (z_table) can reconstruct the inputs
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_outputs, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
                 
+                # B. Alignment Loss (Distillation)
+                # Encoder tries to predict the Table Latent.
+                # z_table.detach() prevents encoder from dragging the table.
+                align_loss = F.mse_loss(z_enc, z_table.detach())
+
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
                 coords_dict_for_log = {}
                 count_targets_for_log = {}
                 head_metrics = {}
 
-                for head_name in embeddings_dict.keys():
+                # C. Set Prediction (Trunk + Heads)
+                for head_name in logits_dict.keys():
                     raw_padded = heads_padded_cpu.get(head_name)
                     
                     if raw_padded is not None:
@@ -314,7 +325,7 @@ def main():
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
 
-                        # Set Loss
+                        # Set Loss (Sampled BCE)
                         rows, cols = torch.nonzero(mask, as_tuple=True)
                         global_person_ids = raw_padded[rows, cols].long()
                         
@@ -328,17 +339,17 @@ def main():
                                 if valid_mask.any():
                                     final_rows = rows[valid_mask]
                                     final_locals = local_person_ids[valid_mask]
-                                    
                                     pos_coords = torch.stack([final_rows, final_locals], dim=1)
                                     
                         head_layer = model.people_expansions[head_name]
+                        bottlenecks = logits_dict[head_name]
+                        
                         loss_head = compute_sampled_asymmetric_loss(
-                            embedding_batch=embeddings_dict[head_name],
+                            embedding_batch=bottlenecks,
                             head_layer=head_layer,
                             positive_coords=pos_coords,
                             num_negatives=NUM_NEG_SAMPLES,
-                            gamma_neg=2.0, # Focal weight for negatives
-                            gamma_pos=0.0  # Standard weight for positives
+                            gamma_neg=2.0
                         )
                         total_set_loss += loss_head
                         head_metrics[f"{head_name}_bce"] = loss_head.detach()
@@ -347,10 +358,19 @@ def main():
                             coords_dict_for_log[head_name] = pos_coords.cpu() 
 
                 # Combine losses
-                loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
+                loss = (w_bce * total_set_loss) + \
+                       (w_count * total_count_loss) + \
+                       (w_recon * recon_loss) + \
+                       (w_align * align_loss)
 
             scaler.scale(loss).backward()
-            scaler.step(opt)
+            
+            # Step Network (GPU)
+            scaler.step(opt_net)
+            
+            # Step Embeddings (CPU)
+            opt_embed.step()
+
             scaler.update()
             
             if sched: sched.step()
@@ -360,28 +380,30 @@ def main():
             if run_logger:
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
-                run_logger.add_scalar("loss/count_total", total_count_loss.item(), global_step)
+                run_logger.add_scalar("loss/align", align_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
-                current_lr = opt.param_groups[0]['lr']
-                run_logger.add_scalar("lr/group_0", current_lr, global_step)
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
                 run_logger.tick()
             
             if collect_coords_for_log:
-                recon_logger.step(global_step, model, inputs, coords_dict_for_log, count_targets_for_log, run_logger)
+                recon_logger.step(global_step, model, inputs, indices_cpu, coords_dict_for_log, count_targets_for_log, run_logger)
             
-            pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}", lr=f"{opt.param_groups[0]['lr']:.2e}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.3f}", 
+                align=f"{align_loss.item():.4f}",
+                lr=f"{opt_net.param_groups[0]['lr']:.2e}"
+            )
             global_step += 1
             
             if global_step % int(cfg.hybrid_set_save_interval) == 0:
-                save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch, global_step, cfg)
+                save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch, global_step, cfg)
             
             if stop_flag["stop"]: break
         if stop_flag["stop"]: break
         
-        save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch+1, global_step, cfg)
+        save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch+1, global_step, cfg)
         
     if run_logger: run_logger.close()
 

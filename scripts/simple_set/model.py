@@ -27,30 +27,43 @@ class HybridSetModel(nn.Module):
         self,
         fields: list,
         num_people: int, 
-        heads_config: dict,      
+        heads_config: dict,       
         head_vocab_sizes: dict, 
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
         depth: int = 12,        
-        dropout: float = 0.0    
+        dropout: float = 0.0,
+        num_movies: int = 0
     ):
         super().__init__()
         self.fields = fields
         self.heads_config = heads_config
         self.latent_dim = latent_dim
         
-        # 1. Learnable Encoder (Trained from Scratch)
+        if num_movies <= 0:
+            raise ValueError("num_movies must be > 0 for Embedding Table mode.")
+
+        # 1. Embedding Table (The Ground Truth Memory)
+        # We initialize this to store the "ideal" latent for every movie.
+        # It allows random access during training without storing 200k dense vectors in VRAM.
+        self.movie_embeddings = nn.Embedding(num_movies, latent_dim)
+        nn.init.normal_(self.movie_embeddings.weight, std=0.02)
+
+        # 2. Learnable Encoder (The Perception)
+        # This tries to predict the embedding table from raw fields.
         self.field_encoder = _FieldEncoders(fields, latent_dim)
         
-        # 2. Decoder (Regularizer)
+        # 3. Decoder (Regularizer)
+        # Decodes back to fields to ensure the Latent retains semantic meaning.
         self.field_decoder = TransformerFieldDecoder(fields, latent_dim, num_layers=2, num_heads=4)
         
-        # 3. Trunk
+        # 4. Trunk (The Set Generator)
+        # Processes the Latent to produce set features.
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
         self.trunk = nn.Sequential(*[ResBlock(hidden_dim, dropout) for _ in range(depth)])
         
-        # 4. Multi-Heads
+        # 5. Multi-Heads (People sets)
         self.people_bottlenecks = nn.ModuleDict()
         self.people_expansions = nn.ModuleDict()
         self.count_heads = nn.ModuleDict()
@@ -76,35 +89,50 @@ class HybridSetModel(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m is not getattr(self, 'movie_embeddings', None): # Don't re-init the main table if set
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
         # --- SPECIAL INITIALIZATION FOR SPARSE HEADS ---
-        # We manually override the initialization for the expansion heads (the final output layers).
-        # We set the bias to a low prior probability (e.g. 0.01) so the sigmoid output 
-        # starts at ~0.01 instead of 0.5. This prevents massive negative gradients 
-        # from the sparse 0s drowning out the few positive 1s.
         for name, layer in self.people_expansions.items():
             if m is layer:
                 prior_prob = 0.01
                 bias_value = -math.log((1 - prior_prob) / prior_prob)
                 nn.init.constant_(m.bias, bias_value)
 
-    def forward(self, field_tensors: list, return_embeddings: bool = False):
+    def forward(
+        self, 
+        field_tensors: list, 
+        batch_indices: torch.Tensor, 
+        return_embeddings: bool = False
+    ):
         """
         Args:
             field_tensors: List[Tensor] - Raw input fields
+            batch_indices: Tensor[Batch] - Global indices of movies (Required)
+        Returns:
+            logits_dict, counts_dict, recon_outputs, (z_enc, z_table)
         """
-        # 1. Encode fields to Latent Z (E2E training)
-        z = self.field_encoder(field_tensors)
+        if batch_indices is None:
+            raise ValueError("batch_indices is required for Embedding Table lookup.")
+
+        # A. Lookup Table Latent (Memory)
+        # Note: self.movie_embeddings might be on CPU. We handle the move to GPU here.
+        z_table = self.movie_embeddings(batch_indices.cpu()).to(self.trunk_proj.weight.device)
+
+        # B. Encode Fields (Perception)
+        z_enc = self.field_encoder(field_tensors)
         
-        # 2. Decode Z (Regularization)
-        recon_outputs = self.field_decoder(z)
+        # C. Decode / Regularize
+        # We decode from the TABLE latent to ensure the table stays grounded in field semantics.
+        # (i.e. The table must contain enough info to reconstruct the title/year/etc)
+        recon_outputs = self.field_decoder(z_table)
         
-        # 3. Trunk
-        feat = self.trunk_proj(z)
+        # D. Trunk & Heads
+        # The Trunk uses the TABLE latent for the main task (people prediction)
+        feat = self.trunk_proj(z_table)
         feat = self.trunk(feat)
         
         logits_dict = {}
@@ -112,7 +140,6 @@ class HybridSetModel(nn.Module):
         
         for name in self.people_bottlenecks.keys():
             bn = self.people_bottlenecks[name](feat)
-            
             if return_embeddings:
                 logits_dict[name] = bn 
             else:
@@ -122,4 +149,4 @@ class HybridSetModel(nn.Module):
             cnt = self.count_heads[name](feat)
             counts_dict[name] = cnt
             
-        return logits_dict, counts_dict, recon_outputs
+        return logits_dict, counts_dict, recon_outputs, (z_enc, z_table)

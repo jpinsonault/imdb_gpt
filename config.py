@@ -71,7 +71,7 @@ class ProjectConfig:
     seq_decoder_w_recon: float = 1.0
     seq_decoder_w_presence: float = 1.0
 
-    hybrid_set_epochs: int = 100
+    hybrid_set_epochs: int = 200
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 1e-4
     
@@ -82,11 +82,15 @@ class ProjectConfig:
     hybrid_set_output_rank: int = 256
     hybrid_set_dropout: float = 0.0
     
+    # Embedding Table Strategy
+    hybrid_set_table_lr: float = 1e-3  # Often useful to have higher LR for embeddings
+    hybrid_set_w_align: float = 1.0    # Weight for MSE(Encoder, Table)
+    
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05
     
-    # [NEW] Focal Loss Gamma (Minimal Improvement)
+    # Focal Loss Gamma
     hybrid_set_focal_gamma: float = 4.0
     
     hybrid_set_save_interval: int = 500

@@ -64,9 +64,10 @@ class HybridSetReconLogger:
         return wrapper.fill(text)
 
     @torch.no_grad()
-    def step(self, global_step, model, inputs, coords_dict, count_targets, run_logger):
+    def step(self, global_step, model, inputs, batch_indices, coords_dict, count_targets, run_logger):
         """
         inputs: List[Tensor(B, ...)]
+        batch_indices: Tensor(B,) [CPU or GPU]
         coords_dict: {head_name: Tensor(N_sparse, 2)} [row_idx, local_col_idx]
         """
         if (global_step + 1) % self.every != 0: return
@@ -81,9 +82,13 @@ class HybridSetReconLogger:
         # 2. Slice inputs to just the samples we want to print
         sliced_inputs = [t[indices_t] for t in inputs]
         
+        # Slice batch indices (handle CPU tensor indexed by numpy array)
+        sliced_batch_indices = batch_indices[indices]
+        
         # 3. Run model ONLY on the slice (Cheap!)
         # We allow full dense expansion here because batch size is tiny (e.g. 3)
-        logits_dict, counts_dict, recon_outputs = model(sliced_inputs)
+        # Unpack 4 return values
+        logits_dict, counts_dict, recon_outputs, _ = model(sliced_inputs, batch_indices=sliced_batch_indices)
         
         output_log = []
         
