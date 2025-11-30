@@ -12,9 +12,16 @@ class HybridSetDataset(Dataset):
         logging.info(f"Loading hybrid dataset from {cache_path}...")
         data = torch.load(cache_path, map_location="cpu")
         
+        # Stacked fields: List[Tensor]
         self.stacked_fields = data["stacked_fields"] 
         # heads_padded[head] = Tensor(NumMovies, MaxLen) filled with -1
         self.heads_padded = data["heads_padded"] 
+        
+        # Pin memory for faster GPU transfer
+        if torch.cuda.is_available():
+            logging.info("Pinning dataset memory...")
+            self.stacked_fields = [t.pin_memory() for t in self.stacked_fields]
+            self.heads_padded = {k: v.pin_memory() for k, v in self.heads_padded.items()}
         
         self.num_people = data["num_people"]
         self.idx_to_name = data["idx_to_person_name"]
@@ -35,54 +42,47 @@ class HybridSetDataset(Dataset):
     def __getitem__(self, idx):
         return idx
 
-def collate_hybrid_set(batch_indices, dataset):
-    """
-    Optimized Collate using Padded Tensors:
-    1. Slices inputs (fast).
-    2. Slices padded target arrays (fast).
-    3. Uses masked selection to generate sparse coords without Python loops.
-    """
-    # 1. Inputs
-    indices_t = torch.tensor(batch_indices, dtype=torch.long)
-    batch_inputs = [t[indices_t] for t in dataset.stacked_fields]
-    
-    # 2. Targets (Sparse Coordinates)
-    # Return:
-    #   coords_dict[head] -> Tensor(N_total_targets, 2) [batch_idx, person_idx]
-    #   counts_dict[head] -> Tensor(B, 1)
-    
-    coords_dict = {}
-    counts_dict = {}
-    
-    for head, padded_tensor in dataset.heads_padded.items():
-        # Slice the batch: (B, MaxLen)
-        batch_padded = padded_tensor[indices_t]
-        
-        # Create mask for valid entries (not -1)
-        mask = (batch_padded != -1)
-        
-        # A. Counts: Simply sum the mask
-        counts = mask.sum(dim=1, keepdim=True).float()
-        counts_dict[head] = counts
-        
-        # B. Indices: Vectorized coordinate generation
-        # torch.nonzero returns indices where mask is True.
-        # Since we want (batch_idx, person_idx), we construct it manually 
-        # to ensure we get the values from batch_padded.
-        
-        # This gets us the indices (row_in_batch, col_in_padded)
-        nonzero_indices = torch.nonzero(mask, as_tuple=True)
-        row_indices = nonzero_indices[0] 
-        col_indices = nonzero_indices[1]
-        
-        # Extract actual person IDs using the mask/indices
-        person_ids = batch_padded[row_indices, col_indices]
-        
-        # We generally want coords to be int64 (Long) for downstream embedding lookups
-        if person_ids.numel() > 0:
-            coords = torch.stack([row_indices, person_ids.long()], dim=1)
-            coords_dict[head] = coords
-        else:
-            coords_dict[head] = torch.empty((0, 2), dtype=torch.long)
 
-    return batch_inputs, coords_dict, counts_dict, indices_t
+class FastInfiniteLoader:
+    """
+    A lightweight iterator that replaces DataLoader for in-memory tensor datasets.
+    It slices the tensors directly on the main thread, avoiding multiprocessing overheads.
+    """
+    def __init__(self, dataset: HybridSetDataset, batch_size: int, shuffle: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        self.indices = torch.arange(len(dataset))
+        if self.shuffle:
+            self.indices = self.indices[torch.randperm(len(dataset))]
+            
+        self.ptr = 0
+        self.n = len(dataset)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.ptr + self.batch_size > self.n:
+            if self.shuffle:
+                self.indices = self.indices[torch.randperm(self.n)]
+            self.ptr = 0
+            
+        batch_idx = self.indices[self.ptr : self.ptr + self.batch_size]
+        self.ptr += self.batch_size
+        
+        # Slice Inputs (List of Tensors)
+        inputs = [t[batch_idx] for t in self.dataset.stacked_fields]
+        
+        # Slice Heads (Dict of Tensors)
+        heads_padded_batch = {k: v[batch_idx] for k, v in self.dataset.heads_padded.items()}
+        
+        return inputs, heads_padded_batch, batch_idx
+
+    def __len__(self):
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+def collate_hybrid_set(batch_indices, dataset):
+    # Compatibility shim if needed
+    pass

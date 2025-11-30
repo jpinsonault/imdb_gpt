@@ -34,22 +34,34 @@ class HybridSetReconLogger:
     @torch.no_grad()
     def step(self, global_step, model, inputs, coords_dict, count_targets, run_logger):
         """
-        coords_dict: {head_name: Tensor(N, 2)} [row_idx, col_idx]
+        inputs: List[Tensor(B, ...)]
+        coords_dict: {head_name: Tensor(N_sparse, 2)} [row_idx, col_idx]
         """
         if (global_step + 1) % self.every != 0: return
+        
         model.eval()
-        logits_dict, counts_dict, recon_outputs = model(inputs)
         
         B = inputs[0].size(0)
-        # Pick random samples
+        # 1. Pick indices FIRST to avoid massive dense compute on the whole batch
         indices = np.random.choice(B, size=min(self.num_samples, B), replace=False)
+        indices_t = torch.tensor(indices, device=inputs[0].device)
+
+        # 2. Slice inputs to just the samples we want to print
+        sliced_inputs = [t[indices_t] for t in inputs]
+        
+        # 3. Run model ONLY on the slice (Cheap!)
+        # We allow full dense expansion here because batch size is tiny (e.g. 3)
+        logits_dict, counts_dict, recon_outputs = model(sliced_inputs)
         
         output_log = []
         
-        for i in indices:
-            # 1. Metadata
-            inp_sample = [t[i].cpu() for t in inputs]
-            rec_sample = [t[i].cpu() for t in recon_outputs]
+        # Iterate 0..num_samples (since we sliced, these correspond to the chosen indices)
+        for local_idx, global_idx in enumerate(indices):
+            
+            # --- Metadata ---
+            # Inputs are already sliced, so use local_idx
+            inp_sample = [t[local_idx].cpu() for t in sliced_inputs]
+            rec_sample = [t[local_idx].cpu() for t in recon_outputs]
             movie_title = self._decode_movie_title(inp_sample)
             
             t = PrettyTable(["Field", "Orig", "Recon"])
@@ -60,36 +72,40 @@ class HybridSetReconLogger:
             output_log.append(f"\n=== {movie_title} ===")
             output_log.append(str(t))
             
-            # 2. Heads
+            # --- Heads ---
             for head in logits_dict.keys():
-                # Reconstruct True Indices from Sparse Coords for this sample `i`
+                # Reconstruct True Indices for this sample `global_idx`
+                # We need to look up the original coords using the global batch index
                 true_idxs = set()
                 coords = coords_dict.get(head)
                 if coords is not None:
-                    # Filter coords where row == i
-                    # Note: coords are on CPU in collate, but might be on GPU if passed from train loop
-                    if coords.device.type != 'cpu':
-                        coords = coords.cpu()
+                    if coords.device.type != 'cpu': coords = coords.cpu()
                     
-                    # Boolean mask for this batch item
-                    mask = (coords[:, 0] == i)
+                    # Filter coords where batch_index == global_idx
+                    mask = (coords[:, 0] == global_idx)
                     if mask.any():
                         true_idxs = set(coords[mask, 1].numpy().tolist())
 
+                # Counts
                 tgt_cnt_t = count_targets.get(head)
-                true_count = tgt_cnt_t[i].item() if tgt_cnt_t is not None else 0.0
+                true_count = tgt_cnt_t[global_idx].item() if tgt_cnt_t is not None else 0.0
+                pred_count = counts_dict[head][local_idx].item()
 
-                # Get Preds
-                probs = torch.sigmoid(logits_dict[head][i])
-                pred_idxs = set((probs > self.threshold).nonzero().flatten().cpu().numpy())
-                pred_count = counts_dict[head][i].item()
+                # Get Preds (Dense)
+                # local_idx corresponds to the sliced logits
+                probs = torch.sigmoid(logits_dict[head][local_idx])
+                
+                # Fast top-k / thresholding on CPU
+                # We only transfer one row of probs to CPU
+                probs_cpu = probs.float().cpu().numpy()
+                pred_idxs = set(np.where(probs_cpu > self.threshold)[0])
                 
                 tp = true_idxs & pred_idxs
                 fp = pred_idxs - true_idxs
                 fn = true_idxs - pred_idxs
                 
                 def fmt(idx_set):
-                    l = sorted([(self._get_name(x), probs[x].item()) for x in idx_set], key=lambda x:x[1], reverse=True)
+                    l = sorted([(self._get_name(x), probs_cpu[x]) for x in idx_set], key=lambda x:x[1], reverse=True)
                     return l[:10]
                 
                 output_log.append(f"\n--- Head: {head.upper()} ---")

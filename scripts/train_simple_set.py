@@ -14,28 +14,91 @@ from dataclasses import asdict
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
 from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.model import HybridSetModel
-from scripts.simple_set.data import HybridSetDataset, collate_hybrid_set
+from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
 from scripts.simple_set.precompute import ensure_hybrid_cache
 from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def asymmetric_loss(logits, targets, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8):
-    p = torch.sigmoid(logits)
-    pos_weight = (1 - p).pow(gamma_pos)
-    loss_pos = -targets * torch.log(p.clamp(min=eps)) * pos_weight
+# --- SAMPLED LOSS FUNCTION ---
+
+def compute_sampled_asymmetric_loss(
+    embedding_batch,    # (B, Rank) - The output from model bottleneck
+    head_layer,         # The nn.Linear(Rank, NumPeople) layer
+    positive_coords,    # Tensor(N_pos, 2) [batch_idx, person_idx]
+    num_negatives=2048, # How many random negatives to sample per batch
+    gamma_neg=4, 
+    gamma_pos=1, 
+    clip=0.05, 
+    eps=1e-8
+):
+    """
+    Computes Asymmetric Loss using only Positive targets + Random Negative samples.
+    Avoids creating (B, NumPeople) dense tensors.
+    """
+    device = embedding_batch.device
+    batch_size = embedding_batch.shape[0]
+    num_people = head_layer.out_features
     
-    p_neg = p.clone()
-    p_neg[p < clip] = 0.0 
-    neg_weight = p_neg.pow(gamma_neg)
-    loss_neg = -(1 - targets) * torch.log((1 - p).clamp(min=eps)) * neg_weight
-    return (loss_pos + loss_neg).sum(dim=1).mean()
+    # 1. Positive Logits
+    # Gather embeddings for the specific rows in batch corresponding to positive_coords
+    # positive_coords[:, 0] are batch indices
+    # positive_coords[:, 1] are person indices (target IDs)
+    
+    if positive_coords.shape[0] > 0:
+        pos_batch_indices = positive_coords[:, 0]
+        pos_person_indices = positive_coords[:, 1]
+        
+        # Get the Embeddings: (N_pos, Rank)
+        pos_embs = embedding_batch[pos_batch_indices]
+        
+        # Get the Weights: (N_pos, Rank) from the linear layer weight
+        pos_weights = head_layer.weight[pos_person_indices]
+        pos_biases = head_layer.bias[pos_person_indices] if head_layer.bias is not None else 0.0
+        
+        # Dot product
+        pos_logits = (pos_embs * pos_weights).sum(dim=1) + pos_biases
+        
+        # Pos Loss
+        p_pos = torch.sigmoid(pos_logits)
+        pos_weight_factor = (1 - p_pos).pow(gamma_pos)
+        loss_pos = -torch.log(p_pos.clamp(min=eps)) * pos_weight_factor
+        loss_pos = loss_pos.sum()
+    else:
+        loss_pos = torch.tensor(0.0, device=device)
+
+    # 2. Negative Logits (Sampled)
+    # We sample 'num_negatives' unique person IDs
+    neg_person_indices = torch.randint(0, num_people, (num_negatives,), device=device)
+    
+    # Get Weights for Negatives: (NumNeg, Rank)
+    neg_weights = head_layer.weight[neg_person_indices]
+    neg_biases = head_layer.bias[neg_person_indices] if head_layer.bias is not None else 0.0
+    
+    # Calculate logits for ALL batch items against these negatives
+    # (B, Rank) @ (Rank, NumNeg) -> (B, NumNeg)
+    neg_logits = embedding_batch @ neg_weights.t() + neg_biases
+    
+    # Neg Loss
+    p_neg = torch.sigmoid(neg_logits)
+    p_neg_clipped = p_neg.clone()
+    p_neg_clipped[p_neg < clip] = 0.0
+    neg_weight_factor = p_neg_clipped.pow(gamma_neg)
+    loss_neg = -torch.log((1 - p_neg).clamp(min=eps)) * neg_weight_factor
+    
+    # Sum over negatives, average over batch
+    loss_neg = loss_neg.sum()
+
+    # Normalize by batch size
+    return (loss_pos + loss_neg) / batch_size
+
+# -----------------------------
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None: return None
@@ -79,9 +142,7 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "rng_state_pytorch": torch.get_rng_state(),
-            "rng_state_numpy": np.random.get_state(),
-            "rng_state_random": random.getstate(),
+            "scaler_state_dict": None, # If using AMP scaler
         }
         torch.save(state, model_dir / "hybrid_set_state.pt")
         logging.info(f"Saved training state to {model_dir / 'hybrid_set_state.pt'}")
@@ -98,14 +159,9 @@ def main():
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
     
-    def _collate(batch_indices):
-        return collate_hybrid_set(batch_indices, ds)
-
-    loader = DataLoader(
-        ds, batch_size=cfg.batch_size, shuffle=True, 
-        num_workers=int(cfg.num_workers), collate_fn=_collate,
-        pin_memory=False
-    )
+    # FastInfiniteLoader is much faster than DataLoader for this specific task
+    loader = FastInfiniteLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+    batches_per_epoch = len(loader)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -120,18 +176,15 @@ def main():
         dropout=float(cfg.hybrid_set_dropout)
     ).to(device)
 
-    # Dummy forward for summary
-    dummy_idxs = [0]
-    inputs, _, _, _ = _collate(dummy_idxs)
-    inputs = [x.to(device) for x in inputs]
-    print_model_summary(model, [inputs])
+    # Initialize AMP Scaler
+    scaler = GradScaler()
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
-    sched = make_lr_scheduler(opt, len(loader)*num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
+    sched = make_lr_scheduler(opt, batches_per_epoch * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
 
     start_epoch, global_step = 0, 0
     ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
@@ -143,6 +196,9 @@ def main():
             start_epoch = c["epoch"]
             global_step = c["global_step"]
             if c["scheduler_state_dict"] and sched: sched.load_state_dict(c["scheduler_state_dict"])
+            # Load scaler state if available (for AMP robustness)
+            if "scaler_state_dict" in c and c["scaler_state_dict"]:
+                scaler.load_state_dict(c["scaler_state_dict"])
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
             logging.error(f"Resume failed: {e}")
@@ -153,65 +209,89 @@ def main():
 
     w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
 
+    # How many negative samples to take from vocabulary per batch
+    # 2048 is usually plenty for convergence, much faster than 100k+
+    NUM_NEG_SAMPLES = 2048
+
     for epoch in range(start_epoch, num_epochs):
-        pbar = tqdm(loader, dynamic_ncols=True, desc=f"Epoch {epoch+1}")
-        for batch in pbar:
+        pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
+        
+        for _ in pbar:
             iter_start = time.perf_counter()
-            # unpack: coords_dict contains tensors of shape (N, 2) [row, col]
-            inputs, coords_dict, count_targets, _ = batch
             
-            inputs = [x.to(device, non_blocking=True) for x in inputs]
+            # 1. Fetch data on CPU
+            inputs_cpu, heads_padded_cpu, _ = next(loader)
+            
+            # 2. Transfer to GPU
+            inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
             
             model.train()
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             
-            logits_dict, counts_dict, recon_outputs = model(inputs)
-            
-            total_set_loss = 0.0
-            total_count_loss = 0.0
-            
-            batch_size = inputs[0].size(0)
-            
-            for head_name in logits_dict.keys():
-                # --- FAST TARGET CONSTRUCTION ON GPU ---
-                # 1. Get sparse coords
-                coords = coords_dict.get(head_name)
+            # 3. Mixed Precision Forward
+            with autocast():
+                # Note: return_embeddings=True gives us (Batch, Rank) instead of (Batch, NumPeople)
+                # This is the massive speedup.
+                embeddings_dict, counts_dict, recon_outputs = model(inputs, return_embeddings=True)
                 
-                # 2. Build Dense Target on Device
-                # Initialize zeros (B, NumPeople)
-                target_dense = torch.zeros(
-                    batch_size, ds.num_people, 
-                    device=device, dtype=torch.float32
-                )
+                total_set_loss = 0.0
+                total_count_loss = 0.0
                 
-                if coords is not None and coords.size(0) > 0:
-                    coords = coords.to(device, non_blocking=True)
-                    # Use index_put or scatter. Scatter is usually safe.
-                    # dim=0 (row), dim=1 (col) -> (N, 2)
-                    # We want target[coords[:,0], coords[:,1]] = 1.0
-                    target_dense.index_put_(
-                        (coords[:, 0], coords[:, 1]), 
-                        torch.tensor(1.0, device=device)
-                    )
+                # Recon Loss
+                recon_loss = 0.0
+                for f, p, t in zip(ds.fields, recon_outputs, inputs):
+                    recon_loss += f.compute_loss(p, t) * float(f.weight)
                 
-                # 3. Counts
-                t_cnt = count_targets.get(head_name)
-                if t_cnt is None:
-                    t_cnt = torch.zeros(batch_size, 1, device=device)
-                else:
-                    t_cnt = t_cnt.to(device, non_blocking=True)
+                collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
+                coords_dict_for_log = {}
+                count_targets_for_log = {}
+
+                for head_name in embeddings_dict.keys():
+                    # Check padding on CPU first to see if we have data (fast check)
+                    raw_padded = heads_padded_cpu.get(head_name)
                     
-                total_set_loss += asymmetric_loss(logits_dict[head_name], target_dense)
-                total_count_loss += F.mse_loss(counts_dict[head_name], t_cnt)
+                    if raw_padded is not None:
+                        raw_padded = raw_padded.to(device, non_blocking=True)
+                        mask = (raw_padded != -1)
+                        
+                        # Count Loss
+                        t_cnt = mask.sum(dim=1, keepdim=True).float()
+                        total_count_loss += F.mse_loss(counts_dict[head_name], t_cnt)
+                        
+                        if collect_coords_for_log:
+                            count_targets_for_log[head_name] = t_cnt
+
+                        # Sparse Coords for Sampled Loss
+                        rows, cols = torch.nonzero(mask, as_tuple=True)
+                        person_ids = raw_padded[rows, cols].long()
+                        
+                        if person_ids.numel() > 0:
+                            pos_coords = torch.stack([rows, person_ids], dim=1)
+                            
+                            # Logits calc + Loss inside this helper
+                            head_layer = model.people_expansions[head_name]
+                            
+                            loss_head = compute_sampled_asymmetric_loss(
+                                embedding_batch=embeddings_dict[head_name],
+                                head_layer=head_layer,
+                                positive_coords=pos_coords,
+                                num_negatives=NUM_NEG_SAMPLES
+                            )
+                            total_set_loss += loss_head
+
+                            if collect_coords_for_log:
+                                coords_dict_for_log[head_name] = pos_coords.cpu()
+                    else:
+                        # Empty head, maybe just push embeddings to zero or ignore
+                        pass
+
+                loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
+
+            # 4. Scaled Backward
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             
-            # Recon Loss
-            recon_loss = 0.0
-            for f, p, t in zip(ds.fields, recon_outputs, inputs):
-                recon_loss += f.compute_loss(p, t) * float(f.weight)
-                
-            loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
-            loss.backward()
-            opt.step()
             if sched: sched.step()
             
             iter_time = time.perf_counter() - iter_start
@@ -223,14 +303,11 @@ def main():
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.tick()
             
-            # Pass sparse coords to recon logger (requires update in recon logger to handle sparse if needed, 
-            # OR we pass the dense we just built)
-            # We must be careful not to hold onto the massive dense tensors.
-            # The Recon logger usually runs infrequently. 
-            # We can re-build a *small sample* dense tensor inside the logger if needed.
-            
-            # Update: We need to adapt the logger call slightly because we changed `multi_targets` signature
-            recon_logger.step(global_step, model, inputs, coords_dict, count_targets, run_logger)
+            if collect_coords_for_log:
+                # Need to be careful: Recon Logger runs model.eval() which usually expects full logits
+                # We handle this by letting recon_logger run standard inference (which returns full logits)
+                # This is slow, but happens rarely (every 200 steps).
+                recon_logger.step(global_step, model, inputs, coords_dict_for_log, count_targets_for_log, run_logger)
             
             pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}")
             global_step += 1
