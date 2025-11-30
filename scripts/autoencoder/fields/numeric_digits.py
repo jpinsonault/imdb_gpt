@@ -32,8 +32,6 @@ class NumericDigitCategoryField(BaseField):
         if raw_value is None:
             return None
         if self.strip_nonnumeric:
-            # Filter keeps only digits, returns iterator, join back to string
-            # This handles 'tt12345' -> '12345' or 'nm0001' -> '0001'
             s = str(raw_value)
             cleaned = "".join(filter(str.isdigit, s))
             return cleaned if cleaned else None
@@ -161,8 +159,6 @@ class NumericDigitCategoryField(BaseField):
 
     def _transform(self, raw_value):
         self._ensure_finalized()
-        
-        # Clean value before checking missing or encoding
         raw_value = self._clean_value(raw_value)
 
         if self._is_missing(raw_value):
@@ -192,14 +188,12 @@ class NumericDigitCategoryField(BaseField):
         return self._transform(raw_value)
 
     def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
-        # Prediction: (B, P, Vocab) -> Argmax
         if prediction_tensor.ndim >= 2 and prediction_tensor.shape[-1] in (self.base, self.vocab_size):
             indices = torch.argmax(prediction_tensor, dim=-1)
             return self.to_string(indices.detach().cpu().numpy())
         return self.to_string(prediction_tensor.detach().cpu().numpy())
 
     def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
-        # Target: (B, P) Indices
         return self.to_string(target_tensor.detach().cpu().numpy())
 
     def to_string(self, values: np.ndarray) -> str:
@@ -255,8 +249,6 @@ class NumericDigitCategoryField(BaseField):
         if self.fraction_digits > 0:
             s += "." + f"{frac_val:0{self.fraction_digits}d}"
         
-        # Note: If strip_nonnumeric was True, we don't automatically add the prefix back here.
-        # The reconstruction is purely the numeric part.
         return ("-" if negative else "") + s
 
     def build_encoder(self, latent_dim: int) -> nn.Module:
@@ -268,14 +260,26 @@ class NumericDigitCategoryField(BaseField):
         return _DigitsDecoder(base=self.base, positions=positions, latent_dim=latent_dim)
 
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Safe cross entropy that handles cases where the entire batch is masked out.
+        """
         self._ensure_finalized()
         B, P, V = pred.shape
         mask_id = int(self.mask_index) if self.mask_index is not None else -100
-        return F.cross_entropy(
+        
+        # We use reduction='sum' and manually divide by the count of non-ignored items.
+        # This prevents NaN when the valid count is 0.
+        loss_sum = F.cross_entropy(
             pred.reshape(B * P, V),
             target.reshape(B * P).long(),
             ignore_index=mask_id,
+            reduction='sum'
         )
+        
+        valid_count = (target.reshape(B * P) != mask_id).sum()
+        
+        # Avoid division by zero
+        return loss_sum / valid_count.clamp(min=1.0)
 
     def print_stats(self):
         return

@@ -45,6 +45,7 @@ class TransformerFieldDecoder(nn.Module):
 
         d_ff = int(ff_dim) if ff_dim is not None else self.latent_dim * 4
 
+        # [REVERTED] standard setup
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.latent_dim,
             nhead=num_heads,

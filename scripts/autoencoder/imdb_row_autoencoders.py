@@ -37,7 +37,6 @@ class TitlesAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("tconst", strip_nonnumeric=True),
             TextField("primaryTitle", max_length=32),
             NumericDigitCategoryField("startYear"),
-            NumericDigitCategoryField("endYear"),
             NumericDigitCategoryField("runtimeMinutes"),
             NumericDigitCategoryField("averageRating", fraction_digits=1),
             NumericDigitCategoryField("numVotes"),
@@ -78,7 +77,6 @@ class TitlesAutoencoder(RowAutoencoder):
             # Unpack results safely (handle None if DB is empty)
             if row and row[0] is not None:
                 self._manual_inject_digits("startYear", row[0], row[1])
-                self._manual_inject_digits("endYear", row[2], row[3])
                 self._manual_inject_digits("runtimeMinutes", row[4], row[5])
                 self._manual_inject_digits("averageRating", row[6], row[7])
                 self._manual_inject_digits("numVotes", row[8], row[9])
@@ -138,7 +136,6 @@ class TitlesAutoencoder(RowAutoencoder):
             # 5. TCONST
             self._manual_inject_digits("tconst", 0, 99999999)
 
-        self.stats_accumulated = True
         self.finalize_stats()
 
     def _manual_inject_digits(self, field_name, min_val, max_val):
@@ -274,7 +271,7 @@ class PeopleAutoencoder(RowAutoencoder):
             # nconst
             self._manual_inject_digits("nconst", 0, 99999999)
 
-        self.stats_accumulated = True
+        # Do NOT set self.stats_accumulated = True here manually.
         self.finalize_stats()
 
     def _manual_inject_digits(self, field_name, min_val, max_val):

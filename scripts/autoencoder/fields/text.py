@@ -110,14 +110,12 @@ class TextField(BaseField):
         return torch.tensor([1.0], dtype=torch.float32)
 
     def render_prediction(self, prediction_tensor: torch.Tensor) -> str:
-        # Prediction: (B, Len, Vocab) -> Argmax -> (B, Len)
         if prediction_tensor.ndim >= 2 and self.tokenizer is not None and prediction_tensor.shape[-1] == self.tokenizer.get_vocab_size():
             indices = torch.argmax(prediction_tensor, dim=-1)
             return self.to_string(indices.detach().cpu().numpy())
         return self.to_string(prediction_tensor.detach().cpu().numpy())
 
     def render_ground_truth(self, target_tensor: torch.Tensor) -> str:
-        # Target: (B, Len) Indices
         return self.to_string(target_tensor.detach().cpu().numpy())
 
     def to_string(self, values: np.ndarray) -> str:
@@ -146,12 +144,23 @@ class TextField(BaseField):
         return _TextDecoder(vocab=vocab, max_len=self.max_length, ch=ch, latent_dim=latent_dim)
 
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Safe cross entropy that handles cases where entire batch is padding."""
         if self.pad_token_id is None:
             raise RuntimeError("TextField not finalized")
         B, L, V = pred.shape
         pred2 = pred.reshape(B * L, V)
         tgt2 = target.reshape(B * L)
-        return F.cross_entropy(pred2, tgt2, ignore_index=int(self.pad_token_id))
+        
+        loss_sum = F.cross_entropy(
+            pred2, 
+            tgt2, 
+            ignore_index=int(self.pad_token_id),
+            reduction='sum'
+        )
+        
+        valid_count = (tgt2 != int(self.pad_token_id)).sum()
+        
+        return loss_sum / valid_count.clamp(min=1.0)
 
     def print_stats(self):
         return

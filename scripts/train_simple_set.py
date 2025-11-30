@@ -26,9 +26,6 @@ from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ... [Keep compute_sampled_asymmetric_loss and make_lr_scheduler exactly as they were] ...
-# (Omitting them here for brevity as they haven't changed, but include them in your file)
-
 def compute_sampled_asymmetric_loss(
     embedding_batch,    
     head_layer,         
@@ -142,14 +139,20 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--new-run", action="store_true")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoint and start fresh")
+    parser.add_argument("--debug", action="store_true", help="Enable anomaly detection")
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.warning("DEBUG MODE: Enabling anomaly detection")
+        torch.autograd.set_detect_anomaly(True)
+
     cfg = project_config
     ensure_dirs(cfg)
     
     # E2E Training requires fresh cache of RAW fields if forcing new run
-    if args.new_run:
-        cfg.refresh_cache = True
+    if args.no_resume:
+        cfg.refresh_cache = False  # DO NOT refresh cache, just reset weights
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
@@ -215,7 +218,7 @@ def main():
 
     start_epoch, global_step = 0, 0
     ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
-    if ckpt_path.exists() and not args.new_run:
+    if ckpt_path.exists() and not args.no_resume:
         try:
             c = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(c["model_state_dict"])
@@ -228,6 +231,8 @@ def main():
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
             logging.error(f"Resume failed: {e}")
+    elif args.no_resume:
+        logging.info("Starting new run (ignoring existing checkpoint).")
     
     if run_logger.run_dir: run_logger.step = global_step
     stop_flag = {"stop": False}
@@ -313,6 +318,7 @@ def main():
                                     if collect_coords_for_log:
                                         coords_dict_for_log[head_name] = pos_coords.cpu() 
 
+                # Combine losses
                 loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
 
             scaler.scale(loss).backward()
