@@ -5,9 +5,6 @@ import torch.nn as nn
 from scripts.autoencoder.row_autoencoder import _FieldEncoders, TransformerFieldDecoder
 
 class ResBlock(nn.Module):
-    """
-    Standard Residual Block.
-    """
     def __init__(self, dim, dropout=0.0):
         super().__init__()
         self.net = nn.Sequential(
@@ -27,48 +24,44 @@ class ResBlock(nn.Module):
 class HybridSetModel(nn.Module):
     def __init__(
         self,
-        fields: list,          # List of BaseField objects
-        num_people: int,       # Output vocab size
-        latent_dim: int = 128, # Output of the Field Transformer
-        hidden_dim: int = 1024,# Width of the ResNet Trunk
-        output_rank: int = 64, # Low-Rank bottleneck for people head
-        depth: int = 12,       # How many ResBlocks
+        fields: list,
+        num_people: int,
+        heads_config: dict,    # {"cast": 1.0, "director": 0.5} (name -> rank_multiplier)
+        latent_dim: int = 128, 
+        hidden_dim: int = 1024,
+        base_output_rank: int = 64, 
+        depth: int = 12,       
         dropout: float = 0.0   
     ):
         super().__init__()
         self.fields = fields
+        self.heads_config = heads_config
         
-        # 1. Field Encoders & Aggregator (Inputs -> Latent)
-        # Output is (B, latent_dim)
+        # 1. Encoders
         self.field_encoder = _FieldEncoders(fields, latent_dim)
+        self.field_decoder = TransformerFieldDecoder(fields, latent_dim, num_layers=2, num_heads=4)
         
-        # 2. Field Decoder (Latent -> Reconstructed Inputs)
-        # This reconstructs the original movie fields from the latent representation
-        self.field_decoder = TransformerFieldDecoder(
-            fields, 
-            latent_dim, 
-            num_layers=2, 
-            num_heads=4
-        )
-        
-        # 3. Projection to Trunk
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
+        self.trunk = nn.Sequential(*[ResBlock(hidden_dim, dropout) for _ in range(depth)])
         
-        # 4. Deep ResNet Trunk (Logic Core)
-        self.trunk = nn.Sequential(*[
-            ResBlock(hidden_dim, dropout) for _ in range(depth)
-        ])
+        # 2. Multi-Heads
+        self.people_bottlenecks = nn.ModuleDict()
+        self.people_expansions = nn.ModuleDict()
+        self.count_heads = nn.ModuleDict()
         
-        # 5. Low-Rank Output Head (People)
-        self.people_bottleneck = nn.Linear(hidden_dim, output_rank, bias=False)
-        self.people_expansion = nn.Linear(output_rank, num_people) 
-        
-        # 6. Count Head
-        self.count_head = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.GELU(),
-            nn.Linear(256, 1)
-        )
+        for name, rank_mult in heads_config.items():
+            rank = max(8, int(base_output_rank * rank_mult))
+            
+            # Factorized classification head
+            self.people_bottlenecks[name] = nn.Linear(hidden_dim, rank, bias=False)
+            self.people_expansions[name] = nn.Linear(rank, num_people)
+            
+            # Count head
+            self.count_heads[name] = nn.Sequential(
+                nn.Linear(hidden_dim, 256),
+                nn.GELU(),
+                nn.Linear(256, 1)
+            )
         
         self.apply(self._init_weights)
 
@@ -85,32 +78,28 @@ class HybridSetModel(nn.Module):
 
     def forward(self, field_tensors: list):
         """
-        Args:
-            field_tensors: List[Tensor], one tensor per field for the batch.
         Returns:
-            people_logits: (B, P)
-            count_pred: (B, 1)
-            recon_outputs: List[Tensor], one per field (reconstructed values/logits)
+            logits_dict: Dict[str, Tensor(B, NumPeople)]
+            counts_dict: Dict[str, Tensor(B, 1)]
+            recon_outputs: List[Tensor]
         """
-        # Encode Fields -> Single Vector
-        # z: (B, latent_dim)
         z = self.field_encoder(field_tensors)
-        
-        # 1. Reconstruction Branch
         recon_outputs = self.field_decoder(z)
         
-        # 2. Prediction Branch (Trunk)
-        # Project to Trunk Width
-        feat = self.trunk_proj(z) # (B, hidden)
+        feat = self.trunk_proj(z)
+        feat = self.trunk(feat)
         
-        # Deep Logic
-        feat = self.trunk(feat)   # (B, hidden)
+        logits_dict = {}
+        counts_dict = {}
         
-        # Output Factorization
-        bottleneck = self.people_bottleneck(feat)         # (B, output_rank)
-        people_logits = self.people_expansion(bottleneck) # (B, num_people)
-        
-        # Count
-        count_pred = self.count_head(feat)                # (B, 1)
-        
-        return people_logits, count_pred, recon_outputs
+        for name in self.people_bottlenecks.keys():
+            # Classify
+            bn = self.people_bottlenecks[name](feat)
+            logits = self.people_expansions[name](bn)
+            logits_dict[name] = logits
+            
+            # Count
+            cnt = self.count_heads[name](feat)
+            counts_dict[name] = cnt
+            
+        return logits_dict, counts_dict, recon_outputs

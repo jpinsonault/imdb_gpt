@@ -1,8 +1,8 @@
 # config.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-
+from typing import List, Dict
 
 @dataclass
 class ProjectConfig:
@@ -34,8 +34,8 @@ class ProjectConfig:
 
     movie_limit: int = 100000000000
 
-    num_workers: int = 0
-    prefetch_factor: int = 0
+    num_workers: int = 4
+    prefetch_factor: int = 2
     max_training_steps: int | None = None
 
     use_cache: bool = True
@@ -60,61 +60,44 @@ class ProjectConfig:
     seq_decoder_recon_samples: int = 5
     seq_decoder_table_width: int = 120
     
-    # Model Architecture
     seq_decoder_len: int = 10 
     seq_decoder_hidden_dim: int = 256
     seq_decoder_layers: int = 6
     seq_decoder_heads: int = 8
     seq_decoder_dropout: float = 0.1
-    
-    # Optimizer
     seq_decoder_lr: float = 3e-4
     seq_decoder_weight_decay: float = 1e-2
-
-    # Loss Weights
     seq_decoder_w_latent: float = 1.0
     seq_decoder_w_recon: float = 1.0
     seq_decoder_w_presence: float = 1.0
 
-    # --- Hybrid Set Model Settings (New) ---
+    # --- Hybrid Set Model Settings ---
     hybrid_set_epochs: int = 100
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0 
     
-    # The Model
+    # Architecture
     hybrid_set_latent_dim: int = 128      # Output of Transformer Aggregator
     hybrid_set_hidden_dim: int = 1024     # Width of ResNet Trunk
     hybrid_set_depth: int = 12            # Depth of ResNet Trunk
-    hybrid_set_output_rank: int = 64      # Low-Rank bottleneck for people
+    hybrid_set_output_rank: int = 64      # Base Rank for output heads
     hybrid_set_dropout: float = 0.0
     
+    # Loss Weights
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05
+    
     hybrid_set_save_interval: int = 500
     hybrid_set_recon_interval: int = 200
 
-    # Path Siren (legacy/future)
-    path_siren_people_count: int = 10
-    path_siren_lr: float = 0.001
-    path_siren_weight_decay: float = 0.0
-    path_siren_epochs: int = 100
-    path_siren_layers: int = 10
-    path_siren_hidden_mult: float = 4.0
-    path_siren_omega0_first: float = 30.0
-    path_siren_omega0_hidden: float = 1.0
-    path_siren_callback_interval: int = 20
-    path_siren_recon_num_samples: int = 2
-    path_siren_table_width: int = 60
-    path_siren_cache_capacity: int = 200000
-    path_siren_save_interval: int = 500
-
-    path_siren_movie_limit: int | None = None
-    path_siren_loss_w_title_latent: float = 1.0
-    path_siren_loss_w_title_recon: float = 1.0
-    path_siren_loss_w_people: float = 1.0
-    path_siren_loss_w_latent_path: float = 1.0
-    path_siren_seed: int = 1337
-    path_siren_time_fourier: int = 0
+    # Defines which heads to build and their relative rank multipliers
+    # e.g., Cast is complex (1.0), Director is simpler (0.5)
+    hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
+        "cast": 1.0,
+        "director": 0.5,
+        "writer": 0.5,
+        "crew": 0.5
+    })
 
     # Image AE / Siren (unchanged)
     image_ae_data_dir: str = "data/image_autoencoder"

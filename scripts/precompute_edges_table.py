@@ -35,11 +35,11 @@ def create_edges_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE edges (
-            edgeId       INTEGER PRIMARY KEY AUTOINCREMENT,
-            tconst       TEXT NOT NULL,
-            nconst       TEXT NOT NULL,
-            movie_hash   INTEGER,
-            person_hash  INTEGER,
+            edgeId        INTEGER PRIMARY KEY AUTOINCREMENT,
+            tconst        TEXT NOT NULL,
+            nconst        TEXT NOT NULL,
+            movie_hash    INTEGER,
+            person_hash   INTEGER,
             UNIQUE(tconst, nconst) ON CONFLICT IGNORE
         );
         """
@@ -190,8 +190,10 @@ def main():
         conn.execute("DROP TABLE IF EXISTS temp_valid_movies")
         conn.execute("DROP TABLE IF EXISTS temp_valid_people")
         
-        print("[Cleanup] Vacuuming database to reclaim disk space (this takes a while)...")
-        conn.execute("VACUUM") 
+        # Disabled VACUUM to prevent hanging on large DBs (~40min for 17GB).
+        # You can run 'sqlite3 data/imdb.db "VACUUM;"' manually if you need to reclaim disk space.
+        # print("[Cleanup] Vacuuming database to reclaim disk space (this takes a while)...")
+        # conn.execute("VACUUM") 
         
         print("\nAll done. `edges` table ready and optimized.")
         

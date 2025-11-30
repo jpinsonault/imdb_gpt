@@ -7,14 +7,7 @@ import logging
 from prettytable import PrettyTable
 
 class HybridSetReconLogger:
-    def __init__(
-        self,
-        dataset, 
-        interval_steps: int = 200,
-        num_samples: int = 3,
-        table_width: int = 80,
-        threshold: float = 0.5
-    ):
+    def __init__(self, dataset, interval_steps=200, num_samples=3, table_width=80, threshold=0.5):
         self.dataset = dataset
         self.every = max(1, int(interval_steps))
         self.num_samples = num_samples
@@ -24,135 +17,89 @@ class HybridSetReconLogger:
     def _get_name(self, idx):
         return self.dataset.idx_to_name.get(idx, f"ID:{idx}")
 
-    def _decode_movie_title(self, field_tensors_sample):
-        """
-        field_tensors_sample: List[Tensor] corresponding to one movie
-        """
-        title = "???"
-        year = ""
-        
-        # We iterate through the dataset fields
-        for f, tensor_val in zip(self.dataset.fields, field_tensors_sample):
-            # Using render_ground_truth as these are input tensors
-            val_str = f.render_ground_truth(tensor_val)
-            
-            if f.name == "primaryTitle":
-                title = val_str
-            elif f.name == "startYear":
-                year = val_str
-                
+    def _decode_movie_title(self, field_tensors):
+        title, year = "???", ""
+        for f, val in zip(self.dataset.fields, field_tensors):
+            s = f.render_ground_truth(val)
+            if f.name == "primaryTitle": title = s
+            elif f.name == "startYear": year = s
         return f"{title} ({year})"
 
-    def _format_list(self, items, header_str):
-        if not items:
-            return f"{header_str}: [None]"
-        entries = [f"{name} ({p:.2f})" for name, p in items]
-        full_str = ", ".join(entries)
-        prefix = f"{header_str} ({len(items)}): "
-        wrapper = textwrap.TextWrapper(initial_indent=prefix, subsequent_indent=" " * 4, width=self.w)
-        return wrapper.fill(full_str)
-
-    def _wrap_cell(self, text, width=40):
-        if not text: return ""
-        return "\n".join(textwrap.wrap(str(text), width=width))
+    def _format_list(self, items, header):
+        if not items: return f"{header}: [None]"
+        text = ", ".join([f"{n} ({p:.2f})" for n, p in items])
+        wrapper = textwrap.TextWrapper(initial_indent=f"{header}: ", subsequent_indent="    ", width=self.w)
+        return wrapper.fill(text)
 
     @torch.no_grad()
-    def step(self, global_step: int, model, batch_inputs, targets, count_targets, run_logger):
-        if (global_step + 1) % self.every != 0:
-            return
-
+    def step(self, global_step, model, inputs, coords_dict, count_targets, run_logger):
+        """
+        coords_dict: {head_name: Tensor(N, 2)} [row_idx, col_idx]
+        """
+        if (global_step + 1) % self.every != 0: return
         model.eval()
+        logits_dict, counts_dict, recon_outputs = model(inputs)
         
-        # Forward pass
-        logits, pred_counts_scalar, recon_outputs = model(batch_inputs)
-        probs = torch.sigmoid(logits)
+        B = inputs[0].size(0)
+        # Pick random samples
+        indices = np.random.choice(B, size=min(self.num_samples, B), replace=False)
         
-        B = logits.size(0)
-        n_samp = min(self.num_samples, B)
-        sample_idxs = np.random.choice(B, size=n_samp, replace=False)
+        output_log = []
         
-        log_output = []
-        
-        for i in sample_idxs:
-            # 1. Reconstruct Inputs Table
-            # Extract i-th sample from batch inputs and batch outputs
-            input_sample_tensors = [t[i].cpu() for t in batch_inputs]
-            recon_sample_tensors = [t[i].cpu() for t in recon_outputs]
+        for i in indices:
+            # 1. Metadata
+            inp_sample = [t[i].cpu() for t in inputs]
+            rec_sample = [t[i].cpu() for t in recon_outputs]
+            movie_title = self._decode_movie_title(inp_sample)
             
-            # Use helpers to get title for the header
-            movie_str = self._decode_movie_title(input_sample_tensors)
+            t = PrettyTable(["Field", "Orig", "Recon"])
+            t.align = "l"
+            for f, orig, rec in zip(self.dataset.fields, inp_sample, rec_sample):
+                t.add_row([f.name, f.render_ground_truth(orig)[:40], f.render_prediction(rec)[:40]])
             
-            # Build PrettyTable for Metadata Reconstruction
-            table = PrettyTable(["Field", "Original", "Reconstructed"])
-            table.align["Field"] = "l"
-            table.align["Original"] = "l"
-            table.align["Reconstructed"] = "l"
+            output_log.append(f"\n=== {movie_title} ===")
+            output_log.append(str(t))
             
-            for f, in_t, out_t in zip(self.dataset.fields, input_sample_tensors, recon_sample_tensors):
-                # Clean API usage: Field knows how to render GT vs Pred
-                orig_str = f.render_ground_truth(in_t)
-                recon_str = f.render_prediction(out_t)
+            # 2. Heads
+            for head in logits_dict.keys():
+                # Reconstruct True Indices from Sparse Coords for this sample `i`
+                true_idxs = set()
+                coords = coords_dict.get(head)
+                if coords is not None:
+                    # Filter coords where row == i
+                    # Note: coords are on CPU in collate, but might be on GPU if passed from train loop
+                    if coords.device.type != 'cpu':
+                        coords = coords.cpu()
+                    
+                    # Boolean mask for this batch item
+                    mask = (coords[:, 0] == i)
+                    if mask.any():
+                        true_idxs = set(coords[mask, 1].numpy().tolist())
+
+                tgt_cnt_t = count_targets.get(head)
+                true_count = tgt_cnt_t[i].item() if tgt_cnt_t is not None else 0.0
+
+                # Get Preds
+                probs = torch.sigmoid(logits_dict[head][i])
+                pred_idxs = set((probs > self.threshold).nonzero().flatten().cpu().numpy())
+                pred_count = counts_dict[head][i].item()
                 
-                table.add_row([
-                    f.name, 
-                    self._wrap_cell(orig_str, width=30), 
-                    self._wrap_cell(recon_str, width=30)
-                ])
-
-            # 2. Gather Ground Truth & Predictions for People
-            true_indices_t = torch.nonzero(targets[i]).flatten()
-            true_indices = set(true_indices_t.cpu().numpy().tolist())
-            
-            pred_indices_t = (probs[i] > self.threshold).nonzero().flatten()
-            pred_indices = set(pred_indices_t.cpu().numpy().tolist())
-            
-            # Set Operations
-            tp_idxs = true_indices.intersection(pred_indices)
-            fp_idxs = pred_indices - true_indices
-            fn_idxs = true_indices - pred_indices
-            
-            # Helper for display
-            def get_display_list(idx_set):
-                if not idx_set: return []
-                lst = list(idx_set)
-                p_vals = probs[i, lst].cpu().numpy()
-                zipped = sorted(zip(lst, p_vals), key=lambda x: x[1], reverse=True)
-                return [(self._get_name(idx), p) for idx, p in zipped]
-
-            matches_list = get_display_list(tp_idxs)
-            extras_list = get_display_list(fp_idxs)
-            missed_list = get_display_list(fn_idxs)
-            
-            true_count = int(count_targets[i].item())
-            pred_count_val = pred_counts_scalar[i].item()
-            
-            header = f"\n=== {movie_str} ==="
-            stats = f"Count: True={true_count} | Pred={pred_count_val:.1f} | IoU={len(tp_idxs) / max(1, len(true_indices | pred_indices)):.2f}"
-            
-            log_output.append(header)
-            log_output.append(str(table)) # Add the reconstruction table
-            log_output.append(stats)
-            log_output.append("-" * 20)
-            
-            limit = 15
-            
-            s_matches = self._format_list(matches_list[:limit], "[+] MATCHES")
-            if len(matches_list) > limit: s_matches += f" ... (+{len(matches_list)-limit})"
-            
-            s_extras = self._format_list(extras_list[:limit], "[x] FALSE POS")
-            if len(extras_list) > limit: s_extras += f" ... (+{len(extras_list)-limit})"
-            
-            s_missed = self._format_list(missed_list[:limit], "[-] MISSED")
-            if len(missed_list) > limit: s_missed += f" ... (+{len(missed_list)-limit})"
-            
-            log_output.append(s_matches)
-            log_output.append(s_extras)
-            log_output.append(s_missed)
-
-        full_text = "\n".join(log_output)
+                tp = true_idxs & pred_idxs
+                fp = pred_idxs - true_idxs
+                fn = true_idxs - pred_idxs
+                
+                def fmt(idx_set):
+                    l = sorted([(self._get_name(x), probs[x].item()) for x in idx_set], key=lambda x:x[1], reverse=True)
+                    return l[:10]
+                
+                output_log.append(f"\n--- Head: {head.upper()} ---")
+                output_log.append(f"Count: True={int(true_count)} Pred={pred_count:.1f}")
+                output_log.append(self._format_list(fmt(tp), "[+] Match"))
+                output_log.append(self._format_list(fmt(fp), "[x] FalsePos"))
+                output_log.append(self._format_list(fmt(fn), "[-] Missed"))
+                
+        full_text = "\n".join(output_log)
         print(full_text)
+        if run_logger: run_logger.add_text("recon/text", f"<pre>{full_text}</pre>", global_step)
         
-        if run_logger:
-            run_logger.add_text("hybrid_set/recon", f"<pre>{full_text}</pre>", global_step)
-            
         model.train()

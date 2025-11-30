@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-from config import project_config, ensure_dirs, ProjectConfig
+from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.model import HybridSetModel
@@ -89,192 +89,160 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
         logging.error(f"Failed to save training state: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Hybrid Set (Metadata->People) Decoder")
-    parser.add_argument("--new-run", action="store_true", help="Start fresh")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--new-run", action="store_true")
     args = parser.parse_args()
-
     cfg = project_config
     ensure_dirs(cfg)
     
-    # 1. Prepare Data
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
     
-    num_people = ds.num_people
-    
-    # Custom collate needs reference to dataset to slice big tensors
     def _collate(batch_indices):
         return collate_hybrid_set(batch_indices, ds)
 
     loader = DataLoader(
-        ds, 
-        batch_size=cfg.batch_size, 
-        shuffle=True, 
-        num_workers=int(cfg.num_workers),
-        collate_fn=_collate,
-        pin_memory=False # Manual pinning in collate if needed, but big tensors usually pinned if mmap
+        ds, batch_size=cfg.batch_size, shuffle=True, 
+        num_workers=int(cfg.num_workers), collate_fn=_collate,
+        pin_memory=False
     )
 
-    logging.info(f"Data loaded: {len(ds)} Movies, {num_people} People.")
-
-    # 2. Build Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-
+    
     model = HybridSetModel(
         fields=ds.fields,
-        num_people=num_people,
+        num_people=ds.num_people,
+        heads_config=cfg.hybrid_set_heads,
         latent_dim=int(cfg.hybrid_set_latent_dim),
         hidden_dim=int(cfg.hybrid_set_hidden_dim),
-        output_rank=int(cfg.hybrid_set_output_rank),
+        base_output_rank=int(cfg.hybrid_set_output_rank),
         depth=int(cfg.hybrid_set_depth),
         dropout=float(cfg.hybrid_set_dropout)
     ).to(device)
 
-    # --- Print Model Summary ---
-    # Create dummy inputs from the dataset to trace the model
-    dummy_indices = [0, 1]
-    dummy_inputs, _, _, _ = _collate(dummy_indices)
-    dummy_inputs = [x.to(device) for x in dummy_inputs]
-    
-    print("\n" + "="*40)
-    print("      HYBRID SET MODEL ARCHITECTURE      ")
-    print("="*40)
-    print_model_summary(model, [dummy_inputs])
-    print("="*40 + "\n")
-    # ---------------------------
+    # Dummy forward for summary
+    dummy_idxs = [0]
+    inputs, _, _, _ = _collate(dummy_idxs)
+    inputs = [x.to(device) for x in inputs]
+    print_model_summary(model, [inputs])
 
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg.hybrid_set_lr),
-        weight_decay=float(cfg.hybrid_set_weight_decay)
-    )
-
-    # 3. Training Setup
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
-    recon_logger = HybridSetReconLogger(
-        dataset=ds,
-        interval_steps=int(cfg.hybrid_set_recon_interval)
-    )
+    recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
-    sched = make_lr_scheduler(opt, len(loader) * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
+    sched = make_lr_scheduler(opt, len(loader)*num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
 
-    start_epoch = 0
-    global_step = 0
-    checkpoint_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
-
-    if checkpoint_path.exists() and not args.new_run:
+    start_epoch, global_step = 0, 0
+    ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
+    if ckpt_path.exists() and not args.new_run:
         try:
-            ckpt = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(ckpt["model_state_dict"])
-            opt.load_state_dict(ckpt["optimizer_state_dict"])
-            start_epoch = ckpt["epoch"]
-            global_step = ckpt["global_step"]
-            if ckpt["scheduler_state_dict"] and sched:
-                sched.load_state_dict(ckpt["scheduler_state_dict"])
-            logging.info(f"Resumed from Epoch {start_epoch}, Step {global_step}")
+            c = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(c["model_state_dict"])
+            opt.load_state_dict(c["optimizer_state_dict"])
+            start_epoch = c["epoch"]
+            global_step = c["global_step"]
+            if c["scheduler_state_dict"] and sched: sched.load_state_dict(c["scheduler_state_dict"])
+            logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
-            logging.error(f"Failed resume: {e}")
-
-    if run_logger and run_logger.run_dir: run_logger.step = global_step
-
-    stop_flag = {"stop": False}
-    def _sig(s, f): stop_flag["stop"] = True
-    signal.signal(signal.SIGINT, _sig)
+            logging.error(f"Resume failed: {e}")
     
-    w_bce = float(cfg.hybrid_set_w_bce)
-    w_count = float(cfg.hybrid_set_w_count)
-    w_recon = 1.0 # Reconstruction weight
-    save_int = int(cfg.hybrid_set_save_interval)
+    if run_logger.run_dir: run_logger.step = global_step
+    stop_flag = {"stop": False}
+    signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
 
-    # 4. Loop
+    w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
+
     for epoch in range(start_epoch, num_epochs):
-        pbar = tqdm(loader, dynamic_ncols=True, desc=f"Epoch {epoch+1}/{num_epochs}")
-        
+        pbar = tqdm(loader, dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         for batch in pbar:
             iter_start = time.perf_counter()
+            # unpack: coords_dict contains tensors of shape (N, 2) [row, col]
+            inputs, coords_dict, count_targets, _ = batch
             
-            # Unpack
-            batch_inputs, multi_hot_targets, count_targets, _ = batch
-            
-            batch_inputs = [x.to(device, non_blocking=True) for x in batch_inputs]
-            multi_hot_targets = multi_hot_targets.to(device, non_blocking=True)
-            count_targets = count_targets.to(device, non_blocking=True)
+            inputs = [x.to(device, non_blocking=True) for x in inputs]
             
             model.train()
             opt.zero_grad()
             
-            # Forward pass now returns reconstruction outputs
-            logits, pred_counts, recon_outputs = model(batch_inputs)
+            logits_dict, counts_dict, recon_outputs = model(inputs)
             
-            # 1. Prediction Losses
-            loss_set = asymmetric_loss(logits, multi_hot_targets)
-            loss_count = F.mse_loss(pred_counts, count_targets)
+            total_set_loss = 0.0
+            total_count_loss = 0.0
             
-            # 2. Reconstruction Loss
-            loss_recon = torch.tensor(0.0, device=device)
-            field_losses = {}
-
-            for f, pred, tgt in zip(ds.fields, recon_outputs, batch_inputs):
-                f_loss = f.compute_loss(pred, tgt) * float(f.weight)
-                loss_recon = loss_recon + f_loss
-                field_losses[f.name] = f_loss.item()
+            batch_size = inputs[0].size(0)
             
-            total_loss = w_bce * loss_set + w_count * loss_count + w_recon * loss_recon
+            for head_name in logits_dict.keys():
+                # --- FAST TARGET CONSTRUCTION ON GPU ---
+                # 1. Get sparse coords
+                coords = coords_dict.get(head_name)
+                
+                # 2. Build Dense Target on Device
+                # Initialize zeros (B, NumPeople)
+                target_dense = torch.zeros(
+                    batch_size, ds.num_people, 
+                    device=device, dtype=torch.float32
+                )
+                
+                if coords is not None and coords.size(0) > 0:
+                    coords = coords.to(device, non_blocking=True)
+                    # Use index_put or scatter. Scatter is usually safe.
+                    # dim=0 (row), dim=1 (col) -> (N, 2)
+                    # We want target[coords[:,0], coords[:,1]] = 1.0
+                    target_dense.index_put_(
+                        (coords[:, 0], coords[:, 1]), 
+                        torch.tensor(1.0, device=device)
+                    )
+                
+                # 3. Counts
+                t_cnt = count_targets.get(head_name)
+                if t_cnt is None:
+                    t_cnt = torch.zeros(batch_size, 1, device=device)
+                else:
+                    t_cnt = t_cnt.to(device, non_blocking=True)
+                    
+                total_set_loss += asymmetric_loss(logits_dict[head_name], target_dense)
+                total_count_loss += F.mse_loss(counts_dict[head_name], t_cnt)
             
-            total_loss.backward()
+            # Recon Loss
+            recon_loss = 0.0
+            for f, p, t in zip(ds.fields, recon_outputs, inputs):
+                recon_loss += f.compute_loss(p, t) * float(f.weight)
+                
+            loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
+            loss.backward()
             opt.step()
             if sched: sched.step()
             
             iter_time = time.perf_counter() - iter_start
             
-            # Metrics
-            with torch.no_grad():
-                pos_mask = (multi_hot_targets > 0.5)
-                if pos_mask.sum() > 0:
-                    pos_prob = torch.sigmoid(logits)[pos_mask].mean().item()
-                else:
-                    pos_prob = 0.0
-                probs = torch.sigmoid(logits)
-                neg_prob = probs[~pos_mask].mean().item()
-            
             if run_logger:
-                run_logger.add_scalar("loss/total", total_loss.item(), global_step)
-                run_logger.add_scalar("loss/set_asymmetric", loss_set.item(), global_step)
-                run_logger.add_scalar("loss/count", loss_count.item(), global_step)
-                run_logger.add_scalar("loss/recon", loss_recon.item(), global_step)
-                
-                # Log per-field losses under a separate header
-                run_logger.add_field_losses("recon_field", field_losses)
-
-                run_logger.add_scalar("metric/pos_prob", pos_prob, global_step)
-                run_logger.add_scalar("metric/neg_prob", neg_prob, global_step)
-                run_logger.add_scalar("time/iter_sec", iter_time, global_step)
+                run_logger.add_scalar("loss/total", loss.item(), global_step)
+                run_logger.add_scalar("loss/set", total_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
+                run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.tick()
-                
-            recon_logger.step(global_step, model, batch_inputs, multi_hot_targets, count_targets, run_logger)
             
-            pbar.set_postfix(
-                loss=f"{total_loss.item():.4f}", 
-                set=f"{loss_set.item():.4f}", 
-                recon=f"{loss_recon.item():.4f}",
-                pos=f"{pos_prob:.2f}"
-            )
+            # Pass sparse coords to recon logger (requires update in recon logger to handle sparse if needed, 
+            # OR we pass the dense we just built)
+            # We must be careful not to hold onto the massive dense tensors.
+            # The Recon logger usually runs infrequently. 
+            # We can re-build a *small sample* dense tensor inside the logger if needed.
             
+            # Update: We need to adapt the logger call slightly because we changed `multi_targets` signature
+            recon_logger.step(global_step, model, inputs, coords_dict, count_targets, run_logger)
+            
+            pbar.set_postfix(loss=f"{loss.item():.4f}", set=f"{total_set_loss.item():.4f}")
             global_step += 1
             
-            if global_step % save_int == 0:
+            if global_step % int(cfg.hybrid_set_save_interval) == 0:
                 save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch, global_step, cfg)
-                torch.save(model.state_dict(), Path(cfg.model_dir) / "HybridSetModel.pt")
-
+            
             if stop_flag["stop"]: break
+        if stop_flag["stop"]: break
         
         save_checkpoint(Path(cfg.model_dir), model, opt, sched, epoch+1, global_step, cfg)
-        if stop_flag["stop"]: break
-
-    torch.save(model.state_dict(), Path(cfg.model_dir) / "HybridSetModel_final.pt")
+        
     if run_logger: run_logger.close()
 
 if __name__ == "__main__":
