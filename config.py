@@ -73,13 +73,13 @@ class ProjectConfig:
 
     hybrid_set_epochs: int = 100
     hybrid_set_lr: float = 1e-3
-    hybrid_set_weight_decay: float = 0.0 
+    hybrid_set_weight_decay: float = 1e-4
     
     # Architecture
     hybrid_set_latent_dim: int = 128
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 12
-    hybrid_set_output_rank: int = 64
+    hybrid_set_output_rank: int = 256
     hybrid_set_dropout: float = 0.0
     
     # Loss Weights

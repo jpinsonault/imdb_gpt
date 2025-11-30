@@ -2,77 +2,32 @@
 
 import torch
 import torch.nn as nn
+import math
 from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder, _FieldEncoders
 
-class FiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation.
-    Projects a conditioning latent 'z' into gamma (scale) and beta (shift)
-    to modulate the features 'x'.
-    """
-    def __init__(self, feature_dim: int, cond_dim: int):
+class ResBlock(nn.Module):
+    def __init__(self, dim, dropout=0.0):
         super().__init__()
-        # Output is 2 * feature_dim because we need both gamma and beta
-        self.proj = nn.Linear(cond_dim, feature_dim * 2)
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.Dropout(dropout)
+        )
+        nn.init.constant_(self.net[-2].weight, 0)
         
-        # Initialize to identity: gamma=0 (which becomes 1.0), beta=0
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: [B, feature_dim]
-        # cond: [B, cond_dim]
-        
-        params = self.proj(cond)
-        gamma, beta = params.chunk(2, dim=-1)
-        
-        # Formula: x * (1 + gamma) + beta
-        return x * (1.0 + gamma) + beta
-
-class FiLMedResBlock(nn.Module):
-    def __init__(self, dim: int, cond_dim: int, dropout=0.0):
-        super().__init__()
-        
-        self.fc1 = nn.Linear(dim, dim)
-        self.ln1 = nn.LayerNorm(dim)
-        
-        # FiLM injection after first normalization
-        self.film = FiLM(dim, cond_dim)
-        
-        self.act = nn.GELU()
-        self.drop1 = nn.Dropout(dropout)
-        
-        self.fc2 = nn.Linear(dim, dim)
-        self.ln2 = nn.LayerNorm(dim)
-        self.drop2 = nn.Dropout(dropout)
-
-        # Zero-init the last LayerNorm weight to make the block an identity function at init
-        nn.init.constant_(self.ln2.weight, 0)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        residual = x
-        
-        x = self.fc1(x)
-        x = self.ln1(x)
-        
-        # Apply Movie Latent Modulation
-        x = self.film(x, cond)
-        
-        x = self.act(x)
-        x = self.drop1(x)
-        
-        x = self.fc2(x)
-        x = self.ln2(x)
-        x = self.drop2(x)
-        
-        return residual + x
+    def forward(self, x):
+        return x + self.net(x)
 
 class HybridSetModel(nn.Module):
     def __init__(
         self,
         fields: list,
         num_people: int, 
-        heads_config: dict,     
+        heads_config: dict,      
         head_vocab_sizes: dict, 
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
@@ -93,12 +48,7 @@ class HybridSetModel(nn.Module):
         
         # 3. Trunk
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
-        
-        # Changed from nn.Sequential to ModuleList to support conditional input (FiLM)
-        self.trunk_blocks = nn.ModuleList([
-            FiLMedResBlock(hidden_dim, latent_dim, dropout) 
-            for _ in range(depth)
-        ])
+        self.trunk = nn.Sequential(*[ResBlock(hidden_dim, dropout) for _ in range(depth)])
         
         # 4. Multi-Heads
         self.people_bottlenecks = nn.ModuleDict()
@@ -131,6 +81,17 @@ class HybridSetModel(nn.Module):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
+        # --- SPECIAL INITIALIZATION FOR SPARSE HEADS ---
+        # We manually override the initialization for the expansion heads (the final output layers).
+        # We set the bias to a low prior probability (e.g. 0.01) so the sigmoid output 
+        # starts at ~0.01 instead of 0.5. This prevents massive negative gradients 
+        # from the sparse 0s drowning out the few positive 1s.
+        for name, layer in self.people_expansions.items():
+            if m is layer:
+                prior_prob = 0.01
+                bias_value = -math.log((1 - prior_prob) / prior_prob)
+                nn.init.constant_(m.bias, bias_value)
+
     def forward(self, field_tensors: list, return_embeddings: bool = False):
         """
         Args:
@@ -144,11 +105,7 @@ class HybridSetModel(nn.Module):
         
         # 3. Trunk
         feat = self.trunk_proj(z)
-        
-        # Apply FiLM-modulated ResBlocks
-        # We pass 'z' (the movie latent) to every block to condition the processing
-        for block in self.trunk_blocks:
-            feat = block(feat, cond=z)
+        feat = self.trunk(feat)
         
         logits_dict = {}
         counts_dict = {}

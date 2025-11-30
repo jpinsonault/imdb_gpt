@@ -12,7 +12,6 @@ from pathlib import Path
 from dataclasses import asdict
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
@@ -27,53 +26,87 @@ from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def compute_dense_focal_loss(
-    embedding_batch, 
-    head_layer, 
-    raw_padded_indices, 
-    mapping_tensor, 
-    vocab_size,
-    gamma=2.0
+def compute_sampled_asymmetric_loss(
+    embedding_batch,    
+    head_layer,          
+    positive_coords,     
+    num_negatives=2048, 
+    gamma_neg=2.0,  # Focus on hard negatives
+    gamma_pos=0.0,  # Do NOT downweight positives
+    eps=1e-8
 ):
     """
-    A minimal improvement over BCE: Dense Focal Loss.
-    
-    Why: In a vocab of 10,000 people, a movie only has ~5 cast members.
-    Standard BCE is dominated by the 9,995 'easy' negatives (zeros).
-    Focal loss down-weights these easy negatives using (1 - p_t)^gamma,
-    preventing the model from just predicting 'zero' everywhere.
+    Computes BCE loss over specific positive coordinates and random negative samples.
+    Uses Asymmetric/Focal logic to handle sparsity.
     """
     device = embedding_batch.device
-    B = embedding_batch.shape[0]
-
-    # 1. Compute Logits
-    logits = head_layer(embedding_batch)
-
-    # 2. Create Dense Targets
-    targets = torch.zeros((B, vocab_size), device=device, dtype=torch.float32)
-    valid_mask = (raw_padded_indices != -1)
+    batch_size = embedding_batch.shape[0]
+    num_vocab = head_layer.out_features
     
-    if valid_mask.any():
-        rows, cols = torch.nonzero(valid_mask, as_tuple=True)
-        global_ids = raw_padded_indices[rows, cols].long()
-        local_ids = mapping_tensor[global_ids]
+    # --- POSITIVES ---
+    if positive_coords.shape[0] > 0:
+        pos_b_idx = positive_coords[:, 0]
+        pos_p_idx = positive_coords[:, 1]
         
-        map_mask = (local_ids != -1)
-        final_rows = rows[map_mask]
-        final_locals = local_ids[map_mask]
+        # Gather embeddings for the specific batch items involved in positives
+        pos_embs = embedding_batch[pos_b_idx] 
+        # Gather weights/biases for the specific positive targets
+        pos_w = head_layer.weight[pos_p_idx]
+        pos_b = head_layer.bias[pos_p_idx] if head_layer.bias is not None else 0.0
         
-        targets[final_rows, final_locals] = 1.0
+        # Dot product
+        pos_logits = (pos_embs * pos_w).sum(dim=1) + pos_b
+        
+        # Asymmetric Loss on Positives (Usually simple BCE, gamma=0)
+        # Loss = -log(p) * (1-p)^gamma
+        pos_probs = torch.sigmoid(pos_logits)
+        pos_loss_raw = -torch.log(pos_probs.clamp(min=eps))
+        if gamma_pos > 0:
+            pos_loss_raw = pos_loss_raw * ((1 - pos_probs).pow(gamma_pos))
+            
+        loss_pos = pos_loss_raw.sum()
+    else:
+        loss_pos = torch.tensor(0.0, device=device)
 
-    # 3. Compute BCE (element-wise, no reduction yet)
-    bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    # --- NEGATIVES ---
+    # We sample indices [0, vocab_size]
+    neg_p_idx = torch.randint(0, num_vocab, (num_negatives,), device=device)
     
-    # 4. Apply Focal Term
-    pt = torch.exp(-bce_loss) # pt is the probability of the *true* class
-    focal_term = (1.0 - pt).pow(gamma)
+    neg_w = head_layer.weight[neg_p_idx]
+    neg_b = head_layer.bias[neg_p_idx] if head_layer.bias is not None else 0.0
     
-    # 5. Weighted Loss
-    return (focal_term * bce_loss).mean()
+    # Calculate logits for ALL batch items against THESE negatives
+    # (Batch, Dim) @ (Negs, Dim).T -> (Batch, Negs)
+    neg_logits = embedding_batch @ neg_w.t() + neg_b
+    
+    # Asymmetric Loss on Negatives (Focal, gamma=2 to suppress easy negatives)
+    # Target is 0. Loss = -log(1-p) * p^gamma
+    neg_probs = torch.sigmoid(neg_logits)
+    neg_loss_raw = -torch.log((1 - neg_probs).clamp(min=eps))
+    
+    if gamma_neg > 0:
+        neg_loss_raw = neg_loss_raw * (neg_probs.pow(gamma_neg))
+        
+    # Masking Collisions: If we accidentally sampled a True Positive as a Negative
+    if positive_coords.shape[0] > 0:
+        # Expand dims to compare: (NumPos, 1) vs (1, NumNeg)
+        collisions = (pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0))
+        if collisions.any():
+            # Find which batch index corresponds to the positive collision
+            # c_pos_idx is index into 'pos_coords', c_neg_idx is index into 'neg_p_idx'
+            c_pos_idx, c_neg_idx = torch.nonzero(collisions, as_tuple=True)
+            
+            # Get the actual batch row involved
+            colliding_batch_rows = pos_b_idx[c_pos_idx]
+            
+            # Zero out the loss for (batch_row, neg_col)
+            neg_loss_raw[colliding_batch_rows, c_neg_idx] = 0.0
 
+    loss_neg = neg_loss_raw.sum()
+
+    # Normalize by Batch Size (standard) rather than number of edges, 
+    # to keep loss scale consistent regardless of sparsity.
+    return (loss_pos + loss_neg) / batch_size
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None: return None
@@ -141,8 +174,9 @@ def main():
     cfg = project_config
     ensure_dirs(cfg)
     
+    # E2E Training requires fresh cache of RAW fields if forcing new run
     if args.no_resume:
-        cfg.refresh_cache = False  
+        cfg.refresh_cache = False  # DO NOT refresh cache, just reset weights
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
@@ -170,6 +204,18 @@ def main():
 
     print("\n" + "="*50)
     print_model_summary(model, [sample_inputs])
+    
+    print("\n=== HybridSetModel Dimensions (End-to-End) ===")
+    print(f"  Input:                  Raw Fields")
+    print(f"  Learned Latent Dim:     {cfg.hybrid_set_latent_dim}")
+    print(f"  Trunk Hidden Dim:       {cfg.hybrid_set_hidden_dim}")
+    print(f"  Trunk Depth:            {cfg.hybrid_set_depth}")
+    print(f"  Global Vocab:           {ds.num_people}")
+    print("  Heads:")
+    for name in model.people_bottlenecks.keys():
+        rank = model.people_bottlenecks[name].out_features
+        out_dim = model.people_expansions[name].out_features
+        print(f"    - {name:<12} | Rank: {rank:<4} | Vocab: {out_dim}")
     print("="*50 + "\n")
     # ---------------------------
 
@@ -217,27 +263,33 @@ def main():
     signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
 
     w_bce, w_count, w_recon = float(cfg.hybrid_set_w_bce), float(cfg.hybrid_set_w_count), 1.0
-    focal_gamma = float(cfg.hybrid_set_focal_gamma)
+    NUM_NEG_SAMPLES = 2048
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         
         for _ in pbar:
             iter_start = time.perf_counter()
+            
+            # 1. Fetch data (RAW FIELDS)
             inputs_cpu, heads_padded_cpu, _ = next(loader)
+            
+            # 2. Transfer to GPU
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
             
             model.train()
             opt.zero_grad(set_to_none=True)
             
             with autocast():
+                # E2E: Pass raw inputs to model. 
+                # Model encodes them -> Z -> Trunk -> Heads
                 embeddings_dict, counts_dict, recon_outputs = model(inputs, return_embeddings=True)
                 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
-                recon_loss = 0.0
                 
-                # Recon Loss
+                # Decoder Regularization Loss: Compare decoded fields to inputs
+                recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_outputs, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
                 
@@ -262,32 +314,39 @@ def main():
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt
 
-                        # --- DENSE FOCAL LOSS ---
-                        if head_name in mapping_tensors:
-                            head_layer = model.people_expansions[head_name]
-                            vocab_size = head_layer.out_features
-                            
-                            loss_head = compute_dense_focal_loss(
-                                embedding_batch=embeddings_dict[head_name],
-                                head_layer=head_layer,
-                                raw_padded_indices=raw_padded,
-                                mapping_tensor=mapping_tensors[head_name],
-                                vocab_size=vocab_size,
-                                gamma=focal_gamma
-                            )
-                            
-                            total_set_loss += loss_head
-                            head_metrics[f"{head_name}_focal"] = loss_head.detach()
+                        # Set Loss
+                        rows, cols = torch.nonzero(mask, as_tuple=True)
+                        global_person_ids = raw_padded[rows, cols].long()
+                        
+                        pos_coords = torch.empty((0, 2), dtype=torch.long, device=device)
 
-                            if collect_coords_for_log:
-                                rows, cols = torch.nonzero(mask, as_tuple=True)
-                                global_ids = raw_padded[rows, cols].long()
-                                local_ids = mapping_tensors[head_name][global_ids]
-                                valid_map = (local_ids != -1)
-                                coords_dict_for_log[head_name] = torch.stack(
-                                    [rows[valid_map], local_ids[valid_map]], dim=1
-                                ).cpu()
+                        if global_person_ids.numel() > 0:
+                            if head_name in mapping_tensors:
+                                local_person_ids = mapping_tensors[head_name][global_person_ids]
+                                valid_mask = (local_person_ids != -1)
+                                
+                                if valid_mask.any():
+                                    final_rows = rows[valid_mask]
+                                    final_locals = local_person_ids[valid_mask]
+                                    
+                                    pos_coords = torch.stack([final_rows, final_locals], dim=1)
+                                    
+                        head_layer = model.people_expansions[head_name]
+                        loss_head = compute_sampled_asymmetric_loss(
+                            embedding_batch=embeddings_dict[head_name],
+                            head_layer=head_layer,
+                            positive_coords=pos_coords,
+                            num_negatives=NUM_NEG_SAMPLES,
+                            gamma_neg=2.0, # Focal weight for negatives
+                            gamma_pos=0.0  # Standard weight for positives
+                        )
+                        total_set_loss += loss_head
+                        head_metrics[f"{head_name}_bce"] = loss_head.detach()
 
+                        if collect_coords_for_log:
+                            coords_dict_for_log[head_name] = pos_coords.cpu() 
+
+                # Combine losses
                 loss = w_bce * total_set_loss + w_count * total_count_loss + w_recon * recon_loss
 
             scaler.scale(loss).backward()
@@ -303,6 +362,7 @@ def main():
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
                 run_logger.add_scalar("loss/count_total", total_count_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
+                run_logger.add_scalar("time/iter", iter_time, global_step)
                 current_lr = opt.param_groups[0]['lr']
                 run_logger.add_scalar("lr/group_0", current_lr, global_step)
                 for k, v in head_metrics.items():
