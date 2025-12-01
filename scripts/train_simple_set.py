@@ -36,74 +36,57 @@ class FieldMasker:
         self.device = device
         self.prob = probability
         self.num_fields = len(fields)
-        
-        # Identify indices to always drop (like 'tconst' which is a leak)
         self.always_drop_indices = []
         if always_drop_names:
             for i, f in enumerate(fields):
                 if f.name in always_drop_names:
                     self.always_drop_indices.append(i)
-        
-        # Precompute padding tensors on device
         self.pad_values = []
         for f in self.fields:
             self.pad_values.append(f.get_base_padding_value().to(device))
+        self.last_mask = None
 
     def __call__(self, inputs):
         """
         inputs: List[Tensor], where inputs[i] corresponds to self.fields[i]
         """
-        # Always mask 'always_drop_indices' regardless of probability
-        
         B = inputs[0].shape[0]
-        
-        # 1. Create Bernoulli Mask (1 = keep, 0 = drop)
         keep_prob = 1.0 - self.prob
-        mask = torch.bernoulli(torch.full((B, self.num_fields), keep_prob, device=self.device))
-        
-        # 2. Enforce Always Drop
+        mask = torch.bernoulli(
+            torch.full((B, self.num_fields), keep_prob, device=self.device)
+        )
+
         for idx in self.always_drop_indices:
             mask[:, idx] = 0.0
-            
-        # 3. Safety: Force at least one field to be kept per sample.
-        # We don't want to force-keep 'always_drop' fields though.
+
         valid_indices = [i for i in range(self.num_fields) if i not in self.always_drop_indices]
-        
         if valid_indices:
-            # Check rows where everything is 0
             all_dropped = (mask.sum(dim=1) == 0)
             if all_dropped.any():
-                # For completely empty rows, pick one random valid field to keep
                 rows_to_fix = torch.nonzero(all_dropped).squeeze(1)
-                
-                # Pick random index from valid_indices for each row
-                rand_select = torch.randint(0, len(valid_indices), (rows_to_fix.size(0),), device=self.device)
-                
-                # Map back to global field indices
+                rand_select = torch.randint(
+                    0,
+                    len(valid_indices),
+                    (rows_to_fix.size(0),),
+                    device=self.device,
+                )
                 valid_tensor = torch.tensor(valid_indices, device=self.device)
                 indices_to_keep = valid_tensor[rand_select]
-                
                 mask[rows_to_fix, indices_to_keep] = 1.0
-        
+
         masked_inputs = []
         for i, (x, pad_val) in enumerate(zip(inputs, self.pad_values)):
-            # x shape: (B, D1, D2...)
-            # mask shape: (B,) -> reshape for broadcasting
             m_col = mask[:, i]
-            
-            # View mask as (B, 1, 1...) to match dimensions of x
             view_shape = [B] + [1] * (x.dim() - 1)
             m_view = m_col.view(*view_shape)
-            
-            # Mix: (x * mask) + (pad * (1 - mask))
-            # Cast mask to input dtype to prevent Float/Long type mismatch error
             m_typed = m_view.to(x.dtype)
             pad_typed = pad_val.unsqueeze(0).to(x.dtype)
-
             x_masked = x * m_typed + pad_typed * (1 - m_typed)
             masked_inputs.append(x_masked)
-            
+
+        self.last_mask = mask.detach().cpu()
         return masked_inputs
+
 
 def compute_sampled_asymmetric_loss(
     embedding_batch,    
@@ -235,7 +218,6 @@ def main():
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
     
-    # We use ds.num_items to represent num_movies
     num_movies = len(ds)
     logging.info(f"Dataset contains {num_movies} items.")
 
@@ -257,14 +239,16 @@ def main():
         num_movies=num_movies
     )
 
-    # 1. Move Network to GPU, Enforce CPU Embeddings
     logging.info("Initializing Split Optimization (Net=GPU, Table=CPU)...")
     model.to(device)
     model.movie_embeddings.to("cpu")
     
-    # 2. Setup Optimizers
     params_net = [p for n, p in model.named_parameters() if "movie_embeddings" not in n]
-    opt_net = torch.optim.AdamW(params_net, lr=float(cfg.hybrid_set_lr), weight_decay=float(cfg.hybrid_set_weight_decay))
+    opt_net = torch.optim.AdamW(
+        params_net,
+        lr=float(cfg.hybrid_set_lr),
+        weight_decay=float(cfg.hybrid_set_weight_decay),
+    )
     
     params_embed = [model.movie_embeddings.weight]
     opt_embed = torch.optim.AdamW(params_embed, lr=float(cfg.hybrid_set_table_lr))
@@ -272,28 +256,28 @@ def main():
     sample_inputs_cpu, _, sample_idx = next(loader)
     sample_inputs = [x.to(device) for x in sample_inputs_cpu]
     
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print_model_summary(model, {"field_tensors": sample_inputs, "batch_indices": sample_idx})
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")
 
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):
         for name, t in ds.head_mappings.items():
             mapping_tensors[name] = t.to(device)
 
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler("cuda")
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
     
     sched = make_lr_scheduler(
-        opt_net, 
-        total_steps=batches_per_epoch * num_epochs, 
-        schedule=cfg.lr_schedule, 
-        warmup_steps=cfg.lr_warmup_steps, 
-        warmup_ratio=cfg.lr_warmup_ratio, 
-        min_factor=cfg.lr_min_factor
+        opt_net,
+        total_steps=batches_per_epoch * num_epochs,
+        schedule=cfg.lr_schedule,
+        warmup_steps=cfg.lr_warmup_steps,
+        warmup_ratio=cfg.lr_warmup_ratio,
+        min_factor=cfg.lr_min_factor,
     )
 
     start_epoch, global_step = 0, 0
@@ -305,19 +289,20 @@ def main():
             opt_net.load_state_dict(c["opt_net_state_dict"])
             if c.get("opt_embed_state_dict"):
                 opt_embed.load_state_dict(c["opt_embed_state_dict"])
-                
             start_epoch = c["epoch"]
             global_step = c["global_step"]
-            if c["scheduler_state_dict"] and sched: sched.load_state_dict(c["scheduler_state_dict"])
+            if c["scheduler_state_dict"] and sched:
+                sched.load_state_dict(c["scheduler_state_dict"])
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
             logging.error(f"Resume failed: {e}")
     elif args.no_resume:
         logging.info("Starting new run (ignoring existing checkpoint).")
     
-    if run_logger.run_dir: run_logger.step = global_step
+    if run_logger.run_dir:
+        run_logger.step = global_step
     stop_flag = {"stop": False}
-    signal.signal(signal.SIGINT, lambda s,f: stop_flag.update({"stop": True}))
+    signal.signal(signal.SIGINT, lambda s, f: stop_flag.update({"stop": True}))
 
     w_bce = float(cfg.hybrid_set_w_bce)
     w_count = float(cfg.hybrid_set_w_count)
@@ -325,14 +310,10 @@ def main():
     w_recon = 1.0
     NUM_NEG_SAMPLES = 2048
 
-    # --- INIT FIELD MASKER ---
-    # We explicitly drop 'tconst' to prevent leakage.
-    # The model must learn to identify the movie latent from other metadata.
     field_masker = FieldMasker(
-        fields=ds.fields, 
-        device=device, 
+        fields=ds.fields,
+        device=device,
         probability=float(getattr(cfg, "hybrid_set_field_dropout", 0.0)),
-        always_drop_names=["tconst"]
     )
     logging.info(f"Field Dropout: {field_masker.prob}. Always drop: {field_masker.always_drop_indices}")
 
@@ -344,22 +325,19 @@ def main():
             
             inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
-            
-            # Apply Masking
             inputs = field_masker(inputs)
             
             model.train()
             opt_net.zero_grad(set_to_none=True)
             opt_embed.zero_grad(set_to_none=True)
             
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast("cuda"):
                 logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table) = model(
-                    field_tensors=inputs, 
-                    batch_indices=indices_cpu, 
-                    return_embeddings=True
+                    field_tensors=inputs,
+                    batch_indices=indices_cpu,
+                    return_embeddings=True,
                 )
                 
-                # Check norms for debugging (Should be ~1.0 with the Fix)
                 z_enc_norm = z_enc.norm(dim=-1).mean()
                 z_table_norm = z_table.norm(dim=-1).mean()
                 
@@ -371,7 +349,7 @@ def main():
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
                 for f, p, t in zip(ds.fields, recon_enc, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
-                recon_loss = recon_loss * 0.5 
+                recon_loss = recon_loss * 0.5
 
                 align_loss = F.mse_loss(z_enc, z_table.detach())
 
@@ -398,14 +376,13 @@ def main():
                         global_person_ids = raw_padded[rows, cols].long()
                         pos_coords = torch.empty((0, 2), dtype=torch.long, device=device)
 
-                        if global_person_ids.numel() > 0:
-                            if head_name in mapping_tensors:
-                                local_person_ids = mapping_tensors[head_name][global_person_ids]
-                                valid_mask = (local_person_ids != -1)
-                                if valid_mask.any():
-                                    final_rows = rows[valid_mask]
-                                    final_locals = local_person_ids[valid_mask]
-                                    pos_coords = torch.stack([final_rows, final_locals], dim=1)
+                        if global_person_ids.numel() > 0 and head_name in mapping_tensors:
+                            local_person_ids = mapping_tensors[head_name][global_person_ids]
+                            valid_mask = (local_person_ids != -1)
+                            if valid_mask.any():
+                                final_rows = rows[valid_mask]
+                                final_locals = local_person_ids[valid_mask]
+                                pos_coords = torch.stack([final_rows, final_locals], dim=1)
                                     
                         head_layer = model.people_expansions[head_name]
                         bottlenecks = logits_dict[head_name]
@@ -415,25 +392,28 @@ def main():
                             head_layer=head_layer,
                             positive_coords=pos_coords,
                             num_negatives=NUM_NEG_SAMPLES,
-                            gamma_neg=2.0
+                            gamma_neg=2.0,
                         )
                         total_set_loss += loss_head
                         head_metrics[f"{head_name}_bce"] = loss_head.detach()
 
                         if collect_coords_for_log:
-                            coords_dict_for_log[head_name] = pos_coords.cpu() 
+                            coords_dict_for_log[head_name] = pos_coords.cpu()
 
-                loss = (w_bce * total_set_loss) + \
-                       (w_count * total_count_loss) + \
-                       (w_recon * recon_loss) + \
-                       (w_align * align_loss)
+                loss = (
+                    w_bce * total_set_loss
+                    + w_count * total_count_loss
+                    + w_recon * recon_loss
+                    + w_align * align_loss
+                )
 
             scaler.scale(loss).backward()
             scaler.step(opt_net)
             opt_embed.step()
             scaler.update()
             
-            if sched: sched.step()
+            if sched:
+                sched.step()
             iter_time = time.perf_counter() - iter_start
             
             if run_logger:
@@ -444,30 +424,41 @@ def main():
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_enc_norm", z_enc_norm.item(), global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
-                
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
                 run_logger.tick()
             
             if collect_coords_for_log:
-                recon_logger.step(global_step, model, inputs, indices_cpu, coords_dict_for_log, count_targets_for_log, run_logger)
+                recon_logger.step(
+                    global_step,
+                    model,
+                    inputs,
+                    indices_cpu,
+                    coords_dict_for_log,
+                    count_targets_for_log,
+                    field_masker.last_mask,
+                    run_logger,
+                )
             
             pbar.set_postfix(
-                loss=f"{loss.item():.3f}", 
+                loss=f"{loss.item():.3f}",
                 align=f"{align_loss.item():.4f}",
-                lr=f"{opt_net.param_groups[0]['lr']:.2e}"
+                lr=f"{opt_net.param_groups[0]['lr']:.2e}",
             )
             global_step += 1
             
             if global_step % int(cfg.hybrid_set_save_interval) == 0:
                 save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch, global_step, cfg)
             
-            if stop_flag["stop"]: break
-        if stop_flag["stop"]: break
+            if stop_flag["stop"]:
+                break
+        if stop_flag["stop"]:
+            break
         
-        save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch+1, global_step, cfg)
+        save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch + 1, global_step, cfg)
         
-    if run_logger: run_logger.close()
+    if run_logger:
+        run_logger.close()
 
 if __name__ == "__main__":
     main()
