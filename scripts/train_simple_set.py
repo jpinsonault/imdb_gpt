@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from dataclasses import asdict
 
+from scripts.simple_set.precompute import ensure_hybrid_cache
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +23,6 @@ from scripts.autoencoder.run_logger import RunLogger
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.model import HybridSetModel
 from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
-from scripts.simple_set.precompute import ensure_hybrid_cache
 from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -143,6 +143,22 @@ def compute_sampled_asymmetric_loss(
     loss_neg = neg_loss_raw.sum()
 
     return (loss_pos + loss_neg) / batch_size
+
+
+def compute_cardinality_kl_loss(
+    full_logits: torch.Tensor,
+    count_pred: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    B, V = full_logits.shape
+    log_probs = F.log_softmax(full_logits, dim=1)
+    probs = log_probs.exp()
+    ent = -(probs * log_probs).sum(dim=1)
+
+    target_counts = count_pred.detach().clamp(min=1.0)
+    target_log = torch.log(target_counts.squeeze(1) + eps)
+
+    return F.mse_loss(ent, target_log)
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -275,15 +291,6 @@ def main():
 
     num_epochs = int(cfg.hybrid_set_epochs)
     total_steps = batches_per_epoch * num_epochs
-
-    base_warmup = max(0, int(cfg.lr_warmup_steps))
-    ratio = float(cfg.lr_warmup_ratio)
-    frac_warmup = int(total_steps * ratio) if ratio > 0.0 else 0
-    mass_warmup_steps = max(base_warmup, frac_warmup)
-    if total_steps > 1:
-        mass_warmup_steps = min(mass_warmup_steps, total_steps - 1)
-    else:
-        mass_warmup_steps = 0
 
     sched = make_lr_scheduler(
         optimizer,
@@ -420,26 +427,21 @@ def main():
                         if w_mass > 0.0:
                             full_logits = bottlenecks @ head_layer.weight.t()
                             if head_layer.bias is not None:
-                                full_logits += head_layer.bias
-
-                            pred_mass = torch.sigmoid(full_logits).sum(dim=1, keepdim=True)
-
-                            m_loss = F.mse_loss(pred_mass, t_cnt)
-                            total_mass_loss += m_loss
-                            head_metrics[f"{head_name}_mass"] = m_loss.detach()
+                                full_logits = full_logits + head_layer.bias
+                            card_loss = compute_cardinality_kl_loss(
+                                full_logits=full_logits,
+                                count_pred=counts_dict[head_name],
+                            )
+                            total_mass_loss += card_loss
+                            head_metrics[f"{head_name}_mass"] = card_loss.detach()
 
                         if collect_coords_for_log:
                             coords_dict_for_log[head_name] = pos_coords.cpu()
 
-                if mass_warmup_steps > 0:
-                    mass_scale = float(min(1.0, (global_step + 1) / mass_warmup_steps))
-                else:
-                    mass_scale = 1.0
-
                 loss = (
                     w_bce * total_set_loss
                     + w_count * total_count_loss
-                    + w_mass * mass_scale * total_mass_loss
+                    + w_mass * total_mass_loss
                     + w_recon * recon_loss
                     + w_align * align_loss
                 )
@@ -461,7 +463,6 @@ def main():
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_enc_norm", z_enc_norm.item(), global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
-                run_logger.add_scalar("loss/mass_scale", mass_scale, global_step)
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
                 run_logger.tick()
