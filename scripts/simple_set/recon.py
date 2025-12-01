@@ -6,6 +6,7 @@ import textwrap
 import logging
 from prettytable import PrettyTable
 
+
 class HybridSetReconLogger:
     def __init__(self, dataset, interval_steps=200, num_samples=3, table_width=80, threshold=0.5):
         self.dataset = dataset
@@ -20,10 +21,13 @@ class HybridSetReconLogger:
         if not hasattr(self.dataset, "head_mappings"):
             return inv_maps
         for head, mapping_tensor in self.dataset.head_mappings.items():
-            valid_mask = (mapping_tensor != -1)
+            valid_mask = mapping_tensor != -1
             global_indices = torch.nonzero(valid_mask).squeeze(1)
             local_indices = mapping_tensor[global_indices]
-            max_local = local_indices.max().item() if local_indices.numel() > 0 else 0
+            if local_indices.numel() == 0:
+                inv_maps[head] = torch.empty(0, dtype=torch.long)
+                continue
+            max_local = local_indices.max().item()
             inverse = torch.full((max_local + 1,), -1, dtype=torch.long)
             inverse[local_indices] = global_indices
             inv_maps[head] = inverse
@@ -54,34 +58,26 @@ class HybridSetReconLogger:
         return wrapper.fill(text)
 
     @torch.no_grad()
-    def step(self, global_step, model, inputs, batch_indices, coords_dict, count_targets, field_mask, run_logger):
-        """
-        inputs: List[Tensor(B, ...)]    (masked features used by the model)
-        batch_indices: Tensor(B,)       (global movie indices / embedding indices)
-        coords_dict: {head_name: Tensor(N_sparse, 2)} [row_idx_in_batch, local_col_idx]
-        count_targets: {head_name: Tensor(B, 1)}
-        field_mask: Tensor(B, num_fields) with 1=visible, 0=masked (or None)
-        """
+    def step(self, global_step, model, inputs, batch_indices, coords_dict, count_targets, run_logger):
         if (global_step + 1) % self.every != 0:
             return
 
         model.eval()
 
         B = inputs[0].size(0)
+        if B == 0:
+            return
+
         indices = np.random.choice(B, size=min(self.num_samples, B), replace=False)
         indices_t = torch.tensor(indices, device=inputs[0].device)
 
         sliced_inputs = [t[indices_t] for t in inputs]
         sliced_batch_indices = batch_indices[indices]
 
-        logits_dict, counts_dict, recon_table, recon_enc, _ = model(
+        logits_dict, counts_dict, recon_table, _ = model(
             sliced_inputs,
             batch_indices=sliced_batch_indices,
         )
-
-        mask_cpu = None
-        if field_mask is not None:
-            mask_cpu = field_mask.cpu()
 
         output_log = []
 
@@ -92,29 +88,17 @@ class HybridSetReconLogger:
                 for i in range(len(self.dataset.fields))
             ]
             rec_table_sample = [t[local_slice_idx].cpu() for t in recon_table]
-            rec_enc_sample = [t[local_slice_idx].cpu() for t in recon_enc]
-
-            if mask_cpu is not None:
-                field_mask_row = mask_cpu[batch_row_idx]
-            else:
-                field_mask_row = None
 
             movie_title = self._decode_movie_title(orig_inputs)
 
-            t = PrettyTable(["Field", "Orig", "Recon (Encoder)", "Recon (Embedding)"])
+            t = PrettyTable(["Field", "Orig", "Recon"])
             t.align = "l"
-            for field_idx, (f, orig, rec_enc_field, rec_tab_field) in enumerate(
-                zip(self.dataset.fields, orig_inputs, rec_enc_sample, rec_table_sample)
-            ):
+            for f, orig, rec_tab_field in zip(self.dataset.fields, orig_inputs, rec_table_sample):
                 orig_str = f.render_ground_truth(orig)[:40]
-                if field_mask_row is not None and field_idx < field_mask_row.numel():
-                    if field_mask_row[field_idx].item() < 0.5:
-                        orig_str = "*" + orig_str
                 t.add_row(
                     [
                         f.name,
                         orig_str,
-                        f.render_prediction(rec_enc_field)[:40],
                         f.render_prediction(rec_tab_field)[:40],
                     ]
                 )
@@ -130,7 +114,7 @@ class HybridSetReconLogger:
                 if coords is not None:
                     if coords.device.type != "cpu":
                         coords = coords.cpu()
-                    mask = (coords[:, 0] == batch_row_idx)
+                    mask = coords[:, 0] == batch_row_idx
                     if mask.any():
                         true_local_idxs = set(coords[mask, 1].numpy().tolist())
 

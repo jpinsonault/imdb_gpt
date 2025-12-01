@@ -1,4 +1,4 @@
-# scripts/train_simple_set.py
+# scripts/simple_set.py
 
 import argparse
 import logging
@@ -28,67 +28,6 @@ from scripts.simple_set.recon import HybridSetReconLogger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-class FieldMasker:
-    """
-    Applies field dropout to simulate partial information during training.
-    """
-    def __init__(self, fields, device, probability=0.0, always_drop_names=None):
-        self.fields = fields
-        self.device = device
-        self.prob = probability
-        self.num_fields = len(fields)
-        self.always_drop_indices = []
-        if always_drop_names:
-            for i, f in enumerate(fields):
-                if f.name in always_drop_names:
-                    self.always_drop_indices.append(i)
-        self.pad_values = []
-        for f in self.fields:
-            self.pad_values.append(f.get_base_padding_value().to(device))
-        self.last_mask = None
-
-    def __call__(self, inputs):
-        """
-        inputs: List[Tensor], where inputs[i] corresponds to self.fields[i]
-        """
-        B = inputs[0].shape[0]
-        keep_prob = 1.0 - self.prob
-        mask = torch.bernoulli(
-            torch.full((B, self.num_fields), keep_prob, device=self.device)
-        )
-
-        for idx in self.always_drop_indices:
-            mask[:, idx] = 0.0
-
-        valid_indices = [i for i in range(self.num_fields) if i not in self.always_drop_indices]
-        if valid_indices:
-            all_dropped = (mask.sum(dim=1) == 0)
-            if all_dropped.any():
-                rows_to_fix = torch.nonzero(all_dropped).squeeze(1)
-                rand_select = torch.randint(
-                    0,
-                    len(valid_indices),
-                    (rows_to_fix.size(0),),
-                    device=self.device,
-                )
-                valid_tensor = torch.tensor(valid_indices, device=self.device)
-                indices_to_keep = valid_tensor[rand_select]
-                mask[rows_to_fix, indices_to_keep] = 1.0
-
-        masked_inputs = []
-        for i, (x, pad_val) in enumerate(zip(inputs, self.pad_values)):
-            m_col = mask[:, i]
-            view_shape = [B] + [1] * (x.dim() - 1)
-            m_view = m_col.view(*view_shape)
-            m_typed = m_view.to(x.dtype)
-            pad_typed = pad_val.unsqueeze(0).to(x.dtype)
-            x_masked = x * m_typed + pad_typed * (1 - m_typed)
-            masked_inputs.append(x_masked)
-
-        self.last_mask = mask.detach().cpu()
-        return masked_inputs
-
-
 def compute_sampled_asymmetric_loss(
     embedding_batch,
     head_layer,
@@ -96,7 +35,7 @@ def compute_sampled_asymmetric_loss(
     num_negatives=2048,
     gamma_neg=2.0,
     gamma_pos=0.0,
-    eps=1e-8
+    eps=1e-8,
 ):
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
@@ -134,7 +73,7 @@ def compute_sampled_asymmetric_loss(
         neg_loss_raw = neg_loss_raw * (neg_probs.pow(gamma_neg))
 
     if positive_coords.shape[0] > 0:
-        collisions = (pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0))
+        collisions = pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0)
         if collisions.any():
             c_pos_idx, c_neg_idx = torch.nonzero(collisions, as_tuple=True)
             colliding_batch_rows = pos_b_idx[c_pos_idx]
@@ -159,7 +98,6 @@ def compute_mass_loss(
     target_t = (target + eps).pow(alpha)
 
     return F.mse_loss(mass_t, target_t)
-
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -193,7 +131,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     def linear_lambda(step):
         s = int(step)
         if w_steps > 0 and s < w_steps:
-            return float(s + 1) / float(w_steps)
+            return float(s + 1) / float(wsteps)
         if s >= total_steps:
             return min_factor
         if w_steps >= total_steps:
@@ -261,7 +199,7 @@ def main():
         base_output_rank=int(cfg.hybrid_set_output_rank),
         depth=int(cfg.hybrid_set_depth),
         dropout=float(cfg.hybrid_set_dropout),
-        num_movies=num_movies
+        num_movies=num_movies,
     )
 
     logging.info("Moving model to device and initializing optimizer...")
@@ -334,15 +272,6 @@ def main():
     GAMMA_NEG = float(getattr(cfg, "hybrid_set_focal_gamma", 2.0))
     GAMMA_POS = 0.0
 
-    field_masker = FieldMasker(
-        fields=ds.fields,
-        device=device,
-        probability=float(getattr(cfg, "hybrid_set_field_dropout", 0.0)),
-        always_drop_names=["tconst"],
-    )
-    logging.info(f"Field Dropout: {field_masker.prob}. Always drop: {field_masker.always_drop_indices}")
-    logging.info(f"Focal Gamma (Neg): {GAMMA_NEG}. Mass Constraint Weight: {w_mass}")
-
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
 
@@ -351,19 +280,17 @@ def main():
 
             inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
-            inputs = field_masker(inputs)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda"):
-                logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table) = model(
+                logits_dict, counts_dict, recon_table, z_table = model(
                     field_tensors=inputs,
                     batch_indices=indices_cpu,
                     return_embeddings=True,
                 )
 
-                z_enc_norm = z_enc.norm(dim=-1).mean()
                 z_table_norm = z_table.norm(dim=-1).mean()
 
                 total_set_loss = 0.0
@@ -373,11 +300,10 @@ def main():
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
                     recon_loss += f.compute_loss(p, t) * float(f.weight)
-                for f, p, t in zip(ds.fields, recon_enc, inputs):
-                    recon_loss += f.compute_loss(p, t) * float(f.weight)
-                recon_loss = recon_loss * 0.5
 
-                align_loss = F.mse_loss(z_enc, z_table.detach())
+                align_loss = z_table_norm.new_zeros(())
+                if w_align != 0.0:
+                    align_loss = align_loss * 0.0
 
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
                 coords_dict_for_log = {}
@@ -388,7 +314,7 @@ def main():
                     raw_padded = heads_padded_cpu.get(head_name)
                     if raw_padded is not None:
                         raw_padded = raw_padded.to(device, non_blocking=True)
-                        mask = (raw_padded != -1)
+                        mask = raw_padded != -1
                         t_cnt = mask.sum(dim=1, keepdim=True).float()
 
                         c_loss = F.mse_loss(counts_dict[head_name], t_cnt)
@@ -404,7 +330,7 @@ def main():
 
                         if global_person_ids.numel() > 0 and head_name in mapping_tensors:
                             local_person_ids = mapping_tensors[head_name][global_person_ids]
-                            valid_mask = (local_person_ids != -1)
+                            valid_mask = local_person_ids != -1
                             if valid_mask.any():
                                 final_rows = rows[valid_mask]
                                 final_locals = local_person_ids[valid_mask]
@@ -461,7 +387,6 @@ def main():
                 run_logger.add_scalar("loss/align", align_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
-                run_logger.add_scalar("debug/z_enc_norm", z_enc_norm.item(), global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
@@ -475,7 +400,6 @@ def main():
                     indices_cpu,
                     coords_dict_for_log,
                     count_targets_for_log,
-                    field_masker.last_mask,
                     run_logger,
                 )
 
