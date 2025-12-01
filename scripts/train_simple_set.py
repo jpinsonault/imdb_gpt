@@ -145,20 +145,23 @@ def compute_sampled_asymmetric_loss(
     return (loss_pos + loss_neg) / batch_size
 
 
-def compute_cardinality_kl_loss(
+def compute_mass_loss(
     full_logits: torch.Tensor,
-    count_pred: torch.Tensor,
+    true_count: torch.Tensor,
+    top_k: int = 4096,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    B, V = full_logits.shape
-    log_probs = F.log_softmax(full_logits, dim=1)
-    probs = log_probs.exp()
-    ent = -(probs * log_probs).sum(dim=1)
-
-    target_counts = count_pred.detach().clamp(min=1.0)
-    target_log = torch.log(target_counts.squeeze(1) + eps)
-
-    return F.mse_loss(ent, target_log)
+    probs = torch.sigmoid(full_logits)
+    if top_k is not None and probs.shape[1] > top_k:
+        top_vals, _ = probs.topk(top_k, dim=1)
+        mass = top_vals.sum(dim=1)
+        target = true_count.squeeze(1).clamp(min=0.0, max=float(top_k))
+    else:
+        mass = probs.sum(dim=1)
+        target = true_count.squeeze(1).clamp(min=0.0)
+    mass_log = torch.log1p(mass.clamp(min=0.0))
+    target_log = torch.log1p(target)
+    return F.mse_loss(mass_log, target_log)
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -428,12 +431,12 @@ def main():
                             full_logits = bottlenecks @ head_layer.weight.t()
                             if head_layer.bias is not None:
                                 full_logits = full_logits + head_layer.bias
-                            card_loss = compute_cardinality_kl_loss(
+                            mass_loss = compute_mass_loss(
                                 full_logits=full_logits,
-                                count_pred=counts_dict[head_name],
+                                true_count=t_cnt,
                             )
-                            total_mass_loss += card_loss
-                            head_metrics[f"{head_name}_mass"] = card_loss.detach()
+                            total_mass_loss += mass_loss
+                            head_metrics[f"{head_name}_mass"] = mass_loss.detach()
 
                         if collect_coords_for_log:
                             coords_dict_for_log[head_name] = pos_coords.cpu()
