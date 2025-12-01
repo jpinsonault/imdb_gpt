@@ -307,13 +307,12 @@ def main():
     w_bce = float(cfg.hybrid_set_w_bce)
     w_count = float(cfg.hybrid_set_w_count)
     w_align = float(cfg.hybrid_set_w_align)
+    w_mass = float(getattr(cfg, "hybrid_set_w_mass", 0.01))
     w_recon = 1.0
     NUM_NEG_SAMPLES = 2048
     
-    # --- FIX: Read Gamma from Config ---
     GAMMA_NEG = float(getattr(cfg, "hybrid_set_focal_gamma", 2.0))
-    GAMMA_POS = 0.0 # Keep this at 0.0 unless tuning positive recall
-    # -----------------------------------
+    GAMMA_POS = 0.0 
 
     field_masker = FieldMasker(
         fields=ds.fields,
@@ -322,7 +321,7 @@ def main():
         always_drop_names=["tconst"],
     )
     logging.info(f"Field Dropout: {field_masker.prob}. Always drop: {field_masker.always_drop_indices}")
-    logging.info(f"Focal Loss Gamma (Negatives): {GAMMA_NEG}")
+    logging.info(f"Focal Gamma (Neg): {GAMMA_NEG}. Mass Constraint Weight: {w_mass}")
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
@@ -350,6 +349,7 @@ def main():
 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
+                total_mass_loss = 0.0
 
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
@@ -394,6 +394,7 @@ def main():
                         head_layer = model.people_expansions[head_name]
                         bottlenecks = logits_dict[head_name]
 
+                        # 1. Focal Loss (Standard Multi-label)
                         loss_head = compute_sampled_asymmetric_loss(
                             embedding_batch=bottlenecks,
                             head_layer=head_layer,
@@ -405,12 +406,31 @@ def main():
                         total_set_loss += loss_head
                         head_metrics[f"{head_name}_bce"] = loss_head.detach()
 
+                        # 2. Mass Constraint Loss (Energy Regularization)
+                        # "You have 15 energy, choose wisely"
+                        # Expand bottleneck to full logits to sum probabilities
+                        # We only do this if weight > 0 because it's slightly expensive (but user has RAM)
+                        if w_mass > 0.0:
+                            # full_logits: (B, Vocab)
+                            full_logits = bottlenecks @ head_layer.weight.t()
+                            if head_layer.bias is not None:
+                                full_logits += head_layer.bias
+                            
+                            # Sum of probabilities = Predicted Mass
+                            pred_mass = torch.sigmoid(full_logits).sum(dim=1, keepdim=True)
+                            
+                            # We want Pred Mass to match True Count
+                            m_loss = F.mse_loss(pred_mass, t_cnt)
+                            total_mass_loss += m_loss
+                            head_metrics[f"{head_name}_mass"] = m_loss.detach()
+
                         if collect_coords_for_log:
                             coords_dict_for_log[head_name] = pos_coords.cpu()
 
                 loss = (
                     w_bce * total_set_loss
                     + w_count * total_count_loss
+                    + w_mass * total_mass_loss
                     + w_recon * recon_loss
                     + w_align * align_loss
                 )
@@ -427,6 +447,7 @@ def main():
             if run_logger:
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/mass_total", total_mass_loss.item(), global_step)
                 run_logger.add_scalar("loss/align", align_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
@@ -451,6 +472,7 @@ def main():
             pbar.set_postfix(
                 loss=f"{loss.item():.3f}",
                 align=f"{align_loss.item():.4f}",
+                mass=f"{total_mass_loss.item():.4f}",
                 lr=f"{opt_net.param_groups[0]['lr']:.2e}",
             )
             global_step += 1

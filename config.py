@@ -71,7 +71,8 @@ class ProjectConfig:
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05
-    
+    hybrid_set_w_mass: float = 0.01    # New: Weight for "Energy" Mass Constraint
+
     # Focal Loss Gamma
     hybrid_set_focal_gamma: float = 4.0
     
