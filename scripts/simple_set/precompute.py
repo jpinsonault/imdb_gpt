@@ -32,38 +32,24 @@ def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.db_path)
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
     
-    # 1. Setup Movie Fields to learn stats (Vocab, etc.)
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
     
-    # --- START HACK TO FORCE FULL STATS ACCUMULATION ---
-    # The original TitlesAutoencoder.accumulate_stats() has an internal limit (LIMIT 50000)
-    # in the Genres and Text section which is optimized away by the cache.
-    # To ensure consistent stats, we temporarily set the internal cache refresh flag
-    # to force the slow, rigorous path to run if the cache is missing/stale.
-    # In this specific context, we want TitlesAutoencoder's logic to run without the cache
-    # to ensure all fields are built correctly from the original SQL logic.
     force_no_cache = not cfg.use_cache or cfg.refresh_cache 
     if force_no_cache:
         logging.info("Temporarily forcing non-cached stats accumulation...")
-        # Since we are calling the internal logic, the original class-level logic should be sufficient
-        # but we ensure the cache is explicitly managed for the purpose of this precompute.
         mov_ae._drop_cache() 
     
     mov_ae.accumulate_stats()
     mov_ae.finalize_stats()
     
-    # Re-enable cache status if we temporarily disabled it.
     if force_no_cache:
-        cfg.refresh_cache = False # Don't keep forcing it downstream
-    # --- END HACK ---
+        cfg.refresh_cache = False 
     
-    # 2. Connect DB
     logging.info(f"Connecting to {db_path}...")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     
-    # 3. Get valid Role entries
     logging.info("Fetching categorized edges...")
     sql_edges = """
     SELECT p.tconst, p.nconst, p.category
@@ -73,7 +59,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
     cur.execute(sql_edges)
     raw_rows = cur.fetchall()
     
-    # 4. Filter Data
     logging.info("Filtering and bucketing...")
     person_counts = Counter(r[1] for r in raw_rows)
     valid_people = {n for n, c in person_counts.items() if c >= MIN_PERSON_FREQUENCY}
@@ -91,7 +76,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
     final_tconsts = []
     
     for tconst, heads in movie_data.items():
-        # STRICT FILTER: Must have Cast AND Director
         has_cast = len(heads.get('cast', [])) > 0
         has_director = len(heads.get('director', [])) > 0
         if has_cast and has_director:
@@ -100,7 +84,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
     final_tconsts.sort()
     logging.info(f"Movie filtering: Kept {len(final_tconsts)} valid movies.")
     
-    # Build Final Global Vocab
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
@@ -112,7 +95,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
     num_movies = len(final_tconsts)
     num_people = len(sorted_nconsts)
     
-    # --- Build Head Subsets & Mappings ---
     head_mappings = {}  
     head_vocab_sizes = {} 
 
@@ -131,7 +113,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
         head_mappings[head] = mapping_tensor
 
-    # 5. Precompute Movie Field Tensors (RAW DATA)
     logging.info("Stacking raw field tensors...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
     cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in final_tconsts])
@@ -156,18 +137,17 @@ def build_hybrid_cache(cfg: ProjectConfig):
         
     for idx, tconst in enumerate(tqdm(final_tconsts, desc="Stacking")):
         row_dict = fetched_rows.get(tconst)
-        if not row_dict: continue
+        if not row_dict:
+            continue
             
         heads_data = movie_data[tconst]
         row_dict["peopleCount"] = sum(len(s) for s in heads_data.values())
         
-        # Stack Fields (Raw transformations)
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
-        # Collect Indices
         for head_name, nconst_set in heads_data.items():
             idxs = [nconst_to_global_idx[n] for n in nconst_set if n in nconst_to_global_idx]
             if idxs:
@@ -178,7 +158,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
         stacked = torch.stack(field_data[i])
         stacked_fields.append(stacked)
 
-    # Build Padded Targets
     heads_padded = {}
     for head, lists in temp_heads_lists.items():
         max_len = max(1, max(len(l) for l in lists) if lists else 0)
@@ -189,7 +168,6 @@ def build_hybrid_cache(cfg: ProjectConfig):
                 padded_tensor[i, :length] = torch.tensor(idx_list, dtype=torch.int32)
         heads_padded[head] = padded_tensor
 
-    # 6. Fetch Names
     logging.info("Fetching person names...")
     idx_to_person_name = {}
     cur.execute("CREATE TEMPORARY TABLE temp_people (nconst TEXT PRIMARY KEY)")
@@ -202,19 +180,28 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
     conn.close()
     
-    # 7. Field Stats & Save
-    # We DO NOT encode latents here. We save field configs so the model can build the encoder from scratch.
     field_configs = {}
     for f in mov_ae.fields:
         from scripts.autoencoder.row_autoencoder import _field_to_state
         field_configs[f.name] = _field_to_state(f)
 
+    head_avg_counts = {}
+    for head, lists in temp_heads_lists.items():
+        total = 0
+        for idx_list in lists:
+            total += len(idx_list)
+        if num_movies > 0:
+            head_avg_counts[head] = float(total) / float(num_movies)
+        else:
+            head_avg_counts[head] = 0.0
+
     payload = {
-        "num_people": num_people,  
-        "stacked_fields": stacked_fields,    # Raw Inputs
-        "heads_padded": heads_padded,        # Global Indices
-        "head_mappings": head_mappings,      
+        "num_people": num_people,
+        "stacked_fields": stacked_fields,
+        "heads_padded": heads_padded,
+        "head_mappings": head_mappings,
         "head_vocab_sizes": head_vocab_sizes,
+        "head_avg_counts": head_avg_counts,
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
         "field_names": [f.name for f in mov_ae.fields]
@@ -223,6 +210,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     logging.info(f"Saving hybrid cache to {cache_path}...")
     torch.save(payload, cache_path)
     return cache_path
+
 
 def ensure_hybrid_cache(cfg: ProjectConfig):
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"

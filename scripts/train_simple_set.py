@@ -27,6 +27,7 @@ from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+
 class FieldMasker:
     """
     Applies field dropout to simulate partial information during training.
@@ -93,15 +94,14 @@ def compute_sampled_asymmetric_loss(
     head_layer,
     positive_coords,
     num_negatives=2048,
-    gamma_neg=2.0, # Focus on hard negatives
-    gamma_pos=0.0, # Do NOT downweight positives
+    gamma_neg=2.0,
+    gamma_pos=0.0,
     eps=1e-8
 ):
     device = embedding_batch.device
     batch_size = embedding_batch.shape[0]
     num_vocab = head_layer.out_features
 
-    # --- POSITIVES ---
     if positive_coords.shape[0] > 0:
         pos_b_idx = positive_coords[:, 0]
         pos_p_idx = positive_coords[:, 1]
@@ -121,7 +121,6 @@ def compute_sampled_asymmetric_loss(
     else:
         loss_pos = torch.tensor(0.0, device=device)
 
-    # --- NEGATIVES ---
     neg_p_idx = torch.randint(0, num_vocab, (num_negatives,), device=device)
     neg_w = head_layer.weight[neg_p_idx]
     neg_b = head_layer.bias[neg_p_idx] if head_layer.bias is not None else 0.0
@@ -134,7 +133,6 @@ def compute_sampled_asymmetric_loss(
     if gamma_neg > 0:
         neg_loss_raw = neg_loss_raw * (neg_probs.pow(gamma_neg))
 
-    # Masking Collisions
     if positive_coords.shape[0] > 0:
         collisions = (pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0))
         if collisions.any():
@@ -146,11 +144,14 @@ def compute_sampled_asymmetric_loss(
 
     return (loss_pos + loss_neg) / batch_size
 
+
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
-    if total_steps is None: return None
+    if total_steps is None:
+        return None
     total_steps = max(1, int(total_steps))
     schedule = (schedule or "").lower()
-    if schedule not in ("cosine", "linear"): return None
+    if schedule not in ("cosine", "linear"):
+        return None
 
     base_warmup = max(0, int(warmup_steps))
     ratio = float(warmup_ratio)
@@ -161,9 +162,12 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
 
     def cosine_lambda(step):
         s = int(step)
-        if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
-        if s >= total_steps: return min_factor
-        if w_steps >= total_steps: return min_factor
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
         t = max(0.0, min(1.0, t))
         decay = 0.5 * (1.0 + math.cos(math.pi * t))
@@ -171,9 +175,12 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
 
     def linear_lambda(step):
         s = int(step)
-        if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
-        if s >= total_steps: return min_factor
-        if w_steps >= total_steps: return min_factor
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
         t = max(0.0, min(1.0, t))
         return max(min_factor, 1.0 - (1.0 - min_factor) * t)
@@ -181,7 +188,8 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     lr_lambda = cosine_lambda if schedule == "cosine" else linear_lambda
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_epoch)
 
-def save_checkpoint(model_dir, model, opt_net, opt_embed, scheduler, epoch, global_step, config):
+
+def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
         with open(model_dir / "hybrid_set_config.json", "w") as f:
@@ -190,14 +198,14 @@ def save_checkpoint(model_dir, model, opt_net, opt_embed, scheduler, epoch, glob
             "epoch": epoch,
             "global_step": global_step,
             "model_state_dict": model.state_dict(),
-            "opt_net_state_dict": opt_net.state_dict(),
-            "opt_embed_state_dict": opt_embed.state_dict() if opt_embed else None,
+            "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         }
         torch.save(state, model_dir / "hybrid_set_state.pt")
         logging.info(f"Saved training state to {model_dir / 'hybrid_set_state.pt'}")
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -239,19 +247,15 @@ def main():
         num_movies=num_movies
     )
 
-    logging.info("Initializing Split Optimization (Net=GPU, Table=CPU)...")
+    logging.info("Moving model to device and initializing optimizer...")
     model.to(device)
     model.movie_embeddings.to("cpu")
 
-    params_net = [p for n, p in model.named_parameters() if "movie_embeddings" not in n]
-    opt_net = torch.optim.AdamW(
-        params_net,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
         lr=float(cfg.hybrid_set_lr),
         weight_decay=float(cfg.hybrid_set_weight_decay),
     )
-
-    params_embed = [model.movie_embeddings.weight]
-    opt_embed = torch.optim.AdamW(params_embed, lr=float(cfg.hybrid_set_table_lr))
 
     sample_inputs_cpu, _, sample_idx = next(loader)
     sample_inputs = [x.to(device) for x in sample_inputs_cpu]
@@ -270,10 +274,20 @@ def main():
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
     num_epochs = int(cfg.hybrid_set_epochs)
+    total_steps = batches_per_epoch * num_epochs
+
+    base_warmup = max(0, int(cfg.lr_warmup_steps))
+    ratio = float(cfg.lr_warmup_ratio)
+    frac_warmup = int(total_steps * ratio) if ratio > 0.0 else 0
+    mass_warmup_steps = max(base_warmup, frac_warmup)
+    if total_steps > 1:
+        mass_warmup_steps = min(mass_warmup_steps, total_steps - 1)
+    else:
+        mass_warmup_steps = 0
 
     sched = make_lr_scheduler(
-        opt_net,
-        total_steps=batches_per_epoch * num_epochs,
+        optimizer,
+        total_steps=total_steps,
         schedule=cfg.lr_schedule,
         warmup_steps=cfg.lr_warmup_steps,
         warmup_ratio=cfg.lr_warmup_ratio,
@@ -286,12 +300,11 @@ def main():
         try:
             c = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(c["model_state_dict"])
-            opt_net.load_state_dict(c["opt_net_state_dict"])
-            if c.get("opt_embed_state_dict"):
-                opt_embed.load_state_dict(c["opt_embed_state_dict"])
+            if "optimizer_state_dict" in c:
+                optimizer.load_state_dict(c["optimizer_state_dict"])
             start_epoch = c["epoch"]
             global_step = c["global_step"]
-            if c["scheduler_state_dict"] and sched:
+            if c.get("scheduler_state_dict") and sched:
                 sched.load_state_dict(c["scheduler_state_dict"])
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
@@ -310,9 +323,9 @@ def main():
     w_mass = float(getattr(cfg, "hybrid_set_w_mass", 0.01))
     w_recon = 1.0
     NUM_NEG_SAMPLES = 2048
-    
+
     GAMMA_NEG = float(getattr(cfg, "hybrid_set_focal_gamma", 2.0))
-    GAMMA_POS = 0.0 
+    GAMMA_POS = 0.0
 
     field_masker = FieldMasker(
         fields=ds.fields,
@@ -334,8 +347,7 @@ def main():
             inputs = field_masker(inputs)
 
             model.train()
-            opt_net.zero_grad(set_to_none=True)
-            opt_embed.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda"):
                 logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table) = model(
@@ -394,7 +406,6 @@ def main():
                         head_layer = model.people_expansions[head_name]
                         bottlenecks = logits_dict[head_name]
 
-                        # 1. Focal Loss (Standard Multi-label)
                         loss_head = compute_sampled_asymmetric_loss(
                             embedding_batch=bottlenecks,
                             head_layer=head_layer,
@@ -406,20 +417,13 @@ def main():
                         total_set_loss += loss_head
                         head_metrics[f"{head_name}_bce"] = loss_head.detach()
 
-                        # 2. Mass Constraint Loss (Energy Regularization)
-                        # "You have 15 energy, choose wisely"
-                        # Expand bottleneck to full logits to sum probabilities
-                        # We only do this if weight > 0 because it's slightly expensive (but user has RAM)
                         if w_mass > 0.0:
-                            # full_logits: (B, Vocab)
                             full_logits = bottlenecks @ head_layer.weight.t()
                             if head_layer.bias is not None:
                                 full_logits += head_layer.bias
-                            
-                            # Sum of probabilities = Predicted Mass
+
                             pred_mass = torch.sigmoid(full_logits).sum(dim=1, keepdim=True)
-                            
-                            # We want Pred Mass to match True Count
+
                             m_loss = F.mse_loss(pred_mass, t_cnt)
                             total_mass_loss += m_loss
                             head_metrics[f"{head_name}_mass"] = m_loss.detach()
@@ -427,17 +431,21 @@ def main():
                         if collect_coords_for_log:
                             coords_dict_for_log[head_name] = pos_coords.cpu()
 
+                if mass_warmup_steps > 0:
+                    mass_scale = float(min(1.0, (global_step + 1) / mass_warmup_steps))
+                else:
+                    mass_scale = 1.0
+
                 loss = (
                     w_bce * total_set_loss
                     + w_count * total_count_loss
-                    + w_mass * total_mass_loss
+                    + w_mass * mass_scale * total_mass_loss
                     + w_recon * recon_loss
                     + w_align * align_loss
                 )
 
             scaler.scale(loss).backward()
-            scaler.step(opt_net)
-            opt_embed.step()
+            scaler.step(optimizer)
             scaler.update()
 
             if sched:
@@ -453,6 +461,7 @@ def main():
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_enc_norm", z_enc_norm.item(), global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
+                run_logger.add_scalar("loss/mass_scale", mass_scale, global_step)
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
                 run_logger.tick()
@@ -473,22 +482,23 @@ def main():
                 loss=f"{loss.item():.3f}",
                 align=f"{align_loss.item():.4f}",
                 mass=f"{total_mass_loss.item():.4f}",
-                lr=f"{opt_net.param_groups[0]['lr']:.2e}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
             global_step += 1
 
             if global_step % int(cfg.hybrid_set_save_interval) == 0:
-                save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch, global_step, cfg)
+                save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch, global_step, cfg)
 
             if stop_flag["stop"]:
                 break
         if stop_flag["stop"]:
             break
 
-        save_checkpoint(Path(cfg.model_dir), model, opt_net, opt_embed, sched, epoch + 1, global_step, cfg)
+        save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch + 1, global_step, cfg)
 
     if run_logger:
         run_logger.close()
+
 
 if __name__ == "__main__":
     main()
