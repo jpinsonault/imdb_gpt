@@ -14,7 +14,7 @@ from scripts.sql_filters import movie_select_clause, map_movie_row
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # --- KNOBS ---
-MIN_PERSON_FREQUENCY = 3  # A person must appear in at least this many movies
+MIN_PERSON_FREQUENCY = 3    # A person must appear in at least this many movies
 PADDING_IDX = -1          # Value used to pad the dense tensors
 # -------------
 
@@ -35,8 +35,28 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # 1. Setup Movie Fields to learn stats (Vocab, etc.)
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
+    
+    # --- START HACK TO FORCE FULL STATS ACCUMULATION ---
+    # The original TitlesAutoencoder.accumulate_stats() has an internal limit (LIMIT 50000)
+    # in the Genres and Text section which is optimized away by the cache.
+    # To ensure consistent stats, we temporarily set the internal cache refresh flag
+    # to force the slow, rigorous path to run if the cache is missing/stale.
+    # In this specific context, we want TitlesAutoencoder's logic to run without the cache
+    # to ensure all fields are built correctly from the original SQL logic.
+    force_no_cache = not cfg.use_cache or cfg.refresh_cache 
+    if force_no_cache:
+        logging.info("Temporarily forcing non-cached stats accumulation...")
+        # Since we are calling the internal logic, the original class-level logic should be sufficient
+        # but we ensure the cache is explicitly managed for the purpose of this precompute.
+        mov_ae._drop_cache() 
+    
     mov_ae.accumulate_stats()
     mov_ae.finalize_stats()
+    
+    # Re-enable cache status if we temporarily disabled it.
+    if force_no_cache:
+        cfg.refresh_cache = False # Don't keep forcing it downstream
+    # --- END HACK ---
     
     # 2. Connect DB
     logging.info(f"Connecting to {db_path}...")
@@ -93,7 +113,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     num_people = len(sorted_nconsts)
     
     # --- Build Head Subsets & Mappings ---
-    head_mappings = {} 
+    head_mappings = {}  
     head_vocab_sizes = {} 
 
     logging.info("Building head-specific subsets...")
@@ -190,10 +210,10 @@ def build_hybrid_cache(cfg: ProjectConfig):
         field_configs[f.name] = _field_to_state(f)
 
     payload = {
-        "num_people": num_people, 
-        "stacked_fields": stacked_fields,   # Raw Inputs
-        "heads_padded": heads_padded,       # Global Indices
-        "head_mappings": head_mappings,     
+        "num_people": num_people,  
+        "stacked_fields": stacked_fields,    # Raw Inputs
+        "heads_padded": heads_padded,        # Global Indices
+        "head_mappings": head_mappings,      
         "head_vocab_sizes": head_vocab_sizes,
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,

@@ -314,6 +314,7 @@ def main():
         fields=ds.fields,
         device=device,
         probability=float(getattr(cfg, "hybrid_set_field_dropout", 0.0)),
+        always_drop_names=["tconst"],
     )
     logging.info(f"Field Dropout: {field_masker.prob}. Always drop: {field_masker.always_drop_indices}")
 

@@ -21,9 +21,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import ProjectConfig, project_config
-from scripts.autoencoder.mapping_samplers import LossLedger
+# from scripts.autoencoder.mapping_samplers import LossLedger # REMOVED
 from scripts.autoencoder.imdb_row_autoencoders import TitlesAutoencoder, PeopleAutoencoder
-from scripts.autoencoder.joint_edge_sampler import EdgeTensorCacheDataset
+# from scripts.autoencoder.joint_edge_sampler import EdgeTensorCacheDataset # REMOVED - using the simplified one
+from scripts.autoencoder.joint_edge_sampler import EdgeEpochDataset as EdgeTensorCacheDataset # RENAME
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.autoencoder.run_logger import build_run_logger
 from scripts.autoencoder.joint_autoencoder.training_callbacks import JointReconstructionLogger
@@ -303,6 +304,7 @@ def build_joint_trainer(
     # -------------------------------------------------------------------------
     # SELF-HEALING CACHE CHECK
     # -------------------------------------------------------------------------
+    # Note: `ensure_joint_tensor_cache` will rebuild the cache if config.refresh_cache is True
     cache_path = ensure_joint_tensor_cache(
         config,
         db_path,
@@ -385,7 +387,7 @@ def build_joint_trainer(
     movie_ae.model.to(device)
     people_ae.model.to(device)
 
-    loss_logger = LossLedger()
+    # loss_logger = LossLedger() # REMOVED: No longer needed for sampling
 
     num_workers = int(getattr(config, "num_workers", 0) or 0)
     cfg_pf = int(getattr(config, "prefetch_factor", 2) or 0)
@@ -411,7 +413,8 @@ def build_joint_trainer(
         f"joint trainer ready device={device} edges={total_edges} "
         f"bs={config.batch_size} workers={num_workers} mode=epoch"
     )
-    return joint, loader, loss_logger, movie_ae, people_ae, total_edges
+    # Pass None for the removed loss_logger
+    return joint, loader, None, movie_ae, people_ae, total_edges
 
 
 def _collate_edge(batch):
@@ -432,7 +435,7 @@ def _train_step(
     mov_ae: TitlesAutoencoder,
     per_ae: PeopleAutoencoder,
     opt: torch.optim.Optimizer,
-    logger: LossLedger,
+    # logger: LossLedger, # REMOVED
     temperature: float,
     nce_weight: float,
     type_loss_weight: float,
@@ -459,7 +462,7 @@ def _train_step(
 
     nce_mean, nce_per = info_nce_components(m_z, p_z, temperature=temperature)
 
-    total_per_sample = rec_per_sample + nce_weight * nce_per
+    total_per_sample = rec_per_sample + nce_weight * nce_per # Kept for min/max logging
 
     type_loss = torch.tensor(0.0, device=device)
 
@@ -491,11 +494,12 @@ def _train_step(
     batch_min = float(total_per_sample.min().detach().cpu().item())
     batch_max = float(total_per_sample.max().detach().cpu().item())
 
-    for eid, edgeloss in zip(
-        eids.detach().cpu().tolist(),
-        total_per_sample.detach().cpu().tolist(),
-    ):
-        logger.add(int(eid), float(edgeloss))
+    # REMOVED: LossLedger logging
+    # for eid, edgeloss in zip(
+    #     eids.detach().cpu().tolist(),
+    #     total_per_sample.detach().cpu().tolist(),
+    # ):
+    #     logger.add(int(eid), float(edgeloss))
 
     return (
         total_val,
@@ -562,7 +566,9 @@ def main(config: ProjectConfig):
     data_dir = Path(config.data_dir)
     db_path = data_dir / "imdb.db"
 
-    joint_model, loader, logger, mov_ae, per_ae, total_edges = build_joint_trainer(
+    # Pass loss_logger as None in the build_joint_trainer call,
+    # as it's no longer used for sampling strategy.
+    joint_model, loader, _, mov_ae, per_ae, total_edges = build_joint_trainer(
         config=config,
         warm=args.warm,
         db_path=db_path,
@@ -635,8 +641,8 @@ def main(config: ProjectConfig):
     )
     
     if checkpoint_path.exists() and not args.new_run:
-         if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] and sched:
-             sched.load_state_dict(checkpoint["scheduler_state_dict"])
+          if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] and sched:
+              sched.load_state_dict(checkpoint["scheduler_state_dict"])
 
     temperature = config.nce_temp
     nce_weight = config.nce_weight
@@ -710,7 +716,7 @@ def main(config: ProjectConfig):
                 mov_ae=mov_ae,
                 per_ae=per_ae,
                 opt=opt,
-                logger=logger,
+                # logger=logger, # REMOVED ARG
                 temperature=temperature,
                 nce_weight=nce_weight,
                 type_loss_weight=type_w,
@@ -744,25 +750,10 @@ def main(config: ProjectConfig):
             edges_seen += eids.size(0)
             global_step += 1
 
-            pbar.set_postfix(
-                edges=f"{min(edges_seen, total_edges)}/{total_edges}",
-                loss=f"{total_val:.4f}",
-                rec=f"{rec_val:.4f}",
-                nce=f"{nce_val:.4f}",
-                cls=f"{type_val:.4f}",
-                min=f"{batch_min:.4f}",
-                max=f"{batch_max:.4f}",
-                lr=f"{opt.param_groups[0]['lr']:.2e}",
-                it_s=f"{iter_time:.3f}",
-            )
-
             JointReconstructionLogger.on_batch_end(
                 joint_recon,
                 global_step - 1,
             )
-
-            if (global_step % flush_interval) == 0:
-                logger.flush()
 
             if (global_step % save_interval) == 0:
                 # Save regular model checkpoints (weights only)
@@ -798,7 +789,7 @@ def main(config: ProjectConfig):
         if stop_flag["stop"]:
             break
 
-    logger.flush()
+    # logger.flush() # REMOVED: No longer need to flush loss ledger
     mov_ae.save_model()
     per_ae.save_model()
 
