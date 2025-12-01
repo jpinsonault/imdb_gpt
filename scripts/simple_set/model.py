@@ -45,26 +45,15 @@ class HybridSetModel(nn.Module):
         if num_movies <= 0:
             raise ValueError("num_movies must be > 0 for Embedding Table mode.")
 
-        # 1. Embedding Table (The Ground Truth Memory)
-        # We initialize this to store the "ideal" latent for every movie.
-        # It allows random access during training without storing 200k dense vectors in VRAM.
         self.movie_embeddings = nn.Embedding(num_movies, latent_dim)
         nn.init.normal_(self.movie_embeddings.weight, std=0.02)
 
-        # 2. Learnable Encoder (The Perception)
-        # This tries to predict the embedding table from raw fields.
         self.field_encoder = _FieldEncoders(fields, latent_dim)
-        
-        # 3. Decoder (Regularizer)
-        # Decodes back to fields to ensure the Latent retains semantic meaning.
         self.field_decoder = TransformerFieldDecoder(fields, latent_dim, num_layers=2, num_heads=4)
         
-        # 4. Trunk (The Set Generator)
-        # Processes the Latent to produce set features.
         self.trunk_proj = nn.Linear(latent_dim, hidden_dim)
         self.trunk = nn.Sequential(*[ResBlock(hidden_dim, dropout) for _ in range(depth)])
         
-        # 5. Multi-Heads (People sets)
         self.people_bottlenecks = nn.ModuleDict()
         self.people_expansions = nn.ModuleDict()
         self.count_heads = nn.ModuleDict()
@@ -90,13 +79,12 @@ class HybridSetModel(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
-            if m is not getattr(self, 'movie_embeddings', None): # Don't re-init the main table if set
+            if m is not getattr(self, "movie_embeddings", None):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
-        # --- SPECIAL INITIALIZATION FOR SPARSE HEADS ---
         for name, layer in self.people_expansions.items():
             if m is layer:
                 prior_prob = 0.01
@@ -109,39 +97,19 @@ class HybridSetModel(nn.Module):
         batch_indices: torch.Tensor, 
         return_embeddings: bool = False
     ):
-        """
-        Args:
-            field_tensors: List[Tensor] - Raw input fields
-            batch_indices: Tensor[Batch] - Global indices of movies (Required)
-        Returns:
-            logits_dict, counts_dict, recon_table, recon_enc, (z_enc, z_table)
-        """
         if batch_indices is None:
             raise ValueError("batch_indices is required for Embedding Table lookup.")
 
-        # A. Lookup Table Latent (Memory)
-        # Note: self.movie_embeddings might be on CPU. We handle the move to GPU here.
-        raw_z_table = self.movie_embeddings(batch_indices.cpu()).to(self.trunk_proj.weight.device)
-        # Normalize: Table latents live on the unit hypersphere
+        idx = batch_indices.to(self.movie_embeddings.weight.device, non_blocking=True)
+        raw_z_table = self.movie_embeddings(idx)
         z_table = F.normalize(raw_z_table, p=2, dim=-1)
 
-        # B. Encode Fields (Perception)
-        # _FieldEncoders ends with LayerNorm (norm ~sqrt(D)). 
-        # We MUST normalize to unit sphere to match z_table for MSE align loss to work as Cosine Distance.
         z_enc = self.field_encoder(field_tensors)
         z_enc = F.normalize(z_enc, p=2, dim=-1)
         
-        # C. Decode / Regularize (Dual Path)
-        # 1. Decode Table: Ensures Table holds semantic info (Memory Integrity)
         recon_table = self.field_decoder(z_table)
-        
-        # 2. Decode Encoder: Ensures Encoder generates valid latents (Perception Validity)
-        # This allows gradients to flow from the Decoder -> Encoder directly.
         recon_enc = self.field_decoder(z_enc)
         
-        # D. Trunk & Heads (Driven by Table Memory)
-        # We generally want the Table to drive the set prediction task
-        # so the Table becomes the "Master Key"
         feat = self.trunk_proj(z_table)
         feat = self.trunk(feat)
         
@@ -151,7 +119,7 @@ class HybridSetModel(nn.Module):
         for name in self.people_bottlenecks.keys():
             bn = self.people_bottlenecks[name](feat)
             if return_embeddings:
-                logits_dict[name] = bn 
+                logits_dict[name] = bn
             else:
                 logits = self.people_expansions[name](bn)
                 logits_dict[name] = logits

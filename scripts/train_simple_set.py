@@ -148,20 +148,18 @@ def compute_sampled_asymmetric_loss(
 def compute_mass_loss(
     full_logits: torch.Tensor,
     true_count: torch.Tensor,
-    top_k: int = 4096,
+    alpha: float = 0.5,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     probs = torch.sigmoid(full_logits)
-    if top_k is not None and probs.shape[1] > top_k:
-        top_vals, _ = probs.topk(top_k, dim=1)
-        mass = top_vals.sum(dim=1)
-        target = true_count.squeeze(1).clamp(min=0.0, max=float(top_k))
-    else:
-        mass = probs.sum(dim=1)
-        target = true_count.squeeze(1).clamp(min=0.0)
-    mass_log = torch.log1p(mass.clamp(min=0.0))
-    target_log = torch.log1p(target)
-    return F.mse_loss(mass_log, target_log)
+    mass = probs.sum(dim=1)
+    target = true_count.squeeze(1).clamp(min=0.0)
+
+    mass_t = (mass.clamp(min=0.0) + eps).pow(alpha)
+    target_t = (target + eps).pow(alpha)
+
+    return F.mse_loss(mass_t, target_t)
+
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -268,7 +266,6 @@ def main():
 
     logging.info("Moving model to device and initializing optimizer...")
     model.to(device)
-    model.movie_embeddings.to("cpu")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
