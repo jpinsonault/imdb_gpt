@@ -359,6 +359,10 @@ def main():
                     return_embeddings=True
                 )
                 
+                # Check norms for debugging (Should be ~1.0 with the Fix)
+                z_enc_norm = z_enc.norm(dim=-1).mean()
+                z_table_norm = z_table.norm(dim=-1).mean()
+                
                 total_set_loss = 0.0
                 total_count_loss = 0.0
                 
@@ -438,6 +442,9 @@ def main():
                 run_logger.add_scalar("loss/align", align_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
+                run_logger.add_scalar("debug/z_enc_norm", z_enc_norm.item(), global_step)
+                run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
+                
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
                 run_logger.tick()

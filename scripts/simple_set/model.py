@@ -28,12 +28,12 @@ class HybridSetModel(nn.Module):
         self,
         fields: list,
         num_people: int, 
-        heads_config: dict,        
+        heads_config: dict,         
         head_vocab_sizes: dict, 
         latent_dim: int = 128, 
         hidden_dim: int = 1024,
         base_output_rank: int = 64, 
-        depth: int = 12,          
+        depth: int = 12,           
         dropout: float = 0.0,
         num_movies: int = 0
     ):
@@ -121,13 +121,15 @@ class HybridSetModel(nn.Module):
 
         # A. Lookup Table Latent (Memory)
         # Note: self.movie_embeddings might be on CPU. We handle the move to GPU here.
-        # FIX: Normalize the table latent to place it on the same hypersphere as the Encoder (which uses LayerNorm)
         raw_z_table = self.movie_embeddings(batch_indices.cpu()).to(self.trunk_proj.weight.device)
+        # Normalize: Table latents live on the unit hypersphere
         z_table = F.normalize(raw_z_table, p=2, dim=-1)
 
         # B. Encode Fields (Perception)
-        # _FieldEncoders ends with LayerNorm, so z_enc is already roughly unit length
+        # _FieldEncoders ends with LayerNorm (norm ~sqrt(D)). 
+        # We MUST normalize to unit sphere to match z_table for MSE align loss to work as Cosine Distance.
         z_enc = self.field_encoder(field_tensors)
+        z_enc = F.normalize(z_enc, p=2, dim=-1)
         
         # C. Decode / Regularize (Dual Path)
         # 1. Decode Table: Ensures Table holds semantic info (Memory Integrity)
