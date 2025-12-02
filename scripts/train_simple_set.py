@@ -28,78 +28,6 @@ from scripts.simple_set.recon import HybridSetReconLogger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def compute_sampled_asymmetric_loss(
-    embedding_batch,
-    head_layer,
-    positive_coords,
-    num_negatives=2048,
-    gamma_neg=2.0,
-    gamma_pos=0.0,
-    eps=1e-8,
-):
-    device = embedding_batch.device
-    batch_size = embedding_batch.shape[0]
-    num_vocab = head_layer.out_features
-
-    if positive_coords.shape[0] > 0:
-        pos_b_idx = positive_coords[:, 0]
-        pos_p_idx = positive_coords[:, 1]
-
-        pos_embs = embedding_batch[pos_b_idx]
-        pos_w = head_layer.weight[pos_p_idx]
-        pos_b = head_layer.bias[pos_p_idx] if head_layer.bias is not None else 0.0
-
-        pos_logits = (pos_embs * pos_w).sum(dim=1) + pos_b
-
-        pos_probs = torch.sigmoid(pos_logits)
-        pos_loss_raw = -torch.log(pos_probs.clamp(min=eps))
-        if gamma_pos > 0:
-            pos_loss_raw = pos_loss_raw * ((1 - pos_probs).pow(gamma_pos))
-
-        loss_pos = pos_loss_raw.sum()
-    else:
-        loss_pos = torch.tensor(0.0, device=device)
-
-    neg_p_idx = torch.randint(0, num_vocab, (num_negatives,), device=device)
-    neg_w = head_layer.weight[neg_p_idx]
-    neg_b = head_layer.bias[neg_p_idx] if head_layer.bias is not None else 0.0
-
-    neg_logits = embedding_batch @ neg_w.t() + neg_b
-
-    neg_probs = torch.sigmoid(neg_logits)
-    neg_loss_raw = -torch.log((1 - neg_probs).clamp(min=eps))
-
-    if gamma_neg > 0:
-        neg_loss_raw = neg_loss_raw * (neg_probs.pow(gamma_neg))
-
-    if positive_coords.shape[0] > 0:
-        collisions = pos_p_idx.unsqueeze(1) == neg_p_idx.unsqueeze(0)
-        if collisions.any():
-            c_pos_idx, c_neg_idx = torch.nonzero(collisions, as_tuple=True)
-            colliding_batch_rows = pos_b_idx[c_pos_idx]
-            neg_loss_raw[colliding_batch_rows, c_neg_idx] = 0.0
-
-    loss_neg = neg_loss_raw.sum()
-
-    return (loss_pos + loss_neg) / batch_size
-
-
-def compute_mass_loss(
-    full_logits: torch.Tensor,
-    true_count: torch.Tensor,
-    alpha: float = 0.5,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    probs = torch.sigmoid(full_logits)
-    mass = probs.sum(dim=1)
-    target = true_count.squeeze(1).clamp(min=0.0)
-
-    mass_t = (mass.clamp(min=0.0) + eps).pow(alpha)
-    target_t = (target + eps).pow(alpha)
-
-    return F.mse_loss(mass_t, target_t)
-
-
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None:
         return None
@@ -264,13 +192,7 @@ def main():
 
     w_bce = float(cfg.hybrid_set_w_bce)
     w_count = float(cfg.hybrid_set_w_count)
-    w_align = float(cfg.hybrid_set_w_align)
-    w_mass = float(getattr(cfg, "hybrid_set_w_mass", 0.01))
     w_recon = 1.0
-    NUM_NEG_SAMPLES = 2048
-
-    GAMMA_NEG = float(getattr(cfg, "hybrid_set_focal_gamma", 2.0))
-    GAMMA_POS = 0.0
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
@@ -288,29 +210,24 @@ def main():
                 logits_dict, counts_dict, recon_table, z_table = model(
                     field_tensors=inputs,
                     batch_indices=indices_cpu,
-                    return_embeddings=True,
+                    return_embeddings=False,
                 )
 
                 z_table_norm = z_table.norm(dim=-1).mean()
 
                 total_set_loss = 0.0
                 total_count_loss = 0.0
-                total_mass_loss = 0.0
 
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
-                    recon_loss += f.compute_loss(p, t) * float(f.weight)
-
-                align_loss = z_table_norm.new_zeros(())
-                if w_align != 0.0:
-                    align_loss = align_loss * 0.0
+                    recon_loss = recon_loss + f.compute_loss(p, t) * float(f.weight)
 
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
                 coords_dict_for_log = {}
                 count_targets_for_log = {}
                 head_metrics = {}
 
-                for head_name in logits_dict.keys():
+                for head_name, logits in logits_dict.items():
                     raw_padded_full = heads_padded_cpu.get(head_name)
                     if raw_padded_full is None:
                         continue
@@ -318,86 +235,49 @@ def main():
                     raw_padded_full = raw_padded_full.to(device, non_blocking=True)
                     mask_full = raw_padded_full != -1  # [num_movies, max_len]
 
-                    # Dataset indices for this batch as a tensor on the same device
                     idx_batch = indices_cpu.to(device, non_blocking=True)  # [B]
 
-                    # Count targets per movie in the batch
                     t_cnt_full = mask_full.sum(dim=1, keepdim=True).float()  # [num_movies, 1]
-                    t_cnt_batch = t_cnt_full[idx_batch]                      # [B, 1]
+                    t_cnt_batch = t_cnt_full[idx_batch]  # [B, 1]
 
                     c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
-                    total_count_loss += c_loss
+                    total_count_loss = total_count_loss + c_loss
                     head_metrics[f"{head_name}_count"] = c_loss.detach()
 
                     if collect_coords_for_log:
-                        # For logging we keep dataset-indexed counts
                         count_targets_for_log[head_name] = t_cnt_full.detach().cpu()
 
-                    # Build positive coords in batch space for the sampled loss
-                    # Slice padded heads to batch only
-                    raw_padded_batch = raw_padded_full[idx_batch]           # [B, max_len]
+                    raw_padded_batch = raw_padded_full[idx_batch]  # [B, max_len]
                     mask_batch = raw_padded_batch != -1
 
                     rows_b, cols_b = torch.nonzero(mask_batch, as_tuple=True)
-                    if rows_b.numel() == 0:
-                        # No positives for this head in the batch
-                        pos_coords_model = torch.empty(
-                            0, 2, dtype=torch.long, device=device
-                        )
-                        coords_for_log = torch.empty(
-                            0, 2, dtype=torch.long, device=device
-                        )
-                    else:
+                    targets = torch.zeros_like(logits)
+
+                    coords_for_log = torch.empty(0, 2, dtype=torch.long, device=device)
+
+                    head_map = mapping_tensors.get(head_name)
+
+                    if rows_b.numel() > 0 and head_map is not None:
                         global_person_ids = raw_padded_batch[rows_b, cols_b].long()
+                        local_person_ids = head_map[global_person_ids]
 
-                        pos_coords_model = torch.empty(0, 2, dtype=torch.long, device=device)
-                        coords_for_log = torch.empty(0, 2, dtype=torch.long, device=device)
+                        valid = local_person_ids != -1
+                        if valid.any():
+                            rows_b = rows_b[valid]
+                            local_person_ids = local_person_ids[valid]
 
-                        head_map = mapping_tensors.get(head_name)
-                        if head_map is not None:
-                            local_person_ids = head_map[global_person_ids]   # [num_pos]
-                            valid = local_person_ids != -1
+                            targets[rows_b, local_person_ids] = 1.0
 
-                            if valid.any():
-                                rows_b = rows_b[valid]
-                                local_person_ids = local_person_ids[valid]
-
-                                # Coords for the model: batch row index, local person index
-                                pos_coords_model = torch.stack(
-                                    [rows_b, local_person_ids], dim=1
-                                )
-
-                                # Coords for logging: dataset index, local person index
+                            if collect_coords_for_log:
                                 ds_rows = idx_batch[rows_b]
                                 coords_for_log = torch.stack(
-                                    [ds_rows, local_person_ids], dim=1
+                                    [ds_rows, local_person_ids],
+                                    dim=1,
                                 )
 
-                    head_layer = model.people_expansions[head_name]
-                    bottlenecks = logits_dict[head_name]  # [B, rank]
-
-                    loss_head = compute_sampled_asymmetric_loss(
-                        embedding_batch=bottlenecks,
-                        head_layer=head_layer,
-                        positive_coords=pos_coords_model,
-                        num_negatives=NUM_NEG_SAMPLES,
-                        gamma_neg=GAMMA_NEG,
-                        gamma_pos=GAMMA_POS,
-                    )
-                    total_set_loss += loss_head
-                    head_metrics[f"{head_name}_bce"] = loss_head.detach()
-
-                    if w_mass > 0.0:
-                        full_logits = bottlenecks @ head_layer.weight.t()
-                        if head_layer.bias is not None:
-                            full_logits = full_logits + head_layer.bias
-                        # Use batch counts as targets for mass loss
-                        mass_loss = compute_mass_loss(
-                            full_logits=full_logits,
-                            true_count=t_cnt_batch,
-                        )
-                        total_mass_loss += mass_loss
-                        head_metrics[f"{head_name}_mass"] = mass_loss.detach()
+                    bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
+                    total_set_loss = total_set_loss + bce_loss
+                    head_metrics[f"{head_name}_bce"] = bce_loss.detach()
 
                     if collect_coords_for_log and coords_for_log.numel() > 0:
                         coords_dict_for_log[head_name] = coords_for_log.detach().cpu()
@@ -405,9 +285,7 @@ def main():
                 loss = (
                     w_bce * total_set_loss
                     + w_count * total_count_loss
-                    + w_mass * total_mass_loss
                     + w_recon * recon_loss
-                    + w_align * align_loss
                 )
 
             scaler.scale(loss).backward()
@@ -421,8 +299,6 @@ def main():
             if run_logger:
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
-                run_logger.add_scalar("loss/mass_total", total_mass_loss.item(), global_step)
-                run_logger.add_scalar("loss/align", align_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
@@ -434,7 +310,6 @@ def main():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
 
                 run_logger.tick()
-
 
             if collect_coords_for_log:
                 recon_logger.step(
@@ -449,8 +324,6 @@ def main():
 
             pbar.set_postfix(
                 loss=f"{loss.item():.3f}",
-                align=f"{align_loss.item():.4f}",
-                mass=f"{total_mass_loss.item():.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
             global_step += 1

@@ -73,6 +73,7 @@ class ProjectConfig:
     
     hybrid_set_save_interval: int = 400
     hybrid_set_recon_interval: int = 200
+    hybrid_set_dropout: float = 0.0
 
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
