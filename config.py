@@ -74,9 +74,6 @@ class ProjectConfig:
     hybrid_set_save_interval: int = 400
     hybrid_set_recon_interval: int = 200
 
-    # New: Input Field Dropout for robust partial matching
-    hybrid_set_field_dropout: float = 0.4
-
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,

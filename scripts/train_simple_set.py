@@ -131,7 +131,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     def linear_lambda(step):
         s = int(step)
         if w_steps > 0 and s < w_steps:
-            return float(s + 1) / float(wsteps)
+            return float(s + 1) / float(w_steps)
         if s >= total_steps:
             return min_factor
         if w_steps >= total_steps:
@@ -311,58 +311,96 @@ def main():
                 head_metrics = {}
 
                 for head_name in logits_dict.keys():
-                    raw_padded = heads_padded_cpu.get(head_name)
-                    if raw_padded is not None:
-                        raw_padded = raw_padded.to(device, non_blocking=True)
-                        mask = raw_padded != -1
-                        t_cnt = mask.sum(dim=1, keepdim=True).float()
+                    raw_padded_full = heads_padded_cpu.get(head_name)
+                    if raw_padded_full is None:
+                        continue
 
-                        c_loss = F.mse_loss(counts_dict[head_name], t_cnt)
-                        total_count_loss += c_loss
-                        head_metrics[f"{head_name}_count"] = c_loss.detach()
+                    raw_padded_full = raw_padded_full.to(device, non_blocking=True)
+                    mask_full = raw_padded_full != -1  # [num_movies, max_len]
 
-                        if collect_coords_for_log:
-                            count_targets_for_log[head_name] = t_cnt
+                    # Dataset indices for this batch as a tensor on the same device
+                    idx_batch = indices_cpu.to(device, non_blocking=True)  # [B]
 
-                        rows, cols = torch.nonzero(mask, as_tuple=True)
-                        global_person_ids = raw_padded[rows, cols].long()
-                        pos_coords = torch.empty((0, 2), dtype=torch.long, device=device)
+                    # Count targets per movie in the batch
+                    t_cnt_full = mask_full.sum(dim=1, keepdim=True).float()  # [num_movies, 1]
+                    t_cnt_batch = t_cnt_full[idx_batch]                      # [B, 1]
 
-                        if global_person_ids.numel() > 0 and head_name in mapping_tensors:
-                            local_person_ids = mapping_tensors[head_name][global_person_ids]
-                            valid_mask = local_person_ids != -1
-                            if valid_mask.any():
-                                final_rows = rows[valid_mask]
-                                final_locals = local_person_ids[valid_mask]
-                                pos_coords = torch.stack([final_rows, final_locals], dim=1)
+                    c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
+                    total_count_loss += c_loss
+                    head_metrics[f"{head_name}_count"] = c_loss.detach()
 
-                        head_layer = model.people_expansions[head_name]
-                        bottlenecks = logits_dict[head_name]
+                    if collect_coords_for_log:
+                        # For logging we keep dataset-indexed counts
+                        count_targets_for_log[head_name] = t_cnt_full.detach().cpu()
 
-                        loss_head = compute_sampled_asymmetric_loss(
-                            embedding_batch=bottlenecks,
-                            head_layer=head_layer,
-                            positive_coords=pos_coords,
-                            num_negatives=NUM_NEG_SAMPLES,
-                            gamma_neg=GAMMA_NEG,
-                            gamma_pos=GAMMA_POS,
+                    # Build positive coords in batch space for the sampled loss
+                    # Slice padded heads to batch only
+                    raw_padded_batch = raw_padded_full[idx_batch]           # [B, max_len]
+                    mask_batch = raw_padded_batch != -1
+
+                    rows_b, cols_b = torch.nonzero(mask_batch, as_tuple=True)
+                    if rows_b.numel() == 0:
+                        # No positives for this head in the batch
+                        pos_coords_model = torch.empty(
+                            0, 2, dtype=torch.long, device=device
                         )
-                        total_set_loss += loss_head
-                        head_metrics[f"{head_name}_bce"] = loss_head.detach()
+                        coords_for_log = torch.empty(
+                            0, 2, dtype=torch.long, device=device
+                        )
+                    else:
+                        global_person_ids = raw_padded_batch[rows_b, cols_b].long()
 
-                        if w_mass > 0.0:
-                            full_logits = bottlenecks @ head_layer.weight.t()
-                            if head_layer.bias is not None:
-                                full_logits = full_logits + head_layer.bias
-                            mass_loss = compute_mass_loss(
-                                full_logits=full_logits,
-                                true_count=t_cnt,
-                            )
-                            total_mass_loss += mass_loss
-                            head_metrics[f"{head_name}_mass"] = mass_loss.detach()
+                        pos_coords_model = torch.empty(0, 2, dtype=torch.long, device=device)
+                        coords_for_log = torch.empty(0, 2, dtype=torch.long, device=device)
 
-                        if collect_coords_for_log:
-                            coords_dict_for_log[head_name] = pos_coords.cpu()
+                        head_map = mapping_tensors.get(head_name)
+                        if head_map is not None:
+                            local_person_ids = head_map[global_person_ids]   # [num_pos]
+                            valid = local_person_ids != -1
+
+                            if valid.any():
+                                rows_b = rows_b[valid]
+                                local_person_ids = local_person_ids[valid]
+
+                                # Coords for the model: batch row index, local person index
+                                pos_coords_model = torch.stack(
+                                    [rows_b, local_person_ids], dim=1
+                                )
+
+                                # Coords for logging: dataset index, local person index
+                                ds_rows = idx_batch[rows_b]
+                                coords_for_log = torch.stack(
+                                    [ds_rows, local_person_ids], dim=1
+                                )
+
+                    head_layer = model.people_expansions[head_name]
+                    bottlenecks = logits_dict[head_name]  # [B, rank]
+
+                    loss_head = compute_sampled_asymmetric_loss(
+                        embedding_batch=bottlenecks,
+                        head_layer=head_layer,
+                        positive_coords=pos_coords_model,
+                        num_negatives=NUM_NEG_SAMPLES,
+                        gamma_neg=GAMMA_NEG,
+                        gamma_pos=GAMMA_POS,
+                    )
+                    total_set_loss += loss_head
+                    head_metrics[f"{head_name}_bce"] = loss_head.detach()
+
+                    if w_mass > 0.0:
+                        full_logits = bottlenecks @ head_layer.weight.t()
+                        if head_layer.bias is not None:
+                            full_logits = full_logits + head_layer.bias
+                        # Use batch counts as targets for mass loss
+                        mass_loss = compute_mass_loss(
+                            full_logits=full_logits,
+                            true_count=t_cnt_batch,
+                        )
+                        total_mass_loss += mass_loss
+                        head_metrics[f"{head_name}_mass"] = mass_loss.detach()
+
+                    if collect_coords_for_log and coords_for_log.numel() > 0:
+                        coords_dict_for_log[head_name] = coords_for_log.detach().cpu()
 
                 loss = (
                     w_bce * total_set_loss
