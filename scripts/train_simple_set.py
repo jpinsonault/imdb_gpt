@@ -151,6 +151,12 @@ def main():
         for name, t in ds.head_mappings.items():
             mapping_tensors[name] = t.to(device)
 
+    head_true_counts = {}
+    if hasattr(ds, "heads_padded"):
+        for head_name, padded in ds.heads_padded.items():
+            mask = padded != -1
+            head_true_counts[head_name] = mask.sum(dim=1, keepdim=True)
+
     scaler = torch.amp.GradScaler("cuda")
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
@@ -228,27 +234,24 @@ def main():
                 head_metrics = {}
 
                 for head_name, logits in logits_dict.items():
-                    raw_padded_full = heads_padded_cpu.get(head_name)
-                    if raw_padded_full is None:
+                    raw_padded_batch_cpu = heads_padded_cpu.get(head_name)
+                    if raw_padded_batch_cpu is None:
                         continue
 
-                    raw_padded_full = raw_padded_full.to(device, non_blocking=True)
-                    mask_full = raw_padded_full != -1  # [num_movies, max_len]
-
-                    idx_batch = indices_cpu.to(device, non_blocking=True)  # [B]
-
-                    t_cnt_full = mask_full.sum(dim=1, keepdim=True).float()  # [num_movies, 1]
-                    t_cnt_batch = t_cnt_full[idx_batch]  # [B, 1]
-
-                    c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
-                    total_count_loss = total_count_loss + c_loss
-                    head_metrics[f"{head_name}_count"] = c_loss.detach()
-
-                    if collect_coords_for_log:
-                        count_targets_for_log[head_name] = t_cnt_full.detach().cpu()
-
-                    raw_padded_batch = raw_padded_full[idx_batch]  # [B, max_len]
+                    raw_padded_batch = raw_padded_batch_cpu.to(device, non_blocking=True)
                     mask_batch = raw_padded_batch != -1
+
+                    t_cnt_full = head_true_counts.get(head_name)
+                    if t_cnt_full is not None:
+                        t_cnt_batch = t_cnt_full[indices_cpu].to(device, non_blocking=True).float()
+                        c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
+                        total_count_loss = total_count_loss + c_loss
+                        head_metrics[f"{head_name}_count"] = c_loss.detach()
+                        if collect_coords_for_log:
+                            count_targets_for_log[head_name] = t_cnt_full
+                    else:
+                        if collect_coords_for_log:
+                            count_targets_for_log[head_name] = None
 
                     rows_b, cols_b = torch.nonzero(mask_batch, as_tuple=True)
                     targets = torch.zeros_like(logits)
@@ -269,6 +272,7 @@ def main():
                             targets[rows_b, local_person_ids] = 1.0
 
                             if collect_coords_for_log:
+                                idx_batch = indices_cpu.to(device, non_blocking=True)
                                 ds_rows = idx_batch[rows_b]
                                 coords_for_log = torch.stack(
                                     [ds_rows, local_person_ids],
