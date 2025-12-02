@@ -83,6 +83,7 @@ class HybridSetReconLogger:
 
         for local_slice_idx, batch_row_idx in enumerate(indices):
             dataset_idx = int(sliced_batch_indices[local_slice_idx])
+
             orig_inputs = [
                 self.dataset.stacked_fields[i][dataset_idx].cpu()
                 for i in range(len(self.dataset.fields))
@@ -114,12 +115,15 @@ class HybridSetReconLogger:
                 if coords is not None:
                     if coords.device.type != "cpu":
                         coords = coords.cpu()
-                    mask = coords[:, 0] == batch_row_idx
+                    mask = coords[:, 0] == dataset_idx
                     if mask.any():
                         true_local_idxs = set(coords[mask, 1].numpy().tolist())
 
                 tgt_cnt_t = count_targets.get(head)
-                true_count = tgt_cnt_t[batch_row_idx].item() if tgt_cnt_t is not None else 0.0
+                if tgt_cnt_t is not None:
+                    true_count = tgt_cnt_t[dataset_idx].item()
+                else:
+                    true_count = 0.0
                 pred_count = counts_dict[head][local_slice_idx].item()
 
                 probs = torch.sigmoid(logits_dict[head][local_slice_idx])
