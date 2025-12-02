@@ -388,9 +388,15 @@ def main():
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
+
+                current_lr = optimizer.param_groups[0]["lr"]
+                run_logger.add_scalar("opt/lr", current_lr, global_step)
+
                 for k, v in head_metrics.items():
                     run_logger.add_scalar(f"loss_heads/{k}", v.item(), global_step)
+
                 run_logger.tick()
+
 
             if collect_coords_for_log:
                 recon_logger.step(

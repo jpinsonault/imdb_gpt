@@ -54,7 +54,7 @@ class ProjectConfig:
     lr_min_factor: float = 0.05
 
     hybrid_set_epochs: int = 200
-    hybrid_set_lr: float = 1e-3
+    hybrid_set_lr: float = 2e-3
     hybrid_set_weight_decay: float = 1e-4
     
     # Architecture
