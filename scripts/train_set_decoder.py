@@ -61,31 +61,46 @@ class EndToEndSetModel(nn.Module):
         return z_pred, pres_logits, z_movie, z_p_seq
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
-    if total_steps is None: return None
+    if total_steps is None:
+        return None
     total_steps = max(1, int(total_steps))
     schedule = (schedule or "").lower()
-    if schedule not in ("cosine", "linear"): return None
+    if schedule not in ("cosine", "linear"):
+        return None
 
     base_warmup = max(0, int(warmup_steps))
     ratio = float(warmup_ratio)
     frac_warmup = int(total_steps * ratio) if ratio > 0.0 else 0
     w_steps = max(base_warmup, frac_warmup)
-    w_steps = min(w_steps, total_steps - 1) if total_steps > 1 else 0
+    if total_steps > 1:
+        w_steps = min(w_steps, total_steps - 1)
+    else:
+        w_steps = 0
     min_factor = float(min_factor)
 
     def cosine_lambda(step):
         s = int(step)
-        if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
-        if s >= total_steps: return min_factor
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
         decay = 0.5 * (1.0 + math.cos(math.pi * t))
         return min_factor + (1.0 - min_factor) * decay
 
     def linear_lambda(step):
         s = int(step)
-        if w_steps > 0 and s < w_steps: return float(s + 1) / float(w_steps)
-        if s >= total_steps: return min_factor
+        if w_steps > 0 and s < w_steps:
+            return float(s + 1) / float(w_steps)
+        if s >= total_steps:
+            return min_factor
+        if w_steps >= total_steps:
+            return min_factor
         t = float(s - w_steps) / float(total_steps - w_steps)
+        t = max(0.0, min(1.0, t))
         return max(min_factor, 1.0 - (1.0 - min_factor) * t)
 
     lr_lambda = cosine_lambda if schedule == "cosine" else linear_lambda

@@ -62,11 +62,6 @@ class ProjectConfig:
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 12
     hybrid_set_output_rank: int = 256
-    hybrid_set_dropout: float = 0.0
-    
-    # Embedding Table Strategy
-    hybrid_set_table_lr: float = 1e-3  # Often useful to have higher LR for embeddings
-    hybrid_set_w_align: float = 1.0    # Weight for MSE(Encoder, Table)
     
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
