@@ -47,10 +47,10 @@ class ProjectConfig:
 
     lr_schedule: str = "cosine"
     lr_warmup_steps: int = 0
-    lr_warmup_ratio: float = 0.01
+    lr_warmup_ratio: float = 0.05
     lr_min_factor: float = 0.05
 
-    hybrid_set_epochs: int = 1000
+    hybrid_set_epochs: int = 200
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 1e-4
     
