@@ -1,5 +1,3 @@
-# config.py
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict
@@ -8,9 +6,8 @@ from typing import List, Dict
 class ProjectConfig:
     data_dir: str = "data"
     
-    # --- Database Paths ---
-    raw_db_path: str = "data/raw.db"    # For raw TSV imports
-    db_path: str = "data/imdb.db"       # For normalized training tables & edges
+    raw_db_path: str = "data/raw.db"
+    db_path: str = "data/imdb.db"
     
     model_dir: str = "models"
 
@@ -57,18 +54,16 @@ class ProjectConfig:
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 1e-4
     
-    # Architecture
     hybrid_set_latent_dim: int = 128
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 4
     hybrid_set_output_rank: int = 256
     
-    # Loss Weights
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05
-    hybrid_set_w_mass: float = 0.01    # New: Weight for "Energy" Mass Constraint
+    hybrid_set_w_mass: float = 0.01
+    hybrid_set_w_title: float = 1.0
 
-    # Focal Loss Gamma
     hybrid_set_focal_gamma: float = 4.0
     
     hybrid_set_save_interval: int = 400

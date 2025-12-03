@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 from scripts.simple_set.precompute import ensure_hybrid_cache
+from scripts.simple_set.recon import HybridSetReconLogger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +24,6 @@ from scripts.autoencoder.run_logger import RunLogger
 from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.model import HybridSetModel
 from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
-from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -97,6 +97,53 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
 
+
+def binary_focal_loss_with_logits(logits, targets, gamma):
+    if gamma <= 0.0:
+        return F.binary_cross_entropy_with_logits(logits, targets)
+    p = torch.sigmoid(logits)
+    ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1.0 - p) * (1.0 - targets)
+    modulating = (1.0 - p_t).pow(gamma)
+    loss = modulating * ce_loss
+    return loss.mean()
+
+
+def build_focus_mask(logits, pos_mask, topk_negatives):
+    if topk_negatives <= 0:
+        return pos_mask
+    if logits.numel() == 0:
+        return pos_mask
+
+    B, V = logits.shape
+    if V == 0:
+        return pos_mask
+
+    k = min(int(topk_negatives), V)
+
+    with torch.no_grad():
+        logits_detached = logits.detach()
+
+        if logits_detached.dtype in (torch.float16, torch.bfloat16):
+            logits_work = logits_detached.float()
+        else:
+            logits_work = logits_detached
+
+        logits_neg = logits_work.masked_fill(pos_mask, float("-inf"))
+        _, topk_idx = torch.topk(logits_neg, k, dim=1)
+
+    topk_mask = torch.zeros_like(pos_mask)
+    topk_mask.scatter_(1, topk_idx, True)
+
+    focus_mask = pos_mask | topk_mask
+    return focus_mask
+
+
+def mass_loss_from_logits(logits, true_counts):
+    pred_mass = torch.sigmoid(logits).sum(dim=-1, keepdim=True)
+    pred_log = torch.log1p(pred_mass)
+    true_log = torch.log1p(true_counts)
+    return F.mse_loss(pred_log, true_log)
 
 
 def main():
@@ -206,6 +253,7 @@ def main():
     w_bce = float(cfg.hybrid_set_w_bce)
     w_count = float(cfg.hybrid_set_w_count)
     w_recon = 1.0
+    w_title = float(cfg.hybrid_set_w_title)
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
@@ -234,6 +282,12 @@ def main():
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
                     recon_loss = recon_loss + f.compute_loss(p, t) * float(f.weight)
+
+                title_latents = model.encode_titles(inputs)
+                z_target = z_table.detach()
+                z_target_norm = F.normalize(z_target, p=2, dim=-1)
+                z_title_norm = F.normalize(title_latents, p=2, dim=-1)
+                title_loss = F.mse_loss(z_title_norm, z_target_norm)
 
                 collect_coords_for_log = (global_step + 1) % recon_logger.every == 0
                 coords_dict_for_log = {}
@@ -297,6 +351,7 @@ def main():
                     w_bce * total_set_loss
                     + w_count * total_count_loss
                     + w_recon * recon_loss
+                    + w_title * title_loss
                 )
 
             scaler.scale(loss).backward()
@@ -311,6 +366,7 @@ def main():
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
                 run_logger.add_scalar("loss/set_total", total_set_loss.item(), global_step)
                 run_logger.add_scalar("loss/recon", recon_loss.item(), global_step)
+                run_logger.add_scalar("loss/title", title_loss.item(), global_step)
                 run_logger.add_scalar("time/iter", iter_time, global_step)
                 run_logger.add_scalar("debug/z_table_norm", z_table_norm.item(), global_step)
 
@@ -351,6 +407,7 @@ def main():
 
     if run_logger:
         run_logger.close()
+
 
 
 if __name__ == "__main__":

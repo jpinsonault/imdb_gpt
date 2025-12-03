@@ -1,5 +1,3 @@
-# scripts/simple_set/recon.py
-
 import torch
 import numpy as np
 import textwrap
@@ -119,7 +117,7 @@ class HybridSetReconLogger:
                     if mask.any():
                         true_local_idxs = set(coords[mask, 1].numpy().tolist())
 
-                tgt_cnt_t = count_targets.get(head)
+                tgt_cnt_t = count_targets.get(head) if count_targets is not None else None
                 if tgt_cnt_t is not None:
                     true_count = tgt_cnt_t[dataset_idx].item()
                 else:

@@ -1,10 +1,9 @@
-# scripts/simple_set/model.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder
+from scripts.autoencoder.fields import TextField
 
 
 class ResBlock(nn.Module):
@@ -38,11 +37,13 @@ class HybridSetModel(nn.Module):
         depth: int = 12,
         dropout: float = 0.0,
         num_movies: int = 0,
+        title_noise_prob: float = 0.05,
     ):
         super().__init__()
         self.fields = fields
         self.heads_config = heads_config
         self.latent_dim = latent_dim
+        self.title_noise_prob = float(title_noise_prob)
 
         if num_movies <= 0:
             raise ValueError("num_movies must be > 0 for Embedding Table mode.")
@@ -72,6 +73,32 @@ class HybridSetModel(nn.Module):
                 nn.Linear(256, 1),
             )
 
+        self.title_field_index = None
+        self.title_encoder = None
+        self.title_pad_id = None
+        self.title_special_ids = []
+        self.title_valid_ids = None
+
+        title_field = None
+        for idx, f in enumerate(self.fields):
+            if isinstance(f, TextField) and f.name == "primaryTitle":
+                self.title_field_index = idx
+                title_field = f
+                break
+
+        if title_field is not None:
+            self.title_encoder = title_field.build_encoder(latent_dim)
+            tok = title_field.tokenizer
+            if tok is not None:
+                specials = list(getattr(tok, "special_tokens", []))
+                special_ids = [tok.token_to_id(s) for s in specials]
+                vocab_size = tok.get_vocab_size()
+                valid_ids = [i for i in range(vocab_size) if i not in special_ids]
+                if valid_ids:
+                    self.title_valid_ids = torch.tensor(valid_ids, dtype=torch.long)
+                self.title_pad_id = title_field.pad_token_id
+                self.title_special_ids = special_ids
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -91,6 +118,39 @@ class HybridSetModel(nn.Module):
                 prior_prob = 0.01
                 bias_value = -math.log((1 - prior_prob) / prior_prob)
                 nn.init.constant_(m.bias, bias_value)
+
+    def _apply_title_noise(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.title_noise_prob <= 0.0:
+            return tokens
+        if self.title_valid_ids is None:
+            return tokens
+        device = tokens.device
+        mask = torch.rand(tokens.shape, device=device) < self.title_noise_prob
+        if self.title_pad_id is not None:
+            mask = mask & (tokens != self.title_pad_id)
+        for sid in self.title_special_ids:
+            mask = mask & (tokens != sid)
+        if not mask.any():
+            return tokens
+        flat_mask = mask.view(-1)
+        num = int(flat_mask.sum().item())
+        if num == 0:
+            return tokens
+        valid_ids = self.title_valid_ids.to(device)
+        choice_idx = torch.randint(valid_ids.size(0), (num,), device=device)
+        new_vals = valid_ids[choice_idx]
+        out = tokens.clone()
+        out_flat = out.view(-1)
+        out_flat[flat_mask] = new_vals
+        return out
+
+    def encode_titles(self, field_tensors: list) -> torch.Tensor:
+        if self.title_field_index is None or self.title_encoder is None:
+            raise RuntimeError("Title encoder not configured")
+        x = field_tensors[self.title_field_index]
+        if self.training:
+            x = self._apply_title_noise(x)
+        return self.title_encoder(x)
 
     def forward(
         self,
