@@ -50,17 +50,17 @@ class ProjectConfig:
 
     lr_schedule: str = "cosine"
     lr_warmup_steps: int = 0
-    lr_warmup_ratio: float = 0.05
+    lr_warmup_ratio: float = 0.01
     lr_min_factor: float = 0.05
 
-    hybrid_set_epochs: int = 200
-    hybrid_set_lr: float = 2e-3
+    hybrid_set_epochs: int = 1000
+    hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 1e-4
     
     # Architecture
     hybrid_set_latent_dim: int = 128
     hybrid_set_hidden_dim: int = 1024
-    hybrid_set_depth: int = 12
+    hybrid_set_depth: int = 4
     hybrid_set_output_rank: int = 256
     
     # Loss Weights
