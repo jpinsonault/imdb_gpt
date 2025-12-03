@@ -75,19 +75,28 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
 def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
-        with open(model_dir / "hybrid_set_config.json", "w") as f:
+        config_path = model_dir / "hybrid_set_config.json"
+        state_path = model_dir / "hybrid_set_state.pt"
+
+        with open(config_path, "w") as f:
             json.dump(asdict(config), f, indent=4)
-        state = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+
+        model_state = {
+            k: v.detach().cpu()
+            for k, v in model.state_dict().items()
         }
-        torch.save(state, model_dir / "hybrid_set_state.pt")
-        logging.info(f"Saved training state to {model_dir / 'hybrid_set_state.pt'}")
+
+        state = {
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "model_state_dict": model_state,
+        }
+
+        torch.save(state, state_path)
+        logging.info(f"Saved training state to {state_path}")
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
+
 
 
 def main():
@@ -178,13 +187,11 @@ def main():
     if ckpt_path.exists() and not args.no_resume:
         try:
             c = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(c["model_state_dict"])
-            if "optimizer_state_dict" in c:
-                optimizer.load_state_dict(c["optimizer_state_dict"])
-            start_epoch = c["epoch"]
-            global_step = c["global_step"]
-            if c.get("scheduler_state_dict") and sched:
-                sched.load_state_dict(c["scheduler_state_dict"])
+            state = c.get("model_state_dict", {})
+            if state:
+                model.load_state_dict(state)
+            start_epoch = int(c.get("epoch", 0))
+            global_step = int(c.get("global_step", 0))
             logging.info(f"Resumed from epoch {start_epoch}")
         except Exception as e:
             logging.error(f"Resume failed: {e}")
