@@ -66,20 +66,25 @@ class HybridSetReconLogger:
         if B == 0:
             return
 
+        if isinstance(batch_indices, torch.Tensor):
+            batch_indices_np = batch_indices.detach().cpu().numpy()
+        else:
+            batch_indices_np = np.asarray(batch_indices)
+
         indices = np.random.choice(B, size=min(self.num_samples, B), replace=False)
         indices_t = torch.tensor(indices, device=inputs[0].device)
 
         sliced_inputs = [t[indices_t] for t in inputs]
-        sliced_batch_indices = batch_indices[indices]
+        sliced_batch_indices = batch_indices_np[indices]
 
         logits_dict, counts_dict, recon_table, _ = model(
             sliced_inputs,
-            batch_indices=sliced_batch_indices,
+            batch_indices=torch.tensor(sliced_batch_indices, device=inputs[0].device),
         )
 
         output_log = []
 
-        for local_slice_idx, batch_row_idx in enumerate(indices):
+        for local_slice_idx, _ in enumerate(indices):
             dataset_idx = int(sliced_batch_indices[local_slice_idx])
 
             orig_inputs = [

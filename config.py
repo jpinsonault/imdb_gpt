@@ -53,7 +53,7 @@ class ProjectConfig:
     lr_min_factor: float = 0.05
 
     hybrid_set_epochs: int = 200
-    hybrid_set_lr: float = 5e-3
+    hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_latent_dim: int = 128
@@ -63,12 +63,12 @@ class ProjectConfig:
 
     hybrid_set_num_person_groups: int = 32
     
-    hybrid_set_w_bce: float = 1.0
+    hybrid_set_w_bce: float = 2.0
     hybrid_set_w_count: float = 0.05
-    hybrid_set_w_mass: float = 0.01
+    hybrid_set_w_mass: float = 0.05
     hybrid_set_w_title: float = 1.0
 
-    hybrid_set_focal_gamma: float = 4.0
+    hybrid_set_focal_gamma: float = 1.0
     
     hybrid_set_save_interval: int = 400
     hybrid_set_recon_interval: int = 200

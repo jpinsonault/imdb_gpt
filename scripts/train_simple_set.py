@@ -253,6 +253,8 @@ def main():
     w_count = float(cfg.hybrid_set_w_count)
     w_recon = 1.0
     w_title = float(cfg.hybrid_set_w_title)
+    gamma = float(cfg.hybrid_set_focal_gamma)
+    mass_weight = float(cfg.hybrid_set_w_mass)
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
@@ -302,6 +304,7 @@ def main():
                     mask_batch = raw_padded_batch != -1
 
                     t_cnt_full = head_true_counts.get(head_name)
+                    t_cnt_batch = None
                     if t_cnt_full is not None:
                         t_cnt_batch = t_cnt_full[indices_cpu].to(device, non_blocking=True).float()
                         c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
@@ -339,9 +342,13 @@ def main():
                                     dim=1,
                                 )
 
-                    bce_loss = F.binary_cross_entropy_with_logits(logits, targets)
-                    total_set_loss = total_set_loss + bce_loss
-                    head_metrics[f"{head_name}_bce"] = bce_loss.detach()
+                    set_loss = binary_focal_loss_with_logits(logits, targets, gamma)
+                    if mass_weight > 0.0 and t_cnt_batch is not None:
+                        mass_loss = mass_loss_from_logits(logits, t_cnt_batch)
+                        set_loss = set_loss + mass_weight * mass_loss
+
+                    total_set_loss = total_set_loss + set_loss
+                    head_metrics[f"{head_name}_set"] = set_loss.detach()
 
                     if collect_coords_for_log and coords_for_log.numel() > 0:
                         coords_dict_for_log[head_name] = coords_for_log.detach().cpu()
