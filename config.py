@@ -1,3 +1,5 @@
+# config.py
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict
@@ -58,6 +60,8 @@ class ProjectConfig:
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 4
     hybrid_set_output_rank: int = 256
+
+    hybrid_set_num_person_groups: int = 32
     
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_count: float = 0.05

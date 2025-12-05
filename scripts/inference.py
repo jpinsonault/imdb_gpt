@@ -1,3 +1,5 @@
+# scripts/inference.py
+
 import logging
 import time
 from pathlib import Path
@@ -39,6 +41,8 @@ class MovieSearchEngine:
             num_people=self.dataset.num_people,
             heads_config=self.cfg.hybrid_set_heads,
             head_vocab_sizes=self.dataset.head_vocab_sizes,
+            head_group_offsets=self.dataset.head_group_offsets,
+            num_groups=self.dataset.num_groups,
             latent_dim=int(self.cfg.hybrid_set_latent_dim),
             hidden_dim=int(self.cfg.hybrid_set_hidden_dim),
             base_output_rank=int(self.cfg.hybrid_set_output_rank),

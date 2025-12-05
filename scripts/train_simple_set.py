@@ -1,5 +1,3 @@
-# scripts/simple_set.py
-
 import argparse
 import logging
 import json
@@ -11,17 +9,16 @@ import time
 from pathlib import Path
 from dataclasses import asdict
 
-from scripts.simple_set.precompute import ensure_hybrid_cache
-from scripts.simple_set.recon import HybridSetReconLogger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 import torch.amp
+from tqdm import tqdm
 
 from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
 from scripts.autoencoder.print_model import print_model_summary
+from scripts.simple_set.precompute import ensure_hybrid_cache
 from scripts.simple_set.model import HybridSetModel
 from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
 
@@ -115,15 +112,14 @@ def build_focus_mask(logits, pos_mask, topk_negatives):
     if logits.numel() == 0:
         return pos_mask
 
-    B, V = logits.shape
-    if V == 0:
+    b, v = logits.shape
+    if v == 0:
         return pos_mask
 
-    k = min(int(topk_negatives), V)
+    k = min(int(topk_negatives), v)
 
     with torch.no_grad():
         logits_detached = logits.detach()
-
         if logits_detached.dtype in (torch.float16, torch.bfloat16):
             logits_work = logits_detached.float()
         else:
@@ -178,6 +174,8 @@ def main():
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
         head_vocab_sizes=ds.head_vocab_sizes,
+        head_group_offsets=ds.head_group_offsets,
+        num_groups=ds.num_groups,
         latent_dim=int(cfg.hybrid_set_latent_dim),
         hidden_dim=int(cfg.hybrid_set_hidden_dim),
         base_output_rank=int(cfg.hybrid_set_output_rank),
@@ -214,6 +212,7 @@ def main():
             head_true_counts[head_name] = mask.sum(dim=1, keepdim=True)
 
     scaler = torch.amp.GradScaler("cuda")
+    from scripts.simple_set.recon import HybridSetReconLogger
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
 
@@ -407,7 +406,6 @@ def main():
 
     if run_logger:
         run_logger.close()
-
 
 
 if __name__ == "__main__":
