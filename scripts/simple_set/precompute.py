@@ -73,17 +73,43 @@ def build_hybrid_cache(cfg: ProjectConfig):
                 movie_data[tconst][head].add(nconst)
                 head_populations[head].add(nconst)
             
-    final_tconsts = []
+    potential_tconsts = []
     
     for tconst, heads in movie_data.items():
         has_cast = len(heads.get('cast', [])) > 0
         has_director = len(heads.get('director', [])) > 0
         if has_cast and has_director:
-            final_tconsts.append(tconst)
+            potential_tconsts.append(tconst)
             
-    final_tconsts.sort()
-    logging.info(f"Movie filtering: Kept {len(final_tconsts)} valid movies.")
+    potential_tconsts.sort()
+    logging.info(f"Movie filtering: Found {len(potential_tconsts)} movies with valid edges.")
     
+    # --- FIX START: Pre-fetch and Filter Tconsts to ensure Alignment ---
+    logging.info("Stacking raw field tensors...")
+    cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
+    cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in potential_tconsts])
+    
+    sql_meta = f"""
+    SELECT 
+        {movie_select_clause(alias='t', genre_alias='g')}
+    FROM titles t
+    JOIN target_movies tm ON tm.tconst = t.tconst
+    JOIN title_genres g ON g.tconst = t.tconst
+    GROUP BY t.tconst
+    """
+    cur.execute(sql_meta)
+    
+    fetched_rows = {}
+    for r in cur:
+        row_dict = map_movie_row(r)
+        fetched_rows[row_dict["tconst"]] = row_dict
+
+    # STRICT FILTER: Only keep movies that we successfully fetched metadata for
+    final_tconsts = [t for t in potential_tconsts if t in fetched_rows]
+    
+    logging.info(f"Metadata alignment: {len(final_tconsts)} movies confirmed (dropped {len(potential_tconsts) - len(final_tconsts)} missing metadata).")
+    
+    # Re-calculate people set based ONLY on final_tconsts to keep things clean
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
@@ -95,11 +121,12 @@ def build_hybrid_cache(cfg: ProjectConfig):
     num_movies = len(final_tconsts)
     num_people = len(sorted_nconsts)
     
-    head_mappings = {}  
+    head_mappings = {}   
     head_vocab_sizes = {} 
 
     logging.info("Building head-specific subsets...")
     for head, nconsts in head_populations.items():
+        # Only include nconsts that survived the final_tconsts filter
         valid_head_nconsts = [n for n in nconsts if n in nconst_to_global_idx]
         valid_head_nconsts.sort()
         
@@ -113,41 +140,24 @@ def build_hybrid_cache(cfg: ProjectConfig):
             
         head_mappings[head] = mapping_tensor
 
-    logging.info("Stacking raw field tensors...")
-    cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
-    cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in final_tconsts])
-    
-    sql_meta = f"""
-    SELECT 
-        {movie_select_clause(alias='t', genre_alias='g')}
-    FROM titles t
-    JOIN target_movies tm ON tm.tconst = t.tconst
-    JOIN title_genres g ON g.tconst = t.tconst
-    GROUP BY t.tconst
-    """
-    cur.execute(sql_meta)
-    
     field_data = [[] for _ in mov_ae.fields]
+    # Initialize with the CORRECT size (num_movies)
     temp_heads_lists = defaultdict(lambda: [[] for _ in range(num_movies)])
     
-    fetched_rows = {}
-    for r in cur:
-        row_dict = map_movie_row(r)
-        fetched_rows[row_dict["tconst"]] = row_dict
-        
+    # --- FIX: Iterate only over the filtered list ---
     for idx, tconst in enumerate(tqdm(final_tconsts, desc="Stacking")):
-        row_dict = fetched_rows.get(tconst)
-        if not row_dict:
-            continue
-            
+        row_dict = fetched_rows[tconst] # Safe because we filtered above
+        
         heads_data = movie_data[tconst]
         row_dict["peopleCount"] = sum(len(s) for s in heads_data.values())
         
+        # Append metadata (this is Index `idx`)
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
             t = field.transform(val).cpu()
             field_data[i].append(t)
             
+        # Assign targets to Index `idx`
         for head_name, nconst_set in heads_data.items():
             idxs = [nconst_to_global_idx[n] for n in nconst_set if n in nconst_to_global_idx]
             if idxs:
