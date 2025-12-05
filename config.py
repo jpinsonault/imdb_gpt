@@ -59,7 +59,7 @@ class ProjectConfig:
     hybrid_set_latent_dim: int = 128
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 4
-    hybrid_set_output_rank: int = 256
+    hybrid_set_output_rank: int = 32 * 32
 
     hybrid_set_num_person_groups: int = 32
     
