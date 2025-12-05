@@ -65,7 +65,7 @@ class ProjectConfig:
     
     hybrid_set_w_bce: float = 2.0
     hybrid_set_w_count: float = 0.05
-    hybrid_set_w_mass: float = 0.05
+    hybrid_set_w_mass: float = 0.5
     hybrid_set_w_title: float = 1.0
 
     hybrid_set_focal_gamma: float = 1.0

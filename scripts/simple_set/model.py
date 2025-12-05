@@ -47,7 +47,6 @@ class HybridSetModel(nn.Module):
 
         self.head_bottlenecks = nn.ModuleDict()
         self.head_expansions = nn.ModuleDict()
-        self.count_heads = nn.ModuleDict()
 
         for name, rank_mult in heads_config.items():
             vocab = int(head_vocab_sizes.get(name, num_people))
@@ -58,12 +57,6 @@ class HybridSetModel(nn.Module):
 
             self.head_bottlenecks[name] = nn.Linear(self.latent_dim, base_rank, bias=False)
             self.head_expansions[name] = nn.Linear(base_rank, vocab)
-
-            self.count_heads[name] = nn.Sequential(
-                nn.Linear(self.latent_dim, 256),
-                nn.GELU(),
-                nn.Linear(256, 1),
-            )
 
         self.title_field_index = None
         self.title_encoder = None
@@ -161,7 +154,6 @@ class HybridSetModel(nn.Module):
         recon_table = self.field_decoder(z_table)
 
         logits_dict = {}
-        counts_dict = {}
 
         for name, bottleneck in self.head_bottlenecks.items():
             expansion = self.head_expansions[name]
@@ -171,6 +163,4 @@ class HybridSetModel(nn.Module):
             else:
                 logits_dict[name] = expansion(u)
 
-            counts_dict[name] = self.count_heads[name](z_table)
-
-        return logits_dict, counts_dict, recon_table, z_table
+        return logits_dict, recon_table, z_table

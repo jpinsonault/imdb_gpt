@@ -250,7 +250,6 @@ def main():
     signal.signal(signal.SIGINT, lambda s, f: stop_flag.update({"stop": True}))
 
     w_bce = float(cfg.hybrid_set_w_bce)
-    w_count = float(cfg.hybrid_set_w_count)
     w_recon = 1.0
     w_title = float(cfg.hybrid_set_w_title)
     gamma = float(cfg.hybrid_set_focal_gamma)
@@ -269,7 +268,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda"):
-                logits_dict, counts_dict, recon_table, z_table = model(
+                logits_dict, recon_table, z_table = model(
                     field_tensors=inputs,
                     batch_indices=indices_cpu,
                     return_embeddings=False,
@@ -278,7 +277,6 @@ def main():
                 z_table_norm = z_table.norm(dim=-1).mean()
 
                 total_set_loss = 0.0
-                total_count_loss = 0.0
 
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
@@ -307,9 +305,6 @@ def main():
                     t_cnt_batch = None
                     if t_cnt_full is not None:
                         t_cnt_batch = t_cnt_full[indices_cpu].to(device, non_blocking=True).float()
-                        c_loss = F.mse_loss(counts_dict[head_name], t_cnt_batch)
-                        total_count_loss = total_count_loss + c_loss
-                        head_metrics[f"{head_name}_count"] = c_loss.detach()
                         if collect_coords_for_log:
                             count_targets_for_log[head_name] = t_cnt_full
                     else:
@@ -355,7 +350,6 @@ def main():
 
                 loss = (
                     w_bce * total_set_loss
-                    + w_count * total_count_loss
                     + w_recon * recon_loss
                     + w_title * title_loss
                 )
@@ -413,6 +407,7 @@ def main():
 
     if run_logger:
         run_logger.close()
+
 
 
 if __name__ == "__main__":

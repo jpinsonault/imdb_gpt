@@ -77,7 +77,7 @@ class HybridSetReconLogger:
         sliced_inputs = [t[indices_t] for t in inputs]
         sliced_batch_indices = batch_indices_np[indices]
 
-        logits_dict, counts_dict, recon_table, _ = model(
+        logits_dict, recon_table, _ = model(
             sliced_inputs,
             batch_indices=torch.tensor(sliced_batch_indices, device=inputs[0].device),
         )
@@ -127,10 +127,10 @@ class HybridSetReconLogger:
                     true_count = tgt_cnt_t[dataset_idx].item()
                 else:
                     true_count = 0.0
-                pred_count = counts_dict[head][local_slice_idx].item()
 
                 probs = torch.sigmoid(logits_dict[head][local_slice_idx])
                 probs_cpu = probs.float().cpu().numpy()
+                pred_count = float(probs_cpu.sum())
                 pred_local_idxs = set(np.where(probs_cpu > self.threshold)[0])
 
                 tp_local = true_local_idxs & pred_local_idxs
