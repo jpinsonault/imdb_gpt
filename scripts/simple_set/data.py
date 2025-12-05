@@ -18,16 +18,13 @@ class HybridSetDataset(Dataset):
         self.heads_padded = data["heads_padded"]
         self.head_mappings = data.get("head_mappings", {})
         self.head_vocab_sizes = data.get("head_vocab_sizes", {})
-        self.head_group_offsets = data.get("head_group_offsets", {})
         self.head_local_to_global = data.get("head_local_to_global", {})
-        self.num_groups = int(data.get("num_groups", project_config.hybrid_set_num_person_groups))
 
         if torch.cuda.is_available():
             logging.info("Pinning dataset memory...")
             self.stacked_fields = [t.pin_memory() for t in self.stacked_fields]
             self.heads_padded = {k: v.pin_memory() for k, v in self.heads_padded.items()}
             self.head_mappings = {k: v.pin_memory() for k, v in self.head_mappings.items()}
-            self.head_group_offsets = {k: v.pin_memory() for k, v in self.head_group_offsets.items()}
             self.head_local_to_global = {k: v.pin_memory() for k, v in self.head_local_to_global.items()}
 
         self.num_people = data["num_people"]

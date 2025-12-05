@@ -53,13 +53,13 @@ class ProjectConfig:
     lr_min_factor: float = 0.05
 
     hybrid_set_epochs: int = 200
-    hybrid_set_lr: float = 1e-3
-    hybrid_set_weight_decay: float = 1e-4
+    hybrid_set_lr: float = 5e-3
+    hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_latent_dim: int = 128
     hybrid_set_hidden_dim: int = 1024
     hybrid_set_depth: int = 4
-    hybrid_set_output_rank: int = 32 * 32
+    hybrid_set_output_rank: int = 64
 
     hybrid_set_num_person_groups: int = 32
     
@@ -79,6 +79,8 @@ class ProjectConfig:
         "director": 0.5,
         "writer": 0.5
     })
+
+    hybrid_set_head_prior: float = 0.1
 
     joint_edge_tensor_cache: bool = True
     joint_edge_tensor_cache_file: str = "joint_edge_tensors.pt"

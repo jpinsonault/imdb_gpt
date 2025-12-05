@@ -174,14 +174,14 @@ def main():
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
         head_vocab_sizes=ds.head_vocab_sizes,
-        head_group_offsets=ds.head_group_offsets,
-        num_groups=ds.num_groups,
         latent_dim=int(cfg.hybrid_set_latent_dim),
         hidden_dim=int(cfg.hybrid_set_hidden_dim),
         base_output_rank=int(cfg.hybrid_set_output_rank),
         depth=int(cfg.hybrid_set_depth),
         dropout=float(cfg.hybrid_set_dropout),
         num_movies=num_movies,
+        title_noise_prob=float(cfg.hybrid_set_w_title > 0.0),
+        head_prior_prob=float(cfg.hybrid_set_head_prior),
     )
 
     logging.info("Moving model to device and initializing optimizer...")

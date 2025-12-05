@@ -27,38 +27,24 @@ def _map_category_to_head(category):
     return None
 
 
-def _build_groups_for_head(nconsts, nconst_to_global_idx, num_people, num_groups):
+def _build_head_mapping(nconsts, nconst_to_global_idx, num_people):
     sorted_nconsts = sorted(list(nconsts))
+    if not sorted_nconsts:
+        return None, None, 0
+
     global_indices = torch.tensor(
         [nconst_to_global_idx[n] for n in sorted_nconsts],
         dtype=torch.long,
     )
     local_vocab_size = int(global_indices.numel())
     if local_vocab_size == 0:
-        return None, None, None, 0
-
-    head_weights = torch.ones(local_vocab_size, dtype=torch.float32)
-    total_weight = head_weights.sum().item()
-    num_groups = max(1, min(int(num_groups), local_vocab_size))
-    target_per_group = total_weight / float(num_groups)
-
-    offsets = [0]
-    running = 0.0
-    current_group = 0
-    for i in range(local_vocab_size):
-        running += head_weights[i].item()
-        if running >= target_per_group and current_group < num_groups - 1:
-            offsets.append(i + 1)
-            current_group += 1
-            running = 0.0
-    offsets.append(local_vocab_size)
-    offsets_tensor = torch.tensor(offsets, dtype=torch.long)
+        return None, None, 0
 
     head_local_to_global = global_indices.clone()
     head_map = torch.full((num_people,), -1, dtype=torch.long)
     head_map[global_indices] = torch.arange(local_vocab_size, dtype=torch.long)
 
-    return head_map, head_local_to_global, offsets_tensor, local_vocab_size
+    return head_map, head_local_to_global, local_vocab_size
 
 
 def build_hybrid_cache(cfg: ProjectConfig):
@@ -129,27 +115,24 @@ def build_hybrid_cache(cfg: ProjectConfig):
 
     head_mappings = {}
     head_vocab_sizes = {}
-    head_group_offsets = {}
     head_local_to_global = {}
 
-    logging.info("Building head-specific subsets and groups...")
+    logging.info("Building head-specific subsets and mappings...")
     for head, nconsts in head_populations.items():
         valid_head_nconsts = [n for n in nconsts if n in nconst_to_global_idx]
         if not valid_head_nconsts:
             continue
 
-        head_map, local_to_global, offsets_tensor, local_vocab_size = _build_groups_for_head(
+        head_map, local_to_global, local_vocab_size = _build_head_mapping(
             valid_head_nconsts,
             nconst_to_global_idx,
             num_people,
-            cfg.hybrid_set_num_person_groups,
         )
         if head_map is None:
             continue
 
         head_mappings[head] = head_map
         head_vocab_sizes[head] = local_vocab_size
-        head_group_offsets[head] = offsets_tensor
         head_local_to_global[head] = local_to_global
 
     logging.info("Stacking raw field tensors...")
@@ -248,13 +231,11 @@ def build_hybrid_cache(cfg: ProjectConfig):
         "heads_padded": heads_padded,
         "head_mappings": head_mappings,
         "head_vocab_sizes": head_vocab_sizes,
-        "head_group_offsets": head_group_offsets,
         "head_local_to_global": head_local_to_global,
         "head_avg_counts": head_avg_counts,
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
         "field_names": [f.name for f in mov_ae.fields],
-        "num_groups": cfg.hybrid_set_num_person_groups,
     }
 
     logging.info(f"Saving hybrid cache to {cache_path}...")

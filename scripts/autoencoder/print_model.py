@@ -4,9 +4,18 @@ import torch
 import torch.nn as nn
 
 
+def _shape_tensor(x: torch.Tensor):
+    shape = tuple(x.shape)
+    if len(shape) == 0:
+        return ()
+    dims = list(shape)
+    dims[0] = "B"
+    return tuple(dims)
+
+
 def _shape_tree(x):
     if isinstance(x, torch.Tensor):
-        return tuple(x.shape)
+        return _shape_tensor(x)
     if isinstance(x, (list, tuple)):
         return [_shape_tree(t) for t in x]
     if isinstance(x, dict):
@@ -45,7 +54,6 @@ def _count_params(module: nn.Module):
 
 
 def _get_detailed_type(module: nn.Module) -> str:
-    """Helper to add dimensions to the type string."""
     base = module.__class__.__name__
     if isinstance(module, nn.Embedding):
         return f"{base}({module.num_embeddings}, {module.embedding_dim})"
@@ -63,8 +71,6 @@ def summarize_model(
     named = {m: name for name, m in model.named_modules()}
     rows = []
     seen = set()
-    
-    # We use a mutable list to act as a counter in the hook
     exec_order = [0]
 
     def hook(module, inputs, output):
@@ -83,7 +89,6 @@ def summarize_model(
         in_shape = _compact_shape(_shape_tree(inputs if len(inputs) != 1 else inputs[0]))
         out_shape = _compact_shape(_shape_tree(output))
         params, trainable = _count_params(module)
-        
         type_str = _get_detailed_type(module)
 
         rows.append(
@@ -100,12 +105,10 @@ def summarize_model(
         )
         exec_order[0] += 1
 
-    # Register hooks
     handles = []
     for m in model.modules():
         handles.append(m.register_forward_hook(hook))
 
-    # Run forward pass
     with torch.no_grad():
         if isinstance(sample_inputs, dict):
             _ = model(**sample_inputs)
@@ -114,11 +117,9 @@ def summarize_model(
         else:
             _ = model(sample_inputs)
 
-    # Cleanup
     for h in handles:
         h.remove()
 
-    # Sort by execution order (id) instead of Name
     rows.sort(key=lambda r: r["id"])
 
     total_params = sum(r["params"] for r in rows)
@@ -138,18 +139,18 @@ def summarize_model(
         name = (indent + r["name"]).strip()
         if len(name) > 30:
             name = name[:27] + "..."
-        
+
         t = r["type"]
         if len(t) > 35:
             t = t[:32] + "..."
-            
+
         inp = r["in"]
         out = r["out"]
         if len(inp) > 20:
             inp = inp[:17] + "..."
         if len(out) > 20:
             out = out[:17] + "..."
-            
+
         print_fn(
             f"{i:4d}  {name:<30}  {t:<35}  "
             f"{inp:<20}  {out:<20}  {r['params']:10d}  {r['trainable']:10d}"

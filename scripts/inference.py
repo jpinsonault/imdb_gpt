@@ -41,14 +41,14 @@ class MovieSearchEngine:
             num_people=self.dataset.num_people,
             heads_config=self.cfg.hybrid_set_heads,
             head_vocab_sizes=self.dataset.head_vocab_sizes,
-            head_group_offsets=self.dataset.head_group_offsets,
-            num_groups=self.dataset.num_groups,
             latent_dim=int(self.cfg.hybrid_set_latent_dim),
             hidden_dim=int(self.cfg.hybrid_set_hidden_dim),
             base_output_rank=int(self.cfg.hybrid_set_output_rank),
             depth=int(self.cfg.hybrid_set_depth),
             dropout=0.0,
             num_movies=self.num_movies,
+            title_noise_prob=float(self.cfg.hybrid_set_w_title > 0.0),
+            head_prior_prob=float(self.cfg.hybrid_set_head_prior),
         )
 
         ckpt_path = Path(self.cfg.model_dir) / "hybrid_set_state.pt"
