@@ -95,6 +95,12 @@ def main():
         weight_decay=cfg.hybrid_set_weight_decay,
     )
 
+    # Print Summary
+    sample_inputs_cpu, _, sample_idx = next(loader)
+    print("\n" + "=" * 50)
+    print_model_summary(model, {"field_tensors": [x.to(device) for x in sample_inputs_cpu], "batch_indices": sample_idx})
+    print("=" * 50 + "\n")
+
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):
         for name, t in ds.head_mappings.items():
