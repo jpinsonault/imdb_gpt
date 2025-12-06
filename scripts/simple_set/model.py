@@ -52,7 +52,8 @@ class SparseProjectedHead(nn.Module):
 
     def forward(self, z):
         # z: [B, latent_dim]
-        q = self.projector(z)
+        # Residual connection: Allow the model to refine z rather than replace it.
+        q = z + self.projector(z)
         logits = self.out_layer(q)
         return logits
 
