@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict
 
 @dataclass
 class ProjectConfig:
@@ -15,75 +15,55 @@ class ProjectConfig:
 
     batch_size: int = 512
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-3
+    weight_decay: float = 1e-4
     epochs: int = 4
+    log_interval: int = 50
 
     latent_dim: int = 64
 
+    # General Training settings
     save_interval: int = 500
-    flush_interval: int = 250
-    callback_interval: int = 200
     tensorboard_dir: str = "runs"
-    log_interval: int = 50
-
-    nce_temp: float = 0.05
-    nce_weight: float = 2.0
-
-    latent_type_loss_weight: float = 0.01
-
+    
+    # Dataset Filtering
     movie_limit: int = 100000000000
-
-    num_workers: int = 4
-    prefetch_factor: int = 2
-    max_training_steps: int | None = None
-
-    use_cache: bool = True
-    refresh_cache: bool = False
-
-    compile_trunk: bool = False
-
-    weak_edge_boost: float = 0.10
-    refresh_batches: int = 1000
-
     principals_table: str = "principals"
-
+    
+    # Optimization
     lr_schedule: str = "cosine"
-    lr_warmup_steps: int = 0
-    lr_warmup_ratio: float = 0.05
+    lr_warmup_steps: int = 1000
+    lr_warmup_ratio: float = 0.0
     lr_min_factor: float = 0.05
 
-    hybrid_set_epochs: int = 200
-    hybrid_set_lr: float = 1e-3
-    hybrid_set_weight_decay: float = 0.0
+    # --- HYBRID SET MODEL SETTINGS ---
+    hybrid_set_epochs: int = 100
+    hybrid_set_lr: float = 1e-3 # Lower LR for cosine training
+    hybrid_set_weight_decay: float = 1e-4
     
-    hybrid_set_latent_dim: int = 128
+    hybrid_set_latent_dim: int = 256 # Bumped up for capacity
     hybrid_set_hidden_dim: int = 1024
-    hybrid_set_depth: int = 4
-    hybrid_set_output_rank: int = 64
-
-    hybrid_set_num_person_groups: int = 32
     
-    hybrid_set_w_bce: float = 2.0
-    hybrid_set_w_count: float = 0.05
-    hybrid_set_w_mass: float = 0.5
-    hybrid_set_w_title: float = 1.0
-
-    hybrid_set_focal_gamma: float = 1.0
+    # Loss Weights
+    hybrid_set_w_bce: float = 1.0
+    hybrid_set_w_recon: float = 1.0
     
-    hybrid_set_save_interval: int = 400
+    # Cosine Similarity Scaling (Learnable starting value)
+    hybrid_set_logit_scale: float = 20.0 
+
+    hybrid_set_save_interval: int = 500
     hybrid_set_recon_interval: int = 200
-    hybrid_set_dropout: float = 0.0
+    hybrid_set_dropout: float = 0.1
 
+    # Relative capacity of the Sparse Heads
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,
         "writer": 0.5
     })
 
-    hybrid_set_head_prior: float = 0.1
-
-    joint_edge_tensor_cache: bool = True
-    joint_edge_tensor_cache_file: str = "joint_edge_tensors.pt"
+    # Caching
+    use_cache: bool = True
+    refresh_cache: bool = False
 
 
 project_config = ProjectConfig()
