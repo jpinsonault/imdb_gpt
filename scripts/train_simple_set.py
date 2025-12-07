@@ -6,6 +6,7 @@ import json
 import signal
 import math
 import time
+import sys
 from pathlib import Path
 from dataclasses import asdict
 
@@ -23,6 +24,17 @@ from scripts.simple_set.model import HybridSetModel
 from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+class GracefulStopper:
+    def __init__(self):
+        self.stop = False
+        signal.signal(signal.SIGINT, self._handler)
+        signal.signal(signal.SIGTERM, self._handler)
+
+    def _handler(self, sig, frame):
+        print("\n[GracefulStopper] Signal received! Finishing current step and saving...")
+        self.stop = True
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
@@ -95,12 +107,6 @@ def main():
         weight_decay=cfg.hybrid_set_weight_decay,
     )
 
-    # Print Summary
-    sample_inputs_cpu, _, sample_idx = next(loader)
-    print("\n" + "=" * 50)
-    print_model_summary(model, {"field_tensors": [x.to(device) for x in sample_inputs_cpu], "batch_indices": sample_idx})
-    print("=" * 50 + "\n")
-
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):
         for name, t in ds.head_mappings.items():
@@ -134,12 +140,17 @@ def main():
             logging.info(f"Resumed from epoch {start_epoch}")
         except: pass
 
-    stop_flag = False
-    signal.signal(signal.SIGINT, lambda s, f: globals().update(stop_flag=True))
+    # --- FIX: Proper Signal Handling ---
+    stopper = GracefulStopper()
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         for _ in pbar:
+            # Check for stop signal at the start of iteration
+            if stopper.stop:
+                pbar.close()
+                break
+
             inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
             inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
             
@@ -176,7 +187,6 @@ def main():
                                 ds_rows = indices_cpu.to(device)[rows_v]
                                 coords_log[head_name] = torch.stack([ds_rows, loc_v], dim=1).cpu()
 
-                    # FIX: Pass FULL true counts tensor to logger (on CPU is fine)
                     if collect and head_name in head_true_counts:
                          counts_log[head_name] = head_true_counts[head_name]
 
@@ -201,14 +211,19 @@ def main():
 
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             global_step += 1
-            if stop_flag: break
+            
             if global_step % cfg.hybrid_set_save_interval == 0:
                 save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch, global_step, cfg)
         
-        if stop_flag: break
+        if stopper.stop:
+            print("[GracefulStopper] Training loop exited. Final save...")
+            break
+            
         save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch + 1, global_step, cfg)
     
+    save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch if stopper.stop else num_epochs, global_step, cfg)
     if run_logger: run_logger.close()
+    print("Done.")
 
 if __name__ == "__main__":
     main()

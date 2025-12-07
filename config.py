@@ -40,8 +40,8 @@ class ProjectConfig:
     hybrid_set_lr: float = 1e-3 # Lower LR for cosine training
     hybrid_set_weight_decay: float = 1e-4
     
-    hybrid_set_latent_dim: int = 128
-    hybrid_set_hidden_dim: int = 2048
+    hybrid_set_latent_dim: int = 64
+    hybrid_set_hidden_dim: int = 4096
     
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
