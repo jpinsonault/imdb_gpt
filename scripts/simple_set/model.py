@@ -12,111 +12,148 @@ from scripts.autoencoder.fields import TextField
 class SparseProjectedHead(nn.Module):
     """
     Projects input z to a query vector using a Cosine-Similarity based approach.
-    
-    1. Projects z via a bottleneck (in_dim -> hidden_dim -> proj_dim).
-    2. Re-normalizes the result to the hypersphere.
-    3. Calculates Cosine Similarity with the output vocabulary weights.
-    4. Scales by a learnable temperature.
+    Now supports Residual connections.
     """
     def __init__(self, in_dim, proj_dim, vocab_size, hidden_dim, dropout=0.1, init_scale=20.0):
         super().__init__()
         
         # 1. Bottleneck / Projector
-        # Note: Skip connection removed, allowing proj_dim != in_dim
-        self.projector = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, proj_dim) 
-        )
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(hidden_dim, proj_dim)
+
+        # Residual handling: if dims match, we learn a scale factor for the residual
+        self.use_res = (in_dim == proj_dim)
+        if self.use_res:
+            self.res_scale = nn.Parameter(torch.tensor(0.1)) # Start with small residual influence
         
-        # 2. The Classifier Weights (No bias in the linear part for Cosine, we add bias separately)
-        # Weights match the projection output dimension
+        # 2. The Classifier Weights (No bias in linear, we add bias separately)
         self.weight = nn.Parameter(torch.empty(vocab_size, proj_dim))
         self.bias = nn.Parameter(torch.empty(vocab_size))
         
         # 3. Learnable Scale (Temperature)
-        # We store it as a log value for numerical stability
         self.logit_scale = nn.Parameter(torch.ones([]) * math.log(init_scale))
 
         self._init_weights()
 
     def _init_weights(self):
-        # Standard Init for projector
-        for m in self.projector.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Standard Init
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        nn.init.constant_(self.in_proj.bias, 0)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, 0)
         
-        # Classifier Init (Xavier Normal often works well for normalized embeddings)
-        nn.init.xavier_normal_(self.weight)
+        # Classifier Init: Normalized embeddings work best with Normal init
+        nn.init.normal_(self.weight, std=0.02)
         
-        # CRITICAL: Initialize bias to -6.0
-        # sigmoid(-6.0) ~= 0.002. 
-        # This tells the model: "Start by assuming everyone is NOT in the movie."
+        # Initialize bias to negative to encourage sparsity at init
         nn.init.constant_(self.bias, -6.0)
 
     def forward(self, z):
-        # z: [B, in_dim] (Assumed normalized coming in, but we handle it anyway)
+        # z: [B, in_dim]
         
-        # 1. Projection (No Residual)
-        # q becomes the "Search Query" for the specific head
-        q = self.projector(z)
+        x = self.in_proj(z)
+        x = self.ln(x)
+        x = self.act(x)
+        x = self.drop(x)
+        q = self.out_proj(x)
+
+        # Scaled Residual
+        if self.use_res:
+            q = q + (z * self.res_scale)
         
-        # 2. Re-Normalize
-        # We want strict Cosine Similarity, so the query must be unit length.
+        # Normalize Query and Weights for Cosine Similarity
         q = F.normalize(q, p=2, dim=-1)
-        
-        # 3. Normalize Weights
         w = F.normalize(self.weight, p=2, dim=-1)
         
-        # 4. Scaled Dot Product (Cosine Similarity)
-        # logits = scale * (q @ w.T) + bias
-        scale = self.logit_scale.exp().clamp(max=100) # Clamp for stability
+        scale = self.logit_scale.exp().clamp(max=100)
         
         logits = F.linear(q, w) * scale + self.bias
-        
         return logits
 
 
-class GroupedProjectedHead(nn.Module):
+class SharedGroupedProjectedHead(nn.Module):
     """
-    Splits a large vocabulary into smaller chunks/groups.
-    Each chunk gets its own SparseProjectedHead (and thus its own projector/query vector).
-    This allows the model to specialize 'queries' for different subsets of the data
-    while keeping individual matrices smaller.
+    Optimized Grouped Head. 
+    Instead of N independent projectors, we use ONE projector that outputs
+    a larger context, which is then chunked for the specific groups.
+    
+    This correlates the groups (learning 'Action Movie' features helps all groups)
+    and reduces computational overhead.
     """
     def __init__(self, in_dim, proj_dim, vocab_size, num_groups, hidden_dim, dropout=0.1, init_scale=20.0):
         super().__init__()
-        self.chunks = nn.ModuleList()
         
-        # Determine chunk size (ceiling division)
-        # We keep order: 0..k, k..2k, etc.
+        self.num_groups = num_groups
+        self.proj_dim = proj_dim
+        
+        # 1. Shared Projector
+        # We project to (proj_dim * num_groups) so each group gets a unique 'view' of z
+        # but they share the non-linear computation.
+        total_out_dim = proj_dim * num_groups
+        
+        self.projector = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, total_out_dim)
+        )
+
+        # 2. Weights & Biases for chunks
         chunk_size = math.ceil(vocab_size / num_groups)
-        
+        self.chunk_sizes = []
         remaining = vocab_size
-        while remaining > 0:
-            current_size = min(chunk_size, remaining)
-            self.chunks.append(
-                SparseProjectedHead(
-                    in_dim=in_dim,
-                    proj_dim=proj_dim,
-                    vocab_size=current_size, 
-                    hidden_dim=hidden_dim, 
-                    dropout=dropout, 
-                    init_scale=init_scale
-                )
-            )
-            remaining -= current_size
+        
+        # We store weights in a ModuleList of simple linear layers (used for storage)
+        # We manually handle the normalization in forward
+        self.group_weights = nn.ParameterList()
+        self.group_biases = nn.ParameterList()
+
+        for _ in range(num_groups):
+            c_size = min(chunk_size, remaining)
+            self.chunk_sizes.append(c_size)
+            
+            w = nn.Parameter(torch.empty(c_size, proj_dim))
+            b = nn.Parameter(torch.empty(c_size))
+            
+            nn.init.normal_(w, std=0.02)
+            nn.init.constant_(b, -6.0)
+            
+            self.group_weights.append(w)
+            self.group_biases.append(b)
+            
+            remaining -= c_size
+            if remaining <= 0: break
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(init_scale))
 
     def forward(self, z):
-        # z: [B, latent_dim]
-        # Calculate sub-logits for each chunk and concatenate.
-        # Each chunk computes its own independent query vector q based on z.
-        chunk_outputs = [chunk(z) for chunk in self.chunks]
-        return torch.cat(chunk_outputs, dim=-1)
+        # 1. Shared Projection
+        # [B, proj_dim * num_groups]
+        q_full = self.projector(z)
+        
+        # 2. Split into chunks: [B, num_groups, proj_dim]
+        # We reshaped to process groups. 
+        # Note: If chunk sizes were identical we could use tensor ops, 
+        # but vocab might not divide evenly, so we split.
+        q_chunks = torch.split(q_full, self.proj_dim, dim=1)
+        
+        outputs = []
+        scale = self.logit_scale.exp().clamp(max=100)
+
+        for i, (q, w, b) in enumerate(zip(q_chunks, self.group_weights, self.group_biases)):
+            # Normalize
+            q_norm = F.normalize(q, p=2, dim=-1)
+            w_norm = F.normalize(w, p=2, dim=-1)
+            
+            # Cosine Sim
+            logits = F.linear(q_norm, w_norm) * scale + b
+            outputs.append(logits)
+
+        return torch.cat(outputs, dim=-1)
 
 
 class HybridSetModel(nn.Module):
@@ -138,14 +175,11 @@ class HybridSetModel(nn.Module):
 
         self.fields = fields
         self.latent_dim = int(latent_dim)
-        # If proj_dim is not specified, default to latent_dim. 
-        # But now they are allowed to differ because skip connection is removed.
         self.proj_dim = int(proj_dim) if proj_dim is not None else self.latent_dim
         
         if num_movies <= 0:
             raise ValueError("num_movies must be > 0")
 
-        # Extract config values potentially passed in kwargs
         init_scale = kwargs.get("hybrid_set_logit_scale", 20.0)
 
         self.movie_embeddings = nn.Embedding(num_movies, self.latent_dim)
@@ -170,7 +204,7 @@ class HybridSetModel(nn.Module):
             num_groups = int(head_groups_config.get(name, 1))
             
             if num_groups > 1:
-                self.heads[name] = GroupedProjectedHead(
+                self.heads[name] = SharedGroupedProjectedHead(
                     in_dim=self.latent_dim,
                     proj_dim=self.proj_dim,
                     vocab_size=vocab,
@@ -197,15 +231,12 @@ class HybridSetModel(nn.Module):
         z = self.movie_embeddings(idx) 
         
         # Normalize for stability
-        # This keeps the embedding space spherical
         z = F.normalize(z, p=2, dim=-1)
 
         recon_table = self.field_decoder(z)
 
         logits_dict = {}
         for name, head_module in self.heads.items():
-            # z is normalized here, but head_module (or its chunks) 
-            # will project and re-normalize internally.
             logits_dict[name] = head_module(z)
 
         return logits_dict, recon_table, z

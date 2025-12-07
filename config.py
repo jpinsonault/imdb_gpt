@@ -37,16 +37,16 @@ class ProjectConfig:
 
     # --- HYBRID SET MODEL SETTINGS ---
     hybrid_set_epochs: int = 100
-    hybrid_set_lr: float = 1e-3 # Lower LR for cosine training
+    hybrid_set_lr: float = 1e-3 
     hybrid_set_weight_decay: float = 0.0
     
-    hybrid_set_latent_dim: int = 128
+    hybrid_set_latent_dim: int = 256
     hybrid_set_hidden_dim: int = 512
-    hybrid_set_head_proj_dim: int = 64
+    hybrid_set_head_proj_dim: int = 128
     
     # Loss Weights
     hybrid_set_w_bce: float = 1.0
-    hybrid_set_w_recon: float = 1.0
+    hybrid_set_w_recon: float = 0.5 # Lower recon weight slightly to focus on sets
     
     # Cosine Similarity Scaling (Learnable starting value)
     hybrid_set_logit_scale: float = 20.0 
@@ -63,7 +63,7 @@ class ProjectConfig:
     })
 
     # Number of chunks/groups to split the head vocabulary into.
-    # Higher numbers = smaller individual matrices, but more projectors.
+    # Higher numbers = smaller individual matrices.
     hybrid_set_head_groups: Dict[str, int] = field(default_factory=lambda: {
         "cast": 20,
         "director": 4,

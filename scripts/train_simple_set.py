@@ -37,6 +37,26 @@ class GracefulStopper:
         self.stop = True
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: logits, targets: binary (0 or 1)
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
     if total_steps is None: return None
     total_steps = max(1, int(total_steps))
@@ -94,7 +114,7 @@ def main():
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
         head_vocab_sizes=ds.head_vocab_sizes,
-        head_groups_config=cfg.hybrid_set_head_groups,  # Added this line
+        head_groups_config=cfg.hybrid_set_head_groups,
         latent_dim=cfg.hybrid_set_latent_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
         proj_dim=cfg.hybrid_set_head_proj_dim,
@@ -133,6 +153,9 @@ def main():
     from scripts.simple_set.recon import HybridSetReconLogger
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
+    
+    # Initialize Focal Loss
+    criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction='mean').to(device)
 
     num_epochs = int(cfg.hybrid_set_epochs)
     batches_per_epoch = len(loader)
@@ -149,13 +172,11 @@ def main():
             logging.info(f"Resumed from epoch {start_epoch}")
         except: pass
 
-    # --- FIX: Proper Signal Handling ---
     stopper = GracefulStopper()
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
         for _ in pbar:
-            # Check for stop signal at the start of iteration
             if stopper.stop:
                 pbar.close()
                 break
@@ -174,7 +195,7 @@ def main():
                 for f, p, t in zip(ds.fields, recon_table, inputs):
                     recon_loss += f.compute_loss(p, t) * f.weight
 
-                # Set Loss
+                # Set Loss (Focal)
                 set_loss_total = 0.0
                 collect = (global_step + 1) % recon_logger.every == 0
                 coords_log, counts_log = {}, {}
@@ -199,8 +220,8 @@ def main():
                     if collect and head_name in head_true_counts:
                          counts_log[head_name] = head_true_counts[head_name]
 
-                    # Standard BCE With Logits
-                    set_loss_total += F.binary_cross_entropy_with_logits(logits, targets)
+                    # Use Focal Loss here
+                    set_loss_total += criterion_set(logits, targets)
 
                 loss = cfg.hybrid_set_w_bce * set_loss_total + cfg.hybrid_set_w_recon * recon_loss
 
