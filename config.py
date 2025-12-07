@@ -21,56 +21,46 @@ class ProjectConfig:
 
     latent_dim: int = 64
 
-    # General Training settings
     save_interval: int = 500
     tensorboard_dir: str = "runs"
     
-    # Dataset Filtering
     movie_limit: int = 100000000000
     principals_table: str = "principals"
     
-    # Optimization
     lr_schedule: str = "cosine"
     lr_warmup_steps: int = 1000
     lr_warmup_ratio: float = 0.0
     lr_min_factor: float = 0.05
 
-    # --- HYBRID SET MODEL SETTINGS ---
     hybrid_set_epochs: int = 100
-    hybrid_set_lr: float = 1e-3 
+    hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_latent_dim: int = 256
     hybrid_set_hidden_dim: int = 512
-    hybrid_set_head_proj_dim: int = 128
+    hybrid_set_person_dim: int = 256
     
-    # Loss Weights
     hybrid_set_w_bce: float = 1.0
-    hybrid_set_w_recon: float = 0.5 # Lower recon weight slightly to focus on sets
+    hybrid_set_w_recon: float = 0.5
     
-    # Cosine Similarity Scaling (Learnable starting value)
-    hybrid_set_logit_scale: float = 20.0 
+    hybrid_set_logit_scale: float = 20.0
 
     hybrid_set_save_interval: int = 500
     hybrid_set_recon_interval: int = 200
     hybrid_set_dropout: float = 0.1
 
-    # Relative capacity of the Sparse Heads
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,
         "writer": 0.5
     })
 
-    # Number of chunks/groups to split the head vocabulary into.
-    # Higher numbers = smaller individual matrices.
     hybrid_set_head_groups: Dict[str, int] = field(default_factory=lambda: {
         "cast": 20,
         "director": 4,
         "writer": 8
     })
 
-    # Caching
     use_cache: bool = True
     refresh_cache: bool = False
 

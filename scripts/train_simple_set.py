@@ -45,7 +45,6 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        # inputs: logits, targets: binary (0 or 1)
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
@@ -58,7 +57,8 @@ class FocalLoss(nn.Module):
 
 
 def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_ratio, min_factor, last_epoch=-1):
-    if total_steps is None: return None
+    if total_steps is None:
+        return None
     total_steps = max(1, int(total_steps))
     ratio = float(warmup_ratio)
     frac_warmup = int(total_steps * ratio)
@@ -101,7 +101,8 @@ def main():
 
     cfg = project_config
     ensure_dirs(cfg)
-    if args.no_resume: cfg.refresh_cache = False
+    if args.no_resume:
+        cfg.refresh_cache = False
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
@@ -114,13 +115,13 @@ def main():
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
         head_vocab_sizes=ds.head_vocab_sizes,
-        head_groups_config=cfg.hybrid_set_head_groups,
+        head_local_to_global=ds.head_local_to_global,
         latent_dim=cfg.hybrid_set_latent_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
-        proj_dim=cfg.hybrid_set_head_proj_dim,
+        person_dim=cfg.hybrid_set_person_dim,
         dropout=cfg.hybrid_set_dropout,
         num_movies=len(ds),
-        hybrid_set_logit_scale=cfg.hybrid_set_logit_scale
+        hybrid_set_logit_scale=cfg.hybrid_set_logit_scale,
     )
     model.to(device)
 
@@ -130,7 +131,6 @@ def main():
         weight_decay=cfg.hybrid_set_weight_decay,
     )
 
-    # Print Summary
     sample_inputs_cpu, _, sample_idx = next(loader)
     print("\n" + "=" * 50)
     print_model_summary(model, {"field_tensors": [x.to(device) for x in sample_inputs_cpu], "batch_indices": sample_idx})
@@ -141,7 +141,6 @@ def main():
         for name, t in ds.head_mappings.items():
             mapping_tensors[name] = t.to(device)
 
-    # Pre-calc counts for logging
     head_true_counts = {}
     if hasattr(ds, "heads_padded"):
         for head_name, padded in ds.heads_padded.items():
@@ -154,7 +153,6 @@ def main():
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
     
-    # Initialize Focal Loss
     criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction='mean').to(device)
 
     num_epochs = int(cfg.hybrid_set_epochs)
@@ -170,7 +168,8 @@ def main():
             start_epoch = c.get("epoch", 0)
             global_step = c.get("global_step", 0)
             logging.info(f"Resumed from epoch {start_epoch}")
-        except: pass
+        except:
+            pass
 
     stopper = GracefulStopper()
 
@@ -190,12 +189,10 @@ def main():
             with torch.amp.autocast("cuda"):
                 logits_dict, recon_table, _ = model(inputs, indices_cpu)
 
-                # Recon Loss
                 recon_loss = 0.0
                 for f, p, t in zip(ds.fields, recon_table, inputs):
                     recon_loss += f.compute_loss(p, t) * f.weight
 
-                # Set Loss (Focal)
                 set_loss_total = 0.0
                 collect = (global_step + 1) % recon_logger.every == 0
                 coords_log, counts_log = {}, {}
@@ -218,9 +215,8 @@ def main():
                                 coords_log[head_name] = torch.stack([ds_rows, loc_v], dim=1).cpu()
 
                     if collect and head_name in head_true_counts:
-                         counts_log[head_name] = head_true_counts[head_name]
+                        counts_log[head_name] = head_true_counts[head_name]
 
-                    # Use Focal Loss here
                     set_loss_total += criterion_set(logits, targets)
 
                 loss = cfg.hybrid_set_w_bce * set_loss_total + cfg.hybrid_set_w_recon * recon_loss
@@ -228,7 +224,8 @@ def main():
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            if sched: sched.step()
+            if sched:
+                sched.step()
 
             if run_logger:
                 run_logger.add_scalar("loss/total", loss.item(), global_step)
@@ -252,8 +249,10 @@ def main():
         save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch + 1, global_step, cfg)
     
     save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch if stopper.stop else num_epochs, global_step, cfg)
-    if run_logger: run_logger.close()
+    if run_logger:
+        run_logger.close()
     print("Done.")
+
 
 if __name__ == "__main__":
     main()

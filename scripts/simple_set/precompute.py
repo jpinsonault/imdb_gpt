@@ -31,25 +31,25 @@ def _map_category_to_head(category: str) -> str | None:
 def build_hybrid_cache(cfg: ProjectConfig):
     db_path = Path(cfg.db_path)
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
-    
+
     logging.info("Initializing TitlesAutoencoder to learn field stats...")
     mov_ae = TitlesAutoencoder(cfg)
-    
-    force_no_cache = not cfg.use_cache or cfg.refresh_cache 
+
+    force_no_cache = not cfg.use_cache or cfg.refresh_cache
     if force_no_cache:
         logging.info("Temporarily forcing non-cached stats accumulation...")
-        mov_ae._drop_cache() 
-    
+        mov_ae._drop_cache()
+
     mov_ae.accumulate_stats()
     mov_ae.finalize_stats()
-    
+
     if force_no_cache:
-        cfg.refresh_cache = False 
-    
+        cfg.refresh_cache = False
+
     logging.info(f"Connecting to {db_path}...")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    
+
     logging.info("Fetching categorized edges...")
     sql_edges = """
     SELECT p.tconst, p.nconst, p.category
@@ -58,11 +58,11 @@ def build_hybrid_cache(cfg: ProjectConfig):
     """
     cur.execute(sql_edges)
     raw_rows = cur.fetchall()
-    
+
     logging.info("Filtering and bucketing...")
     person_counts = Counter(r[1] for r in raw_rows)
     valid_people = {n for n, c in person_counts.items() if c >= MIN_PERSON_FREQUENCY}
-    
+
     movie_data = defaultdict(lambda: defaultdict(set))
     head_populations = defaultdict(set)
 
@@ -72,25 +72,27 @@ def build_hybrid_cache(cfg: ProjectConfig):
             if head is not None:
                 movie_data[tconst][head].add(nconst)
                 head_populations[head].add(nconst)
-            
+
     potential_tconsts = []
-    
+
     for tconst, heads in movie_data.items():
-        has_cast = len(heads.get('cast', [])) > 0
-        has_director = len(heads.get('director', [])) > 0
+        has_cast = len(heads.get("cast", [])) > 0
+        has_director = len(heads.get("director", [])) > 0
         if has_cast and has_director:
             potential_tconsts.append(tconst)
-            
+
     potential_tconsts.sort()
     logging.info(f"Movie filtering: Found {len(potential_tconsts)} movies with valid edges.")
-    
-    # --- FIX START: Pre-fetch and Filter Tconsts to ensure Alignment ---
+
     logging.info("Stacking raw field tensors...")
     cur.execute("CREATE TEMPORARY TABLE target_movies (tconst TEXT PRIMARY KEY)")
-    cur.executemany("INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)", [(t,) for t in potential_tconsts])
-    
+    cur.executemany(
+        "INSERT OR IGNORE INTO target_movies (tconst) VALUES (?)",
+        [(t,) for t in potential_tconsts],
+    )
+
     sql_meta = f"""
-    SELECT 
+    SELECT
         {movie_select_clause(alias='t', genre_alias='g')}
     FROM titles t
     JOIN target_movies tm ON tm.tconst = t.tconst
@@ -98,68 +100,77 @@ def build_hybrid_cache(cfg: ProjectConfig):
     GROUP BY t.tconst
     """
     cur.execute(sql_meta)
-    
+
     fetched_rows = {}
     for r in cur:
         row_dict = map_movie_row(r)
         fetched_rows[row_dict["tconst"]] = row_dict
 
-    # STRICT FILTER: Only keep movies that we successfully fetched metadata for
     final_tconsts = [t for t in potential_tconsts if t in fetched_rows]
-    
-    logging.info(f"Metadata alignment: {len(final_tconsts)} movies confirmed (dropped {len(potential_tconsts) - len(final_tconsts)} missing metadata).")
-    
-    # Re-calculate people set based ONLY on final_tconsts to keep things clean
+
+    logging.info(
+        f"Metadata alignment: {len(final_tconsts)} movies confirmed "
+        f"(dropped {len(potential_tconsts) - len(final_tconsts)} missing metadata)."
+    )
+
     final_nconsts_set = set()
     for t in final_tconsts:
         for p_set in movie_data[t].values():
             final_nconsts_set.update(p_set)
-            
+
     sorted_nconsts = sorted(list(final_nconsts_set))
     nconst_to_global_idx = {n: i for i, n in enumerate(sorted_nconsts)}
-    
+
     num_movies = len(final_tconsts)
     num_people = len(sorted_nconsts)
-    
-    head_mappings = {}   
-    head_vocab_sizes = {} 
+
+    head_mappings = {}
+    head_vocab_sizes = {}
+    head_local_to_global = {}
 
     logging.info("Building head-specific subsets...")
     for head, nconsts in head_populations.items():
-        # Only include nconsts that survived the final_tconsts filter
         valid_head_nconsts = [n for n in nconsts if n in nconst_to_global_idx]
         valid_head_nconsts.sort()
-        
+
         local_vocab_size = len(valid_head_nconsts)
         head_vocab_sizes[head] = local_vocab_size
-        
+
         mapping_tensor = torch.full((num_people,), -1, dtype=torch.long)
         for local_idx, nconst in enumerate(valid_head_nconsts):
             global_idx = nconst_to_global_idx[nconst]
             mapping_tensor[global_idx] = local_idx
-            
+
         head_mappings[head] = mapping_tensor
 
+        if local_vocab_size > 0:
+            local_to_global = torch.full((local_vocab_size,), -1, dtype=torch.long)
+            valid_mask = mapping_tensor != -1
+            global_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+            local_indices = mapping_tensor[global_indices]
+            local_to_global[local_indices] = global_indices
+            head_local_to_global[head] = local_to_global
+
     field_data = [[] for _ in mov_ae.fields]
-    # Initialize with the CORRECT size (num_movies)
     temp_heads_lists = defaultdict(lambda: [[] for _ in range(num_movies)])
-    
-    # --- FIX: Iterate only over the filtered list ---
+
     for idx, tconst in enumerate(tqdm(final_tconsts, desc="Stacking")):
-        row_dict = fetched_rows[tconst] # Safe because we filtered above
-        
+        row_dict = fetched_rows[tconst]
+
         heads_data = movie_data[tconst]
         row_dict["peopleCount"] = sum(len(s) for s in heads_data.values())
-        
-        # Append metadata (this is Index `idx`)
+
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
             t = field.transform(val).cpu()
             field_data[i].append(t)
-            
-        # Assign targets to Index `idx`
+
         for head_name, nconst_set in heads_data.items():
-            idxs = [nconst_to_global_idx[n] for n in nconst_set if n in nconst_to_global_idx]
+            idxs = [
+                nconst_to_global_idx[n]
+                for n in nconst_set
+                if n in nconst_to_global_idx
+            ]
             if idxs:
                 temp_heads_lists[head_name][idx] = idxs
 
@@ -181,18 +192,25 @@ def build_hybrid_cache(cfg: ProjectConfig):
     logging.info("Fetching person names...")
     idx_to_person_name = {}
     cur.execute("CREATE TEMPORARY TABLE temp_people (nconst TEXT PRIMARY KEY)")
-    cur.executemany("INSERT OR IGNORE INTO temp_people (nconst) VALUES (?)", [(n,) for n in sorted_nconsts])
-    cur.execute("SELECT p.nconst, p.primaryName FROM people p JOIN temp_people tp ON tp.nconst = p.nconst")
-    
+    cur.executemany(
+        "INSERT OR IGNORE INTO temp_people (nconst) VALUES (?)",
+        [(n,) for n in sorted_nconsts],
+    )
+    cur.execute(
+        "SELECT p.nconst, p.primaryName FROM people p "
+        "JOIN temp_people tp ON tp.nconst = p.nconst"
+    )
+
     for n, name in cur:
         if n in nconst_to_global_idx:
             idx_to_person_name[nconst_to_global_idx[n]] = name
-            
+
     conn.close()
-    
+
     field_configs = {}
     for f in mov_ae.fields:
         from scripts.autoencoder.row_autoencoder import _field_to_state
+
         field_configs[f.name] = _field_to_state(f)
 
     head_avg_counts = {}
@@ -214,13 +232,13 @@ def build_hybrid_cache(cfg: ProjectConfig):
         "head_avg_counts": head_avg_counts,
         "idx_to_person_name": idx_to_person_name,
         "field_configs": field_configs,
-        "field_names": [f.name for f in mov_ae.fields]
+        "field_names": [f.name for f in mov_ae.fields],
+        "head_local_to_global": head_local_to_global,
     }
-    
+
     logging.info(f"Saving hybrid cache to {cache_path}...")
     torch.save(payload, cache_path)
     return cache_path
-
 
 def ensure_hybrid_cache(cfg: ProjectConfig):
     cache_path = Path(cfg.data_dir) / "hybrid_set_cache.pt"
