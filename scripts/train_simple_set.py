@@ -97,6 +97,7 @@ def main():
         head_groups_config=cfg.hybrid_set_head_groups,  # Added this line
         latent_dim=cfg.hybrid_set_latent_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
+        proj_dim=cfg.hybrid_set_head_proj_dim,
         dropout=cfg.hybrid_set_dropout,
         num_movies=len(ds),
         hybrid_set_logit_scale=cfg.hybrid_set_logit_scale

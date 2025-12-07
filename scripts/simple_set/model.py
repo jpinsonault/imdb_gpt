@@ -13,25 +13,27 @@ class SparseProjectedHead(nn.Module):
     """
     Projects input z to a query vector using a Cosine-Similarity based approach.
     
-    1. Refines z via a residual bottleneck.
+    1. Projects z via a bottleneck (in_dim -> hidden_dim -> proj_dim).
     2. Re-normalizes the result to the hypersphere.
     3. Calculates Cosine Similarity with the output vocabulary weights.
     4. Scales by a learnable temperature.
     """
-    def __init__(self, in_dim, vocab_size, hidden_dim, dropout=0.1, init_scale=20.0):
+    def __init__(self, in_dim, proj_dim, vocab_size, hidden_dim, dropout=0.1, init_scale=20.0):
         super().__init__()
         
         # 1. Bottleneck / Projector
+        # Note: Skip connection removed, allowing proj_dim != in_dim
         self.projector = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, in_dim) 
+            nn.Linear(hidden_dim, proj_dim) 
         )
         
         # 2. The Classifier Weights (No bias in the linear part for Cosine, we add bias separately)
-        self.weight = nn.Parameter(torch.empty(vocab_size, in_dim))
+        # Weights match the projection output dimension
+        self.weight = nn.Parameter(torch.empty(vocab_size, proj_dim))
         self.bias = nn.Parameter(torch.empty(vocab_size))
         
         # 3. Learnable Scale (Temperature)
@@ -57,12 +59,11 @@ class SparseProjectedHead(nn.Module):
         nn.init.constant_(self.bias, -6.0)
 
     def forward(self, z):
-        # z: [B, latent_dim] (Assumed normalized coming in, but we handle it anyway)
+        # z: [B, in_dim] (Assumed normalized coming in, but we handle it anyway)
         
-        # 1. Residual Refinement
-        # q becomes the "Search Query" for the specific head (e.g., Cast vs Director)
-        residual = self.projector(z)
-        q = z + residual
+        # 1. Projection (No Residual)
+        # q becomes the "Search Query" for the specific head
+        q = self.projector(z)
         
         # 2. Re-Normalize
         # We want strict Cosine Similarity, so the query must be unit length.
@@ -87,7 +88,7 @@ class GroupedProjectedHead(nn.Module):
     This allows the model to specialize 'queries' for different subsets of the data
     while keeping individual matrices smaller.
     """
-    def __init__(self, in_dim, vocab_size, num_groups, hidden_dim, dropout=0.1, init_scale=20.0):
+    def __init__(self, in_dim, proj_dim, vocab_size, num_groups, hidden_dim, dropout=0.1, init_scale=20.0):
         super().__init__()
         self.chunks = nn.ModuleList()
         
@@ -100,7 +101,8 @@ class GroupedProjectedHead(nn.Module):
             current_size = min(chunk_size, remaining)
             self.chunks.append(
                 SparseProjectedHead(
-                    in_dim=in_dim, 
+                    in_dim=in_dim,
+                    proj_dim=proj_dim,
                     vocab_size=current_size, 
                     hidden_dim=hidden_dim, 
                     dropout=dropout, 
@@ -127,6 +129,7 @@ class HybridSetModel(nn.Module):
         head_groups_config=None,
         latent_dim=256,
         hidden_dim=1024,
+        proj_dim=None,
         dropout=0.1,
         num_movies=0,
         **kwargs 
@@ -135,6 +138,9 @@ class HybridSetModel(nn.Module):
 
         self.fields = fields
         self.latent_dim = int(latent_dim)
+        # If proj_dim is not specified, default to latent_dim. 
+        # But now they are allowed to differ because skip connection is removed.
+        self.proj_dim = int(proj_dim) if proj_dim is not None else self.latent_dim
         
         if num_movies <= 0:
             raise ValueError("num_movies must be > 0")
@@ -166,6 +172,7 @@ class HybridSetModel(nn.Module):
             if num_groups > 1:
                 self.heads[name] = GroupedProjectedHead(
                     in_dim=self.latent_dim,
+                    proj_dim=self.proj_dim,
                     vocab_size=vocab,
                     num_groups=num_groups,
                     hidden_dim=hidden_dim,
@@ -175,6 +182,7 @@ class HybridSetModel(nn.Module):
             else:
                 self.heads[name] = SparseProjectedHead(
                     in_dim=self.latent_dim,
+                    proj_dim=self.proj_dim,
                     vocab_size=vocab,
                     hidden_dim=hidden_dim,
                     dropout=dropout,
@@ -197,7 +205,7 @@ class HybridSetModel(nn.Module):
         logits_dict = {}
         for name, head_module in self.heads.items():
             # z is normalized here, but head_module (or its chunks) 
-            # will add residual and re-normalize internally.
+            # will project and re-normalize internally.
             logits_dict[name] = head_module(z)
 
         return logits_dict, recon_table, z
