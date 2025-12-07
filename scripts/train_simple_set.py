@@ -94,10 +94,12 @@ def main():
         num_people=ds.num_people,
         heads_config=cfg.hybrid_set_heads,
         head_vocab_sizes=ds.head_vocab_sizes,
+        head_groups_config=cfg.hybrid_set_head_groups,  # Added this line
         latent_dim=cfg.hybrid_set_latent_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
         dropout=cfg.hybrid_set_dropout,
         num_movies=len(ds),
+        hybrid_set_logit_scale=cfg.hybrid_set_logit_scale
     )
     model.to(device)
 
@@ -106,6 +108,12 @@ def main():
         lr=cfg.hybrid_set_lr,
         weight_decay=cfg.hybrid_set_weight_decay,
     )
+
+    # Print Summary
+    sample_inputs_cpu, _, sample_idx = next(loader)
+    print("\n" + "=" * 50)
+    print_model_summary(model, {"field_tensors": [x.to(device) for x in sample_inputs_cpu], "batch_indices": sample_idx})
+    print("=" * 50 + "\n")
 
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):

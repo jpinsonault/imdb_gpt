@@ -80,6 +80,43 @@ class SparseProjectedHead(nn.Module):
         return logits
 
 
+class GroupedProjectedHead(nn.Module):
+    """
+    Splits a large vocabulary into smaller chunks/groups.
+    Each chunk gets its own SparseProjectedHead (and thus its own projector/query vector).
+    This allows the model to specialize 'queries' for different subsets of the data
+    while keeping individual matrices smaller.
+    """
+    def __init__(self, in_dim, vocab_size, num_groups, hidden_dim, dropout=0.1, init_scale=20.0):
+        super().__init__()
+        self.chunks = nn.ModuleList()
+        
+        # Determine chunk size (ceiling division)
+        # We keep order: 0..k, k..2k, etc.
+        chunk_size = math.ceil(vocab_size / num_groups)
+        
+        remaining = vocab_size
+        while remaining > 0:
+            current_size = min(chunk_size, remaining)
+            self.chunks.append(
+                SparseProjectedHead(
+                    in_dim=in_dim, 
+                    vocab_size=current_size, 
+                    hidden_dim=hidden_dim, 
+                    dropout=dropout, 
+                    init_scale=init_scale
+                )
+            )
+            remaining -= current_size
+
+    def forward(self, z):
+        # z: [B, latent_dim]
+        # Calculate sub-logits for each chunk and concatenate.
+        # Each chunk computes its own independent query vector q based on z.
+        chunk_outputs = [chunk(z) for chunk in self.chunks]
+        return torch.cat(chunk_outputs, dim=-1)
+
+
 class HybridSetModel(nn.Module):
     def __init__(
         self,
@@ -87,6 +124,7 @@ class HybridSetModel(nn.Module):
         num_people,
         heads_config,
         head_vocab_sizes,
+        head_groups_config=None,
         latent_dim=256,
         hidden_dim=1024,
         dropout=0.1,
@@ -116,17 +154,32 @@ class HybridSetModel(nn.Module):
 
         self.heads = nn.ModuleDict()
 
+        if head_groups_config is None:
+            head_groups_config = {}
+
         for name, _ in heads_config.items():
             vocab = int(head_vocab_sizes.get(name, num_people))
             if vocab <= 0: continue
             
-            self.heads[name] = SparseProjectedHead(
-                in_dim=self.latent_dim,
-                vocab_size=vocab,
-                hidden_dim=hidden_dim,
-                dropout=dropout,
-                init_scale=init_scale
-            )
+            num_groups = int(head_groups_config.get(name, 1))
+            
+            if num_groups > 1:
+                self.heads[name] = GroupedProjectedHead(
+                    in_dim=self.latent_dim,
+                    vocab_size=vocab,
+                    num_groups=num_groups,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                    init_scale=init_scale
+                )
+            else:
+                self.heads[name] = SparseProjectedHead(
+                    in_dim=self.latent_dim,
+                    vocab_size=vocab,
+                    hidden_dim=hidden_dim,
+                    dropout=dropout,
+                    init_scale=init_scale
+                )
 
     def forward(self, field_tensors, batch_indices):
         if batch_indices is None:
@@ -143,7 +196,8 @@ class HybridSetModel(nn.Module):
 
         logits_dict = {}
         for name, head_module in self.heads.items():
-            # z is normalized here, but head_module will add residual and re-normalize
+            # z is normalized here, but head_module (or its chunks) 
+            # will add residual and re-normalize internally.
             logits_dict[name] = head_module(z)
 
         return logits_dict, recon_table, z
