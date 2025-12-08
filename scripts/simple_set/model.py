@@ -1,5 +1,3 @@
-# scripts/simple_set/model.py
-
 import math
 import torch
 import torch.nn as nn
@@ -65,6 +63,63 @@ class PersonSetHead(nn.Module):
         return logits
 
 
+class MovieSetHead(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        movie_dim,
+        vocab_size,
+        hidden_dim,
+        local_to_global,
+        dropout=0.1,
+        init_scale=20.0,
+    ):
+        super().__init__()
+
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(hidden_dim, movie_dim)
+
+        self.use_res = in_dim == movie_dim
+        if self.use_res:
+            self.res_scale = nn.Parameter(torch.tensor(0.1))
+
+        self.bias = nn.Parameter(torch.empty(vocab_size))
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(init_scale))
+
+        self.register_buffer("local_to_global", local_to_global.long(), persistent=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        nn.init.constant_(self.in_proj.bias, 0.0)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+        nn.init.constant_(self.bias, -6.0)
+
+    def forward(self, z, movie_weight):
+        x = self.in_proj(z)
+        x = self.ln(x)
+        x = self.act(x)
+        x = self.drop(x)
+        q = self.out_proj(x)
+
+        if self.use_res:
+            q = q + self.res_scale * z
+
+        q = F.normalize(q, p=2, dim=-1)
+
+        w = movie_weight[self.local_to_global]
+        w = F.normalize(w, p=2, dim=-1)
+
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        logits = F.linear(q, w) * scale + self.bias
+        return logits
+
+
 class HybridSetModel(nn.Module):
     def __init__(
         self,
@@ -103,6 +158,7 @@ class HybridSetModel(nn.Module):
         )
 
         self.heads = nn.ModuleDict()
+        self.movie_heads = nn.ModuleDict()
         init_scale = kwargs.get("hybrid_set_logit_scale", 20.0)
 
         for name, _ in heads_config.items():
@@ -124,7 +180,18 @@ class HybridSetModel(nn.Module):
                 init_scale=init_scale,
             )
 
-    def forward(self, field_tensors, batch_indices):
+            movie_local_to_global = torch.arange(num_movies, dtype=torch.long)
+            self.movie_heads[name] = MovieSetHead(
+                in_dim=self.person_dim,
+                movie_dim=self.latent_dim,
+                vocab_size=num_movies,
+                hidden_dim=hidden_dim,
+                local_to_global=movie_local_to_global,
+                dropout=dropout,
+                init_scale=init_scale,
+            )
+
+    def forward_movie(self, field_tensors, batch_indices):
         if batch_indices is None:
             raise ValueError("batch_indices is required.")
 
@@ -143,4 +210,25 @@ class HybridSetModel(nn.Module):
         for name, head_module in self.heads.items():
             logits_dict[name] = head_module(z, people_weight)
 
+        return logits_dict, recon_table, z
+
+    def forward_person(self, person_indices):
+        if person_indices is None:
+            raise ValueError("person_indices is required.")
+
+        device = self.person_embeddings.weight.device
+        idx = person_indices.to(device, non_blocking=True)
+        z = self.person_embeddings(idx)
+        z = F.normalize(z, p=2, dim=-1)
+
+        movie_weight = self.movie_embeddings.weight
+
+        logits_dict = {}
+        for name, head_module in self.movie_heads.items():
+            logits_dict[name] = head_module(z, movie_weight)
+
+        return logits_dict, z
+
+    def forward(self, field_tensors, batch_indices):
+        logits_dict, recon_table, z = self.forward_movie(field_tensors, batch_indices)
         return logits_dict, recon_table, z

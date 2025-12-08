@@ -1,12 +1,8 @@
-# scripts/train_simple_set.py
-
 import argparse
 import logging
 import json
 import signal
 import math
-import time
-import sys
 from pathlib import Path
 from dataclasses import asdict
 
@@ -18,10 +14,10 @@ from tqdm import tqdm
 
 from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
-from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.precompute import ensure_hybrid_cache
 from scripts.simple_set.model import HybridSetModel
-from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader
+from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader, FastInfinitePeopleLoader
+from scripts.simple_set.inspect import print_hybrid_model_sections
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -38,20 +34,20 @@ class GracefulStopper:
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
-        
-        if self.reduction == 'mean':
+
+        if self.reduction == "mean":
             return focal_loss.mean()
-        elif self.reduction == 'sum':
+        if self.reduction == "sum":
             return focal_loss.sum()
         return focal_loss
 
@@ -63,7 +59,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     ratio = float(warmup_ratio)
     frac_warmup = int(total_steps * ratio)
     w_steps = max(int(warmup_steps), frac_warmup)
-    
+
     def lambda_fn(step):
         s = int(step)
         if s < w_steps:
@@ -73,8 +69,7 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
         if schedule == "cosine":
             decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return min_factor + (1.0 - min_factor) * decay
-        else:
-            return max(min_factor, 1.0 - (1.0 - min_factor) * progress)
+        return max(min_factor, 1.0 - (1.0 - min_factor) * progress)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_fn, last_epoch=last_epoch)
 
@@ -106,8 +101,9 @@ def main():
 
     cache_path = ensure_hybrid_cache(cfg)
     ds = HybridSetDataset(str(cache_path), cfg)
-    loader = FastInfiniteLoader(ds, batch_size=cfg.batch_size, shuffle=True)
-    
+    movie_loader = FastInfiniteLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+    people_loader = FastInfinitePeopleLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = HybridSetModel(
@@ -125,16 +121,14 @@ def main():
     )
     model.to(device)
 
+    sample_inputs_cpu, _, sample_idx = next(movie_loader)
+    print_hybrid_model_sections(model, sample_inputs_cpu, sample_idx, device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.hybrid_set_lr,
         weight_decay=cfg.hybrid_set_weight_decay,
     )
-
-    sample_inputs_cpu, _, sample_idx = next(loader)
-    print("\n" + "=" * 50)
-    print_model_summary(model, {"field_tensors": [x.to(device) for x in sample_inputs_cpu], "batch_indices": sample_idx})
-    print("=" * 50 + "\n")
 
     mapping_tensors = {}
     if hasattr(ds, "head_mappings"):
@@ -148,16 +142,27 @@ def main():
             head_true_counts[head_name] = mask.sum(dim=1, keepdim=True)
 
     scaler = torch.amp.GradScaler("cuda")
-    from scripts.autoencoder.run_logger import RunLogger
-    from scripts.simple_set.recon import HybridSetReconLogger
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
+    from scripts.simple_set.recon import HybridSetReconLogger
+
     recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
-    
-    criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction='mean').to(device)
+
+    criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction="mean").to(device)
 
     num_epochs = int(cfg.hybrid_set_epochs)
-    batches_per_epoch = len(loader)
-    sched = make_lr_scheduler(optimizer, batches_per_epoch * num_epochs, cfg.lr_schedule, cfg.lr_warmup_steps, cfg.lr_warmup_ratio, cfg.lr_min_factor)
+    movie_steps_per_epoch = len(movie_loader)
+    people_steps_per_epoch = len(people_loader)
+    batches_per_epoch = min(movie_steps_per_epoch, people_steps_per_epoch)
+
+    total_steps = batches_per_epoch * num_epochs
+    sched = make_lr_scheduler(
+        optimizer,
+        total_steps,
+        cfg.lr_schedule,
+        cfg.lr_warmup_steps,
+        cfg.lr_warmup_ratio,
+        cfg.lr_min_factor,
+    )
 
     start_epoch, global_step = 0, 0
     ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
@@ -168,58 +173,86 @@ def main():
             start_epoch = c.get("epoch", 0)
             global_step = c.get("global_step", 0)
             logging.info(f"Resumed from epoch {start_epoch}")
-        except:
+        except Exception:
             pass
 
     stopper = GracefulStopper()
 
     for epoch in range(start_epoch, num_epochs):
         pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
-        for _ in pbar:
+        for step in pbar:
             if stopper.stop:
                 pbar.close()
                 break
 
-            inputs_cpu, heads_padded_cpu, indices_cpu = next(loader)
-            inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
-            
+            movie_step = (step % 2 == 0)
+            collect = movie_step and ((global_step + 1) % recon_logger.every == 0)
+            coords_log = {}
+            counts_log = {}
+
             model.train()
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda"):
-                logits_dict, recon_table, _ = model(inputs, indices_cpu)
+            if movie_step:
+                inputs_cpu, heads_padded_cpu, indices_cpu = next(movie_loader)
+                inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
 
-                recon_loss = 0.0
-                for f, p, t in zip(ds.fields, recon_table, inputs):
-                    recon_loss += f.compute_loss(p, t) * f.weight
+                with torch.amp.autocast("cuda"):
+                    logits_dict, recon_table, _ = model.forward_movie(inputs, indices_cpu)
 
-                set_loss_total = 0.0
-                collect = (global_step + 1) % recon_logger.every == 0
-                coords_log, counts_log = {}, {}
+                    recon_loss = 0.0
+                    for f, p, t in zip(ds.fields, recon_table, inputs):
+                        recon_loss += f.compute_loss(p, t) * f.weight
 
-                for head_name, logits in logits_dict.items():
-                    raw_padded = heads_padded_cpu[head_name].to(device, non_blocking=True)
-                    mask = raw_padded != -1
-                    rows, cols = torch.nonzero(mask, as_tuple=True)
-                    
-                    targets = torch.zeros_like(logits)
-                    if rows.numel() > 0:
-                        glob = raw_padded[rows, cols].long()
-                        loc = mapping_tensors[head_name][glob]
-                        valid = loc != -1
-                        if valid.any():
-                            rows_v, loc_v = rows[valid], loc[valid]
-                            targets[rows_v, loc_v] = 1.0
-                            if collect:
-                                ds_rows = indices_cpu.to(device)[rows_v]
-                                coords_log[head_name] = torch.stack([ds_rows, loc_v], dim=1).cpu()
+                    set_loss_total = 0.0
 
-                    if collect and head_name in head_true_counts:
-                        counts_log[head_name] = head_true_counts[head_name]
+                    for head_name, logits in logits_dict.items():
+                        raw_padded = heads_padded_cpu[head_name].to(device, non_blocking=True)
+                        mask = raw_padded != -1
+                        rows, cols = torch.nonzero(mask, as_tuple=True)
 
-                    set_loss_total += criterion_set(logits, targets)
+                        targets = torch.zeros_like(logits)
+                        if rows.numel() > 0:
+                            glob = raw_padded[rows, cols].long()
+                            loc = mapping_tensors[head_name][glob]
+                            valid = loc != -1
+                            if valid.any():
+                                rows_v = rows[valid]
+                                loc_v = loc[valid]
+                                targets[rows_v, loc_v] = 1.0
+                                if collect:
+                                    ds_rows = indices_cpu.to(device)[rows_v]
+                                    coords_log[head_name] = torch.stack([ds_rows, loc_v], dim=1).cpu()
 
-                loss = cfg.hybrid_set_w_bce * set_loss_total + cfg.hybrid_set_w_recon * recon_loss
+                        if collect and head_name in head_true_counts:
+                            counts_log[head_name] = head_true_counts[head_name]
+
+                        set_loss_total += criterion_set(logits, targets)
+
+                    loss = cfg.hybrid_set_w_bce * set_loss_total + cfg.hybrid_set_w_recon * recon_loss
+            else:
+                heads_padded_people_cpu, person_indices_cpu = next(people_loader)
+                person_indices_cpu = person_indices_cpu.to(device, non_blocking=True)
+
+                with torch.amp.autocast("cuda"):
+                    logits_dict_p, _ = model.forward_person(person_indices_cpu)
+
+                    set_loss_total = 0.0
+
+                    for head_name, logits in logits_dict_p.items():
+                        raw_padded = heads_padded_people_cpu[head_name].to(device, non_blocking=True)
+                        mask = raw_padded != -1
+                        rows, cols = torch.nonzero(mask, as_tuple=True)
+
+                        targets = torch.zeros_like(logits)
+                        if rows.numel() > 0:
+                            movies = raw_padded[rows, cols].long()
+                            targets[rows, movies] = 1.0
+
+                        set_loss_total += criterion_set(logits, targets)
+
+                    recon_loss = 0.0
+                    loss = cfg.hybrid_set_w_bce * set_loss_total
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -233,22 +266,31 @@ def main():
                 run_logger.add_scalar("opt/lr", optimizer.param_groups[0]["lr"], global_step)
                 run_logger.tick()
 
-            if collect:
+            if movie_step and collect:
                 recon_logger.step(global_step, model, inputs, indices_cpu, coords_log, counts_log, run_logger)
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            mode_str = "movie" if movie_step else "person"
+            pbar.set_postfix(mode=mode_str, loss=f"{loss.item():.4f}")
             global_step += 1
-            
+
             if global_step % cfg.hybrid_set_save_interval == 0:
                 save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch, global_step, cfg)
-        
+
         if stopper.stop:
             print("[GracefulStopper] Training loop exited. Final save...")
             break
-            
+
         save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch + 1, global_step, cfg)
-    
-    save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch if stopper.stop else num_epochs, global_step, cfg)
+
+    save_checkpoint(
+        Path(cfg.model_dir),
+        model,
+        optimizer,
+        sched,
+        epoch if stopper.stop else num_epochs,
+        global_step,
+        cfg,
+    )
     if run_logger:
         run_logger.close()
     print("Done.")

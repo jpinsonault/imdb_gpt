@@ -39,6 +39,34 @@ class HybridSetDataset(Dataset):
                 _apply_field_state(f, field_configs[f.name])
 
         self.num_items = self.stacked_fields[0].shape[0]
+        self.num_movies = self.num_items
+
+        self.people_heads_padded = {}
+        if self.heads_padded:
+            logging.info("Building people_heads_padded (person → movies) cache...")
+            for head, padded in self.heads_padded.items():
+                num_movies, max_len = padded.shape
+                lists = [[] for _ in range(self.num_people)]
+                for m in range(num_movies):
+                    row = padded[m]
+                    valid = row[row != -1]
+                    if valid.numel() == 0:
+                        continue
+                    for p in valid.tolist():
+                        lists[int(p)].append(m)
+                max_movies = 1
+                if lists:
+                    max_movies = max(1, max(len(v) for v in lists))
+                people_padded = torch.full((self.num_people, max_movies), -1, dtype=torch.int32)
+                for pid, movies in enumerate(lists):
+                    if movies:
+                        t = torch.tensor(movies, dtype=torch.int32)
+                        length = t.shape[0]
+                        people_padded[pid, :length] = t
+                if torch.cuda.is_available():
+                    people_padded = people_padded.pin_memory()
+                self.people_heads_padded[head] = people_padded
+            logging.info("Finished building people_heads_padded.")
 
     def __len__(self):
         return self.num_items
@@ -76,6 +104,39 @@ class FastInfiniteLoader:
         heads_padded_batch = {k: v[batch_idx] for k, v in self.dataset.heads_padded.items()}
 
         return inputs, heads_padded_batch, batch_idx
+
+    def __len__(self):
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+
+class FastInfinitePeopleLoader:
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        self.indices = torch.arange(dataset.num_people)
+        if self.shuffle:
+            self.indices = self.indices[torch.randperm(len(self.indices))]
+
+        self.ptr = 0
+        self.n = len(self.indices)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.ptr + self.batch_size > self.n:
+            if self.shuffle:
+                self.indices = self.indices[torch.randperm(self.n)]
+            self.ptr = 0
+
+        batch_idx = self.indices[self.ptr : self.ptr + self.batch_size]
+        self.ptr += self.batch_size
+
+        heads_padded_batch = {k: v[batch_idx] for k, v in self.dataset.people_heads_padded.items()}
+
+        return heads_padded_batch, batch_idx
 
     def __len__(self):
         return (self.n + self.batch_size - 1) // self.batch_size
