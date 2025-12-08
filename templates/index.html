@@ -4,13 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IMDb Neural Search</title>
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         [x-cloak] { display: none !important; }
     </style>
 
-    <!-- App Logic: Define before Alpine loads -->
     <script>
         document.addEventListener('alpine:init', () => {
             Alpine.data('searchApp', () => ({
@@ -19,6 +17,7 @@
                 results: [],
                 hasSearched: false,
                 showFilters: false,
+                searchType: 'movie',
                 filters: {
                     startYear: '',
                     averageRating: '',
@@ -27,7 +26,7 @@
 
                 async performSearch() {
                     if (!this.query.trim()) return;
-                    
+
                     this.isLoading = true;
                     this.hasSearched = true;
                     this.results = [];
@@ -36,23 +35,25 @@
                         const payload = {
                             query: this.query,
                             top_k: 50,
-                            filters: {}
+                            filters: {},
+                            search_type: this.searchType,
                         };
 
-                        // Add non-empty filters
-                        if(this.filters.startYear) payload.filters.startYear = this.filters.startYear;
-                        if(this.filters.averageRating) payload.filters.averageRating = this.filters.averageRating;
-                        if(this.filters.genres) payload.filters.genres = this.filters.genres;
+                        if (this.searchType === 'movie') {
+                            if (this.filters.startYear) payload.filters.startYear = this.filters.startYear;
+                            if (this.filters.averageRating) payload.filters.averageRating = this.filters.averageRating;
+                            if (this.filters.genres) payload.filters.genres = this.filters.genres;
+                        }
 
                         const res = await fetch('/api/search', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(payload)
                         });
-                        
+
                         const data = await res.json();
                         if (data.error) throw new Error(data.error);
-                        
+
                         this.results = data.results;
                     } catch (err) {
                         console.error(err);
@@ -65,119 +66,188 @@
         })
     </script>
 
-    <!-- Alpine.js -->
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen font-sans">
-
-    <!-- Use the component name directly in x-data -->
-    <div class="container mx-auto px-4 py-8 max-w-4xl" 
-         x-data="searchApp">
-        
-        <!-- Header -->
+    <div class="container mx-auto px-4 py-8 max-w-4xl" x-data="searchApp">
         <div class="mb-8 text-center">
             <h1 class="text-4xl font-bold text-yellow-500 mb-2">IMDb Neural Search</h1>
             <p class="text-gray-400">Set Encoder Latent Space Exploration</p>
         </div>
 
-        <!-- Search Box -->
         <div class="bg-gray-800 p-6 rounded-lg shadow-lg mb-8 border border-gray-700">
             <form @submit.prevent="performSearch">
-                <div class="flex gap-4">
-                    <input type="text" 
-                           x-model="query" 
-                           placeholder="Type a movie title..." 
-                           class="flex-1 bg-gray-900 border border-gray-600 rounded px-4 py-3 text-lg focus:outline-none focus:border-yellow-500 transition-colors placeholder-gray-600"
-                           autofocus>
-                    <button type="submit" 
-                            class="bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-3 px-8 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            :disabled="isLoading || !query.trim()">
-                        <span x-show="!isLoading">Search</span>
-                        <span x-show="isLoading" x-cloak>Running...</span>
-                    </button>
-                </div>
-                <!-- Optional Filters Toggle -->
-                <div class="mt-4">
-                    <button type="button" @click="showFilters = !showFilters" class="text-sm text-gray-500 hover:text-gray-300 underline">
-                        <span x-text="showFilters ? 'Hide Advanced Filters' : 'Show Advanced Filters'"></span>
-                    </button>
-                    
-                    <div x-show="showFilters" x-cloak class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 p-4 bg-gray-900 rounded border border-gray-700">
-                        <div>
-                            <label class="block text-xs text-gray-500 mb-1">Year</label>
-                            <input type="text" x-model="filters.startYear" placeholder="e.g. 1999" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+                <div class="flex flex-col gap-4">
+                    <div class="flex gap-4">
+                        <input type="text"
+                               x-model="query"
+                               :placeholder="searchType === 'movie' ? 'Type a movie title...' : 'Type a person name...'"
+                               class="flex-1 bg-gray-900 border border-gray-600 rounded px-4 py-3 text-lg focus:outline-none focus:border-yellow-500 transition-colors placeholder-gray-600"
+                               autofocus>
+                        <button type="submit"
+                                class="bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-3 px-8 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                :disabled="isLoading || !query.trim()">
+                            <span x-show="!isLoading">Search</span>
+                            <span x-show="isLoading" x-cloak>Running...</span>
+                        </button>
+                    </div>
+
+                    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                        <div class="inline-flex rounded bg-gray-900 p-1 border border-gray-700">
+                            <button type="button"
+                                    @click="searchType = 'movie'"
+                                    class="px-3 py-1 text-sm rounded"
+                                    :class="searchType === 'movie' ? 'bg-yellow-500 text-gray-900 font-semibold' : 'bg-gray-800 text-gray-300'">
+                                Movies
+                            </button>
+                            <button type="button"
+                                    @click="searchType = 'person'"
+                                    class="px-3 py-1 text-sm rounded"
+                                    :class="searchType === 'person' ? 'bg-yellow-500 text-gray-900 font-semibold' : 'bg-gray-800 text-gray-300'">
+                                People
+                            </button>
                         </div>
-                        <div>
-                            <label class="block text-xs text-gray-500 mb-1">Min Rating</label>
-                            <input type="text" x-model="filters.averageRating" placeholder="e.g. 8.0" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+
+                        <div class="text-xs text-gray-500">
+                            <span x-show="searchType === 'movie'">Use advanced filters for year, rating, and genre.</span>
+                            <span x-show="searchType === 'person'">Searching by name; filters are disabled.</span>
                         </div>
-                        <div>
-                            <label class="block text-xs text-gray-500 mb-1">Genre</label>
-                            <input type="text" x-model="filters.genres" placeholder="e.g. Action" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+                    </div>
+
+                    <div class="mt-2">
+                        <button type="button"
+                                @click="showFilters = !showFilters"
+                                class="text-sm text-gray-500 hover:text-gray-300 underline"
+                                x-show="searchType === 'movie'">
+                            <span x-text="showFilters ? 'Hide Advanced Filters' : 'Show Advanced Filters'"></span>
+                        </button>
+
+                        <div x-show="showFilters && searchType === 'movie'" x-cloak
+                             class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 p-4 bg-gray-900 rounded border border-gray-700">
+                            <div>
+                                <label class="block text-xs text-gray-500 mb-1">Year</label>
+                                <input type="text" x-model="filters.startYear" placeholder="e.g. 1999"
+                                       class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-500 mb-1">Min Rating</label>
+                                <input type="text" x-model="filters.averageRating" placeholder="e.g. 8.0"
+                                       class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-500 mb-1">Genre</label>
+                                <input type="text" x-model="filters.genres" placeholder="e.g. Action"
+                                       class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+                            </div>
                         </div>
                     </div>
                 </div>
             </form>
         </div>
 
-        <!-- Results -->
         <div class="space-y-4">
             <template x-for="item in results" :key="item._id">
                 <div class="bg-gray-800 p-4 rounded border border-gray-700 hover:border-gray-500 transition-colors flex flex-col md:flex-row gap-4">
-                    <!-- Rank / Score -->
                     <div class="flex-shrink-0 flex flex-col items-center justify-center bg-gray-900 rounded w-16 h-16 md:w-20 md:h-full border border-gray-700">
                         <span class="text-xs text-gray-500">Rank</span>
                         <span class="text-xl font-bold text-white" x-text="item._rank"></span>
                         <span class="text-[10px] text-gray-600 mt-1" x-text="'dist: ' + parseFloat(item._score).toFixed(2)"></span>
                     </div>
 
-                    <!-- Content -->
                     <div class="flex-grow">
-                        <div class="flex justify-between items-start">
-                            <h3 class="text-xl font-bold text-yellow-500 leading-tight">
-                                <span x-text="item.primaryTitle"></span>
-                                <span class="text-gray-400 font-normal ml-2 text-base" x-text="'(' + item.startYear + ')'"></span>
-                            </h3>
-                            <span class="bg-gray-700 text-xs px-2 py-1 rounded text-gray-300" x-text="item.titleType"></span>
-                        </div>
+                        <template x-if="item.titleType === 'movie'">
+                            <div>
+                                <div class="flex justify-between items-start">
+                                    <a :href="'/movie/' + item._id"
+                                       class="text-xl font-bold text-yellow-500 leading-tight hover:underline">
+                                        <span x-text="item.primaryTitle"></span>
+                                        <span class="text-gray-400 font-normal ml-2 text-base"
+                                              x-text="item.startYear ? '(' + item.startYear + ')' : ''"></span>
+                                    </a>
+                                    <span class="bg-gray-700 text-xs px-2 py-1 rounded text-gray-300">movie</span>
+                                </div>
 
-                        <div class="mt-2 text-sm text-gray-300 grid grid-cols-2 md:grid-cols-4 gap-y-1 gap-x-4">
-                            <div>
-                                <span class="text-gray-500">Rating:</span> <span x-text="item.averageRating"></span>
-                            </div>
-                            <div>
-                                <span class="text-gray-500">Votes:</span> <span x-text="item.numVotes"></span>
-                            </div>
-                            <div>
-                                <span class="text-gray-500">Runtime:</span> <span x-text="item.runtimeMinutes + 'm'"></span>
-                            </div>
-                            <div>
-                                <span class="text-gray-500">Crew:</span> <span x-text="item.peopleCount"></span>
-                            </div>
-                        </div>
+                                <div class="mt-2 text-sm text-gray-300 grid grid-cols-2 md:grid-cols-4 gap-y-1 gap-x-4">
+                                    <div>
+                                        <span class="text-gray-500">Rating:</span>
+                                        <span x-text="item.averageRating"></span>
+                                    </div>
+                                    <div>
+                                        <span class="text-gray-500">Votes:</span>
+                                        <span x-text="item.numVotes"></span>
+                                    </div>
+                                    <div>
+                                        <span class="text-gray-500">Runtime:</span>
+                                        <span x-text="item.runtimeMinutes + 'm'"></span>
+                                    </div>
+                                    <div>
+                                        <span class="text-gray-500">Crew:</span>
+                                        <span x-text="item.peopleCount"></span>
+                                    </div>
+                                </div>
 
-                        <div class="mt-3">
-                            <div class="flex flex-wrap gap-2">
-                                <template x-for="genre in (item.genres || '').split(' ')" :key="genre">
-                                    <span x-show="genre && genre.indexOf(':') === -1" 
-                                          class="px-2 py-0.5 bg-blue-900 text-blue-200 text-xs rounded border border-blue-800" 
-                                          x-text="genre"></span>
-                                </template>
+                                <div class="mt-3">
+                                    <div class="flex flex-wrap gap-2">
+                                        <template x-for="genre in (item.genres || '').split(' ')" :key="genre">
+                                            <span x-show="genre && genre.indexOf(':') === -1"
+                                                  class="px-2 py-0.5 bg-blue-900 text-blue-200 text-xs rounded border border-blue-800"
+                                                  x-text="genre"></span>
+                                        </template>
+                                    </div>
+                                </div>
                             </div>
-                        </div>
+                        </template>
+
+                        <template x-if="item.titleType === 'person'">
+                            <div>
+                                <div class="flex justify-between items-start">
+                                    <a :href="'/person/' + item._id"
+                                       class="text-xl font-bold text-yellow-500 leading-tight hover:underline">
+                                        <span x-text="item.primaryName"></span>
+                                        <span class="text-gray-400 font-normal ml-2 text-base"
+                                              x-show="item.birthYear"
+                                              x-text="'(b. ' + item.birthYear + ')'"></span>
+                                    </a>
+                                    <span class="bg-gray-700 text-xs px-2 py-1 rounded text-gray-300">person</span>
+                                </div>
+
+                                <div class="mt-2 text-sm text-gray-300 grid grid-cols-2 md:grid-cols-3 gap-y-1 gap-x-4">
+                                    <div>
+                                        <span class="text-gray-500">Birth:</span>
+                                        <span x-text="item.birthYear || '–'"></span>
+                                    </div>
+                                    <div>
+                                        <span class="text-gray-500">Death:</span>
+                                        <span x-text="item.deathYear || '–'"></span>
+                                    </div>
+                                    <div>
+                                        <span class="text-gray-500">Credits:</span>
+                                        <span x-text="item.titleCount"></span>
+                                    </div>
+                                </div>
+
+                                <div class="mt-3">
+                                    <div class="flex flex-wrap gap-2">
+                                        <template x-for="prof in (item.professions || '').split(' ')" :key="prof">
+                                            <span x-show="prof && prof.indexOf(':') === -1"
+                                                  class="px-2 py-0.5 bg-purple-900 text-purple-200 text-xs rounded border border-purple-800"
+                                                  x-text="prof"></span>
+                                        </template>
+                                    </div>
+                                </div>
+                            </div>
+                        </template>
                     </div>
                 </div>
             </template>
 
-            <!-- Empty State -->
             <div x-show="!isLoading && results.length === 0 && hasSearched" x-cloak class="text-center text-gray-500 py-12">
-                No results found. Try a different title.
+                No results found. Try a different query.
             </div>
-            
-            <!-- Loading State -->
+
             <div x-show="isLoading" x-cloak class="text-center py-12">
                 <div class="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-yellow-500"></div>
-                <p class="mt-2 text-gray-500">Searching vector space...</p>
+                <p class="mt-2 text-gray-500">Searching latent space...</p>
             </div>
         </div>
     </div>

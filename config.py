@@ -32,12 +32,12 @@ class ProjectConfig:
     lr_warmup_ratio: float = 0.0
     lr_min_factor: float = 0.05
 
-    hybrid_set_epochs: int = 100
+    hybrid_set_epochs: int = 300
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_movie_dim: int = 256
-    hybrid_set_hidden_dim: int = 512
+    hybrid_set_hidden_dim: int = 1024
     hybrid_set_person_dim: int = 256
     
     hybrid_set_w_bce: float = 1.0

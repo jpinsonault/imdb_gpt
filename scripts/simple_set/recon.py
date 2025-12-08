@@ -264,7 +264,6 @@ class HybridSetReconLogger:
                 probs = torch.sigmoid(logits_dict[head][local_idx])
                 probs_cpu = probs.float().cpu().numpy()
                 pred_local_idxs = set(np.where(probs_cpu > self.threshold)[0])
-                pred_count = float(probs_cpu.sum())
 
                 tp_local = true_local_idxs & pred_local_idxs
                 fp_local = pred_local_idxs - true_local_idxs
@@ -289,7 +288,6 @@ class HybridSetReconLogger:
                     return items[:10]
 
                 lines.append(f"\n--- Head: {head.upper()} (Person -> Movies) ---")
-                lines.append(f"Count: True={int(true_count)} Pred={pred_count:.1f}")
                 lines.append(self._format_list(fmt(tp_local), "[+] Match"))
                 lines.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
                 lines.append(self._format_list(fmt(fn_local), "[-] Missed"))

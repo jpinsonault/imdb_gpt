@@ -5,12 +5,12 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
 
-from scripts.inference import MovieSearchEngine
+from scripts.inference import HybridSearchEngine
 
 app = Flask(__name__)
 
 print("Loading Search Engine... please wait.")
-engine = MovieSearchEngine()
+engine = HybridSearchEngine()
 print("Search Engine Loaded.")
 
 
@@ -52,17 +52,19 @@ def _passes_filters(row, filters):
 
 @app.route("/api/search", methods=["POST"])
 def search_api():
-    data = request.json
-    if not data:
-        return jsonify({"error": "No JSON payload provided"}), 400
-
+    data = request.json or {}
     query = data.get("query", "") or ""
     top_k = int(data.get("top_k", 50) or 50)
     filters = data.get("filters", {}) or {}
+    search_type = (data.get("search_type") or "movie").strip().lower()
 
     try:
-        raw_results = engine.search_by_title(query, top_k=top_k)
-        filtered_results = [r for r in raw_results if _passes_filters(r, filters)]
+        if search_type == "person":
+            raw_results = engine.search_people(query, top_k=top_k)
+            filtered_results = raw_results
+        else:
+            raw_results = engine.search_movies(query, top_k=top_k)
+            filtered_results = [r for r in raw_results if _passes_filters(r, filters)]
 
         return jsonify(
             {
@@ -71,11 +73,60 @@ def search_api():
                 "interpreted_query": {
                     "primaryTitle": query.strip(),
                     "filters": filters,
+                    "search_type": search_type,
                 },
             }
         )
     except Exception as e:
         logging.error(f"Search error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/movie/<int:movie_id>")
+def movie_page(movie_id: int):
+    try:
+        detail = engine.get_movie_detail(movie_id)
+    except KeyError:
+        return "Movie not found", 404
+    except Exception as e:
+        logging.error(f"Movie detail error: {e}", exc_info=True)
+        return "Internal error", 500
+    return render_template("movie.html", movie=detail)
+
+
+@app.route("/person/<int:person_id>")
+def person_page(person_id: int):
+    try:
+        detail = engine.get_person_detail(person_id)
+    except KeyError:
+        return "Person not found", 404
+    except Exception as e:
+        logging.error(f"Person detail error: {e}", exc_info=True)
+        return "Internal error", 500
+    return render_template("person.html", person=detail)
+
+
+@app.route("/api/movie/<int:movie_id>")
+def movie_detail_api(movie_id: int):
+    try:
+        detail = engine.get_movie_detail(movie_id)
+        return jsonify(detail)
+    except KeyError:
+        return jsonify({"error": "Movie not found"}), 404
+    except Exception as e:
+        logging.error(f"Movie detail API error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/person/<int:person_id>")
+def person_detail_api(person_id: int):
+    try:
+        detail = engine.get_person_detail(person_id)
+        return jsonify(detail)
+    except KeyError:
+        return jsonify({"error": "Person not found"}), 404
+    except Exception as e:
+        logging.error(f"Person detail API error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
