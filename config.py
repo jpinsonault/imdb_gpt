@@ -36,7 +36,7 @@ class ProjectConfig:
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
-    hybrid_set_latent_dim: int = 256
+    hybrid_set_movie_dim: int = 256
     hybrid_set_hidden_dim: int = 512
     hybrid_set_person_dim: int = 256
     

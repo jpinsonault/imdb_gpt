@@ -1,8 +1,12 @@
+# scripts/train_simple_set.py
+
 import argparse
 import logging
 import json
 import signal
 import math
+import time
+import sys
 from pathlib import Path
 from dataclasses import asdict
 
@@ -10,14 +14,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.amp
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import project_config, ensure_dirs
 from scripts.autoencoder.run_logger import RunLogger
+from scripts.autoencoder.print_model import print_model_summary
 from scripts.simple_set.precompute import ensure_hybrid_cache
 from scripts.simple_set.model import HybridSetModel
-from scripts.simple_set.data import HybridSetDataset, FastInfiniteLoader, FastInfinitePeopleLoader
-from scripts.simple_set.inspect import print_hybrid_model_sections
+from scripts.simple_set.data import HybridSetDataset, PersonHybridSetDataset
+from scripts.simple_set.recon import HybridSetReconLogger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -82,7 +88,11 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
         with open(config_path, "w") as f:
             json.dump(asdict(config), f, indent=4)
         model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-        state = {"epoch": int(epoch), "global_step": int(global_step), "model_state_dict": model_state}
+        state = {
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "model_state_dict": model_state,
+        }
         torch.save(state, state_path)
         logging.info(f"Saved training state to {state_path}")
     except Exception as e:
@@ -100,29 +110,42 @@ def main():
         cfg.refresh_cache = False
 
     cache_path = ensure_hybrid_cache(cfg)
-    ds = HybridSetDataset(str(cache_path), cfg)
-    movie_loader = FastInfiniteLoader(ds, batch_size=cfg.batch_size, shuffle=True)
-    people_loader = FastInfinitePeopleLoader(ds, batch_size=cfg.batch_size, shuffle=True)
+
+    movie_ds = HybridSetDataset(str(cache_path), cfg)
+    person_ds = PersonHybridSetDataset(str(cache_path), cfg)
+
+    movie_loader = DataLoader(
+        movie_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
+    person_loader = DataLoader(
+        person_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        drop_last=False,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = HybridSetModel(
-        fields=ds.fields,
-        num_people=ds.num_people,
+        movie_fields=movie_ds.fields,
+        person_fields=person_ds.fields,
+        num_movies=len(movie_ds),
+        num_people=movie_ds.num_people,
         heads_config=cfg.hybrid_set_heads,
-        head_vocab_sizes=ds.head_vocab_sizes,
-        head_local_to_global=ds.head_local_to_global,
-        latent_dim=cfg.hybrid_set_latent_dim,
+        movie_head_vocab_sizes=movie_ds.head_vocab_sizes,
+        movie_head_local_to_global=movie_ds.head_local_to_global,
+        person_head_vocab_sizes=person_ds.head_vocab_sizes,
+        person_head_local_to_global=person_ds.head_local_to_global,
+        movie_dim=cfg.hybrid_set_movie_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
         person_dim=cfg.hybrid_set_person_dim,
         dropout=cfg.hybrid_set_dropout,
-        num_movies=len(ds),
         hybrid_set_logit_scale=cfg.hybrid_set_logit_scale,
     )
     model.to(device)
-
-    sample_inputs_cpu, _, sample_idx = next(movie_loader)
-    print_hybrid_model_sections(model, sample_inputs_cpu, sample_idx, device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -130,31 +153,37 @@ def main():
         weight_decay=cfg.hybrid_set_weight_decay,
     )
 
-    mapping_tensors = {}
-    if hasattr(ds, "head_mappings"):
-        for name, t in ds.head_mappings.items():
-            mapping_tensors[name] = t.to(device)
+    sample_idx = next(iter(movie_loader))
+    print("\n" + "=" * 50)
+    print_model_summary(model, {"movie_indices": sample_idx.to(device)})
+    print("=" * 50 + "\n")
 
-    head_true_counts = {}
-    if hasattr(ds, "heads_padded"):
-        for head_name, padded in ds.heads_padded.items():
-            mask = padded != -1
-            head_true_counts[head_name] = mask.sum(dim=1, keepdim=True)
+    movie_mapping_tensors = {}
+    if hasattr(movie_ds, "head_mappings"):
+        for name, t in movie_ds.head_mappings.items():
+            movie_mapping_tensors[name] = t.to(device)
 
-    scaler = torch.amp.GradScaler("cuda")
+    person_mapping_tensors = {}
+    if hasattr(person_ds, "head_mappings"):
+        for name, t in person_ds.head_mappings.items():
+            person_mapping_tensors[name] = t.to(device)
+
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else torch.amp.GradScaler("cpu")
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
-    from scripts.simple_set.recon import HybridSetReconLogger
-
-    recon_logger = HybridSetReconLogger(ds, interval_steps=int(cfg.hybrid_set_recon_interval))
+    recon_logger = HybridSetReconLogger(
+        movie_ds,
+        person_ds,
+        interval_steps=int(cfg.hybrid_set_recon_interval),
+    )
 
     criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction="mean").to(device)
 
     num_epochs = int(cfg.hybrid_set_epochs)
-    movie_steps_per_epoch = len(movie_loader)
-    people_steps_per_epoch = len(people_loader)
-    batches_per_epoch = min(movie_steps_per_epoch, people_steps_per_epoch)
+    movie_steps = len(movie_loader)
+    person_steps = len(person_loader)
+    max_steps_per_epoch = max(movie_steps, person_steps)
+    total_steps = max_steps_per_epoch * num_epochs
 
-    total_steps = batches_per_epoch * num_epochs
     sched = make_lr_scheduler(
         optimizer,
         total_steps,
@@ -173,104 +202,144 @@ def main():
             start_epoch = c.get("epoch", 0)
             global_step = c.get("global_step", 0)
             logging.info(f"Resumed from epoch {start_epoch}")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Failed to resume from checkpoint: {e}")
 
     stopper = GracefulStopper()
 
     for epoch in range(start_epoch, num_epochs):
-        pbar = tqdm(range(batches_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
-        for step in pbar:
+        movie_iter = iter(movie_loader)
+        person_iter = iter(person_loader)
+
+        pbar = tqdm(range(max_steps_per_epoch), dynamic_ncols=True, desc=f"Epoch {epoch+1}")
+        for _ in pbar:
             if stopper.stop:
                 pbar.close()
                 break
 
-            movie_step = (step % 2 == 0)
-            collect = movie_step and ((global_step + 1) % recon_logger.every == 0)
-            coords_log = {}
-            counts_log = {}
+            try:
+                batch_movie_idx = next(movie_iter)
+            except StopIteration:
+                batch_movie_idx = None
+
+            try:
+                batch_person_idx = next(person_iter)
+            except StopIteration:
+                batch_person_idx = None
+
+            if batch_movie_idx is None and batch_person_idx is None:
+                continue
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
 
-            if movie_step:
-                inputs_cpu, heads_padded_cpu, indices_cpu = next(movie_loader)
-                inputs = [x.to(device, non_blocking=True) for x in inputs_cpu]
+            with torch.amp.autocast(device_type=device.type):
+                total_loss = None
 
-                with torch.amp.autocast("cuda"):
-                    logits_dict, recon_table, _ = model.forward_movie(inputs, indices_cpu)
+                movie_set_loss = torch.tensor(0.0, device=device)
+                movie_recon_loss = torch.tensor(0.0, device=device)
+                person_set_loss = torch.tensor(0.0, device=device)
+                person_recon_loss = torch.tensor(0.0, device=device)
 
-                    recon_loss = 0.0
-                    for f, p, t in zip(ds.fields, recon_table, inputs):
-                        recon_loss += f.compute_loss(p, t) * f.weight
+                if batch_movie_idx is not None:
+                    idx_m = batch_movie_idx.to(device, non_blocking=True).long()
+                    outputs_m = model(movie_indices=idx_m)
+                    movie_out = outputs_m.get("movie")
+                    if movie_out is not None:
+                        logits_dict_m, recon_table_m, _, _ = movie_out
+                        movie_inputs = [
+                            t[batch_movie_idx].to(device, non_blocking=True)
+                            for t in movie_ds.stacked_fields
+                        ]
 
-                    set_loss_total = 0.0
+                        for f, p, t_in in zip(movie_ds.fields, recon_table_m, movie_inputs):
+                            movie_recon_loss = movie_recon_loss + f.compute_loss(p, t_in) * f.weight
 
-                    for head_name, logits in logits_dict.items():
-                        raw_padded = heads_padded_cpu[head_name].to(device, non_blocking=True)
-                        mask = raw_padded != -1
-                        rows, cols = torch.nonzero(mask, as_tuple=True)
+                        for head_name, logits in logits_dict_m.items():
+                            mapping = movie_mapping_tensors.get(head_name)
+                            padded = movie_ds.heads_padded.get(head_name)
+                            if mapping is None or padded is None:
+                                continue
+                            raw_padded = padded[batch_movie_idx]
+                            raw_padded = raw_padded.to(device, non_blocking=True)
 
-                        targets = torch.zeros_like(logits)
-                        if rows.numel() > 0:
-                            glob = raw_padded[rows, cols].long()
-                            loc = mapping_tensors[head_name][glob]
-                            valid = loc != -1
-                            if valid.any():
-                                rows_v = rows[valid]
-                                loc_v = loc[valid]
-                                targets[rows_v, loc_v] = 1.0
-                                if collect:
-                                    ds_rows = indices_cpu.to(device)[rows_v]
-                                    coords_log[head_name] = torch.stack([ds_rows, loc_v], dim=1).cpu()
+                            mask = raw_padded != -1
+                            rows, cols = torch.nonzero(mask, as_tuple=True)
 
-                        if collect and head_name in head_true_counts:
-                            counts_log[head_name] = head_true_counts[head_name]
+                            targets = torch.zeros_like(logits)
+                            if rows.numel() > 0:
+                                glob = raw_padded[rows, cols].long()
+                                loc = mapping[glob]
+                                valid = loc != -1
+                                if valid.any():
+                                    rows_v, loc_v = rows[valid], loc[valid]
+                                    targets[rows_v, loc_v] = 1.0
 
-                        set_loss_total += criterion_set(logits, targets)
+                            movie_set_loss = movie_set_loss + criterion_set(logits, targets)
 
-                    loss = cfg.hybrid_set_w_bce * set_loss_total + cfg.hybrid_set_w_recon * recon_loss
-            else:
-                heads_padded_people_cpu, person_indices_cpu = next(people_loader)
-                person_indices_cpu = person_indices_cpu.to(device, non_blocking=True)
+                        movie_loss_total = cfg.hybrid_set_w_bce * movie_set_loss + cfg.hybrid_set_w_recon * movie_recon_loss
+                        total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
 
-                with torch.amp.autocast("cuda"):
-                    logits_dict_p, _ = model.forward_person(person_indices_cpu)
+                if batch_person_idx is not None:
+                    idx_p = batch_person_idx.to(device, non_blocking=True).long()
+                    outputs_p = model(person_indices=idx_p)
+                    person_out = outputs_p.get("person")
+                    if person_out is not None:
+                        logits_dict_p, recon_table_p, _, _ = person_out
+                        person_inputs = [
+                            t[batch_person_idx].to(device, non_blocking=True)
+                            for t in person_ds.stacked_fields
+                        ]
 
-                    set_loss_total = 0.0
+                        for f, p_pred, t_in in zip(person_ds.fields, recon_table_p, person_inputs):
+                            person_recon_loss = person_recon_loss + f.compute_loss(p_pred, t_in) * f.weight
 
-                    for head_name, logits in logits_dict_p.items():
-                        raw_padded = heads_padded_people_cpu[head_name].to(device, non_blocking=True)
-                        mask = raw_padded != -1
-                        rows, cols = torch.nonzero(mask, as_tuple=True)
+                        for head_name, logits in logits_dict_p.items():
+                            mapping = person_mapping_tensors.get(head_name)
+                            padded = person_ds.heads_padded.get(head_name)
+                            if mapping is None or padded is None:
+                                continue
+                            raw_padded = padded[batch_person_idx]
+                            raw_padded = raw_padded.to(device, non_blocking=True)
 
-                        targets = torch.zeros_like(logits)
-                        if rows.numel() > 0:
-                            movies = raw_padded[rows, cols].long()
-                            targets[rows, movies] = 1.0
+                            mask = raw_padded != -1
+                            rows, cols = torch.nonzero(mask, as_tuple=True)
 
-                        set_loss_total += criterion_set(logits, targets)
+                            targets = torch.zeros_like(logits)
+                            if rows.numel() > 0:
+                                glob = raw_padded[rows, cols].long()
+                                loc = mapping[glob]
+                                valid = loc != -1
+                                if valid.any():
+                                    rows_v, loc_v = rows[valid], loc[valid]
+                                    targets[rows_v, loc_v] = 1.0
 
-                    recon_loss = 0.0
-                    loss = cfg.hybrid_set_w_bce * set_loss_total
+                            person_set_loss = person_set_loss + criterion_set(logits, targets)
 
-            scaler.scale(loss).backward()
+                        person_loss_total = cfg.hybrid_set_w_bce * person_set_loss + cfg.hybrid_set_w_recon * person_recon_loss
+                        total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
+
+                if total_loss is None:
+                    continue
+
+            scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
             if sched:
                 sched.step()
 
             if run_logger:
-                run_logger.add_scalar("loss/total", loss.item(), global_step)
-                run_logger.add_scalar("loss/set", set_loss_total.item(), global_step)
+                run_logger.add_scalar("loss/total", total_loss.item(), global_step)
+                run_logger.add_scalar("loss/movie_set", movie_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/movie_recon", movie_recon_loss.item(), global_step)
+                run_logger.add_scalar("loss/person_set", person_set_loss.item(), global_step)
+                run_logger.add_scalar("loss/person_recon", person_recon_loss.item(), global_step)
                 run_logger.add_scalar("opt/lr", optimizer.param_groups[0]["lr"], global_step)
                 run_logger.tick()
 
-            if movie_step and collect:
-                recon_logger.step(global_step, model, inputs, indices_cpu, coords_log, counts_log, run_logger)
+            recon_logger.step(global_step, model, run_logger)
 
-            mode_str = "movie" if movie_step else "person"
-            pbar.set_postfix(mode=mode_str, loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{total_loss.item():.4f}")
             global_step += 1
 
             if global_step % cfg.hybrid_set_save_interval == 0:
@@ -278,6 +347,7 @@ def main():
 
         if stopper.stop:
             print("[GracefulStopper] Training loop exited. Final save...")
+            save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch, global_step, cfg)
             break
 
         save_checkpoint(Path(cfg.model_dir), model, optimizer, sched, epoch + 1, global_step, cfg)
