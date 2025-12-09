@@ -83,20 +83,29 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
 def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
+
         config_path = model_dir / "hybrid_set_config.json"
-        state_path = model_dir / "hybrid_set_state.pt"
         with open(config_path, "w") as f:
             json.dump(asdict(config), f, indent=4)
+
+        tmp_path = model_dir / "hybrid_set_state.tmp"
+        final_path = model_dir / "hybrid_set_state.pt"
+
         model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
         state = {
             "epoch": int(epoch),
             "global_step": int(global_step),
             "model_state_dict": model_state,
         }
-        torch.save(state, state_path)
-        logging.info(f"Saved training state to {state_path}")
+
+        torch.save(state, tmp_path)
+        tmp_path.replace(final_path)
+
+        logging.info(f"Saved training state to {final_path}")
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
+
 
 
 def main():
