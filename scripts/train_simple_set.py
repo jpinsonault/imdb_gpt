@@ -90,6 +90,7 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
 
         tmp_path = model_dir / "hybrid_set_state.tmp"
         final_path = model_dir / "hybrid_set_state.pt"
+        json_state_path = model_dir / "hybrid_set_state.json"
 
         model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
@@ -99,13 +100,86 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "model_state_dict": model_state,
         }
 
+        # Binary checkpoint
         torch.save(state, tmp_path)
         tmp_path.replace(final_path)
 
-        logging.info(f"Saved training state to {final_path}")
+        # JSON sidecar with editable basic state info
+        json_state = {
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "max_epochs": int(config.hybrid_set_epochs),
+        }
+        with open(json_state_path, "w") as f_json:
+            json.dump(json_state, f_json, indent=4)
+
+        logging.info(f"Saved training state to {final_path} and {json_state_path}")
     except Exception as e:
         logging.error(f"Failed to save training state: {e}")
 
+
+def _count_module_params(module: nn.Module):
+    total = 0
+    trainable = 0
+    for p in module.parameters():
+        n = int(p.numel())
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return total, trainable
+
+
+def print_param_summary(model: nn.Module):
+    total_params, total_trainable = _count_module_params(model)
+
+    movie_field_params, movie_field_trainable = _count_module_params(model.movie_field_decoder)
+    person_field_params, person_field_trainable = _count_module_params(model.person_field_decoder)
+
+    movie_head_params, movie_head_trainable = _count_module_params(model.movie_heads)
+    person_head_params, person_head_trainable = _count_module_params(model.person_heads)
+
+    movie_emb_params, movie_emb_trainable = _count_module_params(model.movie_embeddings)
+    person_emb_params, person_emb_trainable = _count_module_params(model.person_embeddings)
+
+    print("\n" + "=" * 50)
+    print("Parameter summary by component")
+    print("-" * 50)
+
+    print("Field reconstruction modules:")
+    print(f"  movie_field_decoder   total={movie_field_params:10d}  trainable={movie_field_trainable:10d}")
+    print(f"  person_field_decoder  total={person_field_params:10d}  trainable={person_field_trainable:10d}")
+
+    print("\nSet relation heads:")
+    print(f"  movie_heads           total={movie_head_params:10d}  trainable={movie_head_trainable:10d}")
+    print(f"  person_heads          total={person_head_params:10d}  trainable={person_head_trainable:10d}")
+
+    print("\nEmbedding tables:")
+    print(f"  movie_embeddings      total={movie_emb_params:10d}  trainable={movie_emb_trainable:10d}")
+    print(f"  person_embeddings     total={person_emb_params:10d}  trainable={person_emb_trainable:10d}")
+
+    accounted_total = (
+        movie_field_params
+        + person_field_params
+        + movie_head_params
+        + person_head_params
+        + movie_emb_params
+        + person_emb_params
+    )
+    accounted_trainable = (
+        movie_field_trainable
+        + person_field_trainable
+        + movie_head_trainable
+        + person_head_trainable
+        + movie_emb_trainable
+        + person_emb_trainable
+    )
+
+    print("\n" + "-" * 50)
+    print(f"{'Accounted total params:':25s} {accounted_total:10d}")
+    print(f"{'Accounted trainable:':25s} {accounted_trainable:10d}")
+    print(f"{'Model total params:':25s} {total_params:10d}")
+    print(f"{'Model trainable:':25s} {total_trainable:10d}")
+    print("=" * 50 + "\n")
 
 
 def main():
@@ -162,10 +236,20 @@ def main():
         weight_decay=cfg.hybrid_set_weight_decay,
     )
 
-    sample_idx = next(iter(movie_loader))
+    # --- Model summary: run both movie and person paths ---
+    sample_movie_idx = next(iter(movie_loader))
+    sample_person_idx = next(iter(person_loader))
+
+    sample_inputs = {
+        "movie_indices": sample_movie_idx.to(device),
+        "person_indices": sample_person_idx.to(device),
+    }
+
     print("\n" + "=" * 50)
-    print_model_summary(model, {"movie_indices": sample_idx.to(device)})
+    print_model_summary(model, sample_inputs)
     print("=" * 50 + "\n")
+
+    print_param_summary(model)
 
     movie_mapping_tensors = {}
     if hasattr(movie_ds, "head_mappings"):
@@ -204,13 +288,25 @@ def main():
 
     start_epoch, global_step = 0, 0
     ckpt_path = Path(cfg.model_dir) / "hybrid_set_state.pt"
+    json_state_path = Path(cfg.model_dir) / "hybrid_set_state.json"
+
     if ckpt_path.exists() and not args.no_resume:
         try:
             c = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(c["model_state_dict"])
             start_epoch = c.get("epoch", 0)
             global_step = c.get("global_step", 0)
-            logging.info(f"Resumed from epoch {start_epoch}")
+
+            if json_state_path.exists():
+                try:
+                    with open(json_state_path, "r") as f:
+                        state_override = json.load(f)
+                    start_epoch = int(state_override.get("epoch", start_epoch))
+                    global_step = int(state_override.get("global_step", global_step))
+                except Exception as e:
+                    logging.warning(f"Failed to load JSON state from {json_state_path}: {e}")
+
+            logging.info(f"Resumed from epoch {start_epoch}, global_step {global_step}")
         except Exception as e:
             logging.warning(f"Failed to resume from checkpoint: {e}")
 
@@ -261,8 +357,8 @@ def main():
                             for t in movie_ds.stacked_fields
                         ]
 
-                        for f, p, t_in in zip(movie_ds.fields, recon_table_m, movie_inputs):
-                            movie_recon_loss = movie_recon_loss + f.compute_loss(p, t_in) * f.weight
+                        for f, p_pred, t_in in zip(movie_ds.fields, recon_table_m, movie_inputs):
+                            movie_recon_loss = movie_recon_loss + f.compute_loss(p_pred, t_in) * f.weight
 
                         for head_name, logits in logits_dict_m.items():
                             mapping = movie_mapping_tensors.get(head_name)
@@ -373,6 +469,7 @@ def main():
     if run_logger:
         run_logger.close()
     print("Done.")
+
 
 
 if __name__ == "__main__":
