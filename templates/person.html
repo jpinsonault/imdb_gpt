@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ person.name }} – Person Detail</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen font-sans">
+    <div class="container mx-auto px-4 py-8 max-w-5xl">
+        <div class="mb-6 flex items-center justify-between">
+            <a href="/" class="text-sm text-gray-400 hover:text-gray-200 underline">Back to search</a>
+            <span class="text-xs text-gray-500">Person index: {{ person.person_index }}, nconst: {{ person.nconst }}</span>
+        </div>
+
+        <div class="mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold text-yellow-500">
+                {{ person.db.row.primaryName or person.name }}
+            </h1>
+            <p class="text-sm text-gray-400 mt-1">
+                Birth: {{ person.db.row.birthYear or "?" }} ·
+                Death: {{ person.db.row.deathYear or "–" }} ·
+                Credits: {{ person.db.row.titleCount or "?" }}
+            </p>
+        </div>
+
+        <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 mb-6">
+            <h2 class="text-lg font-semibold mb-3 text-gray-100">Core Fields (DB vs Reconstruction)</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-gray-700 text-gray-400">
+                            <th class="text-left py-2 pr-4">Field</th>
+                            <th class="text-left py-2 pr-4">Database</th>
+                            <th class="text-left py-2">Reconstruction</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for field in person.reconstructed.fields %}
+                            <tr class="border-b border-gray-800">
+                                <td class="py-1 pr-4 text-gray-300">{{ field.name }}</td>
+                                <td class="py-1 pr-4 text-gray-100">{{ field.db }}</td>
+                                <td class="py-1 text-gray-100">{{ field.recon }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="grid md:grid-cols-3 gap-4">
+            {% for head in ['cast', 'director', 'writer'] %}
+                <div class="bg-gray-800 border border-gray-700 rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3 text-gray-100">
+                        {{ head|capitalize }} credits
+                        <span class="text-xs text-gray-500">(DB vs model)</span>
+                    </h2>
+
+                    <div class="grid gap-3">
+                        <div>
+                            <h3 class="text-xs uppercase tracking-wide text-gray-500 mb-1">Database (principals)</h3>
+                            {% set db_list = person.db.movies_by_head.get(head, []) %}
+                            {% if db_list %}
+                                <ul class="space-y-1 text-sm">
+                                    {% for m in db_list %}
+                                        <li>
+                                            {% if m.movie_index is not none %}
+                                                <a href="/movie/{{ m.movie_index }}" class="text-blue-300 hover:underline">
+                                                    {{ m.primaryTitle }}
+                                                </a>
+                                            {% else %}
+                                                <span class="text-gray-100">{{ m.primaryTitle }}</span>
+                                            {% endif %}
+                                            <span class="text-gray-500 text-xs">
+                                                ({{ m.category }}, {{ m.tconst }},
+                                                {{ m.startYear if m.startYear is not none else "?" }})
+                                            </span>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="text-xs text-gray-500">No titles in DB for this head.</p>
+                            {% endif %}
+                        </div>
+
+                        <div>
+                            <h3 class="text-xs uppercase tracking-wide text-gray-500 mb-1">Model prediction</h3>
+                            {% set pred_list = person.reconstructed.movies_by_head.get(head, []) %}
+                            {% if pred_list %}
+                                <ul class="space-y-1 text-sm">
+                                    {% for m in pred_list %}
+                                        <li>
+                                            {% if m.movie_index is not none %}
+                                                <a href="/movie/{{ m.movie_index }}"
+                                                   class="hover:underline {% if m.is_true %}text-green-300{% else %}text-red-300{% endif %}">
+                                                    {{ m.primaryTitle }}
+                                                </a>
+                                            {% else %}
+                                                <span class="{% if m.is_true %}text-green-300{% else %}text-red-300{% endif %}">
+                                                    {{ m.primaryTitle }}
+                                                </span>
+                                            {% endif %}
+                                            <span class="text-gray-500 text-xs">
+                                                ({{ "%.2f"|format(m.prob) }}, {{ m.tconst }})
+                                                {% if m.is_true %} · matches DB{% endif %}
+                                            </span>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="text-xs text-gray-500">No predictions above threshold.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>
