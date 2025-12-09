@@ -28,16 +28,16 @@ class ProjectConfig:
     principals_table: str = "principals"
     
     lr_schedule: str = "cosine"
-    lr_warmup_steps: int = 1000
+    lr_warmup_steps: int = 2000
     lr_warmup_ratio: float = 0.0
     lr_min_factor: float = 0.05
 
-    hybrid_set_epochs: int = 200
+    hybrid_set_epochs: int = 400
     hybrid_set_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_movie_dim: int = 256
-    hybrid_set_hidden_dim: int = 1024
+    hybrid_set_hidden_dim: int = 2048
     hybrid_set_person_dim: int = 256
     
     hybrid_set_w_bce: float = 1.0
