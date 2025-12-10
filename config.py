@@ -43,8 +43,8 @@ class ProjectConfig:
     
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_recon: float = 0.5
-    hybrid_set_film_reg: float = 1e-3
 
+    hybrid_set_film_reg: float = 1e-3
     hybrid_set_logit_scale: float = 20.0
 
     hybrid_set_save_interval: int = 500
@@ -54,14 +54,26 @@ class ProjectConfig:
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,
-        "writer": 0.5
+        "writer": 0.5,
     })
 
     hybrid_set_head_groups: Dict[str, int] = field(default_factory=lambda: {
         "cast": 20,
         "director": 4,
-        "writer": 8
+        "writer": 8,
     })
+
+    hybrid_set_focal_alpha: float = 0.25
+    hybrid_set_focal_gamma: float = 2.0
+
+    hybrid_set_movie_count_loss_weight: float = 0.1
+    hybrid_set_person_count_loss_weight: float = 0.1
+
+    hybrid_set_film_bottleneck_dim: int = 128
+
+    hybrid_set_recon_num_samples: int = 3
+    hybrid_set_recon_table_width: int = 80
+    hybrid_set_recon_threshold: float = 0.5
 
     use_cache: bool = True
     refresh_cache: bool = False

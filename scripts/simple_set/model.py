@@ -16,9 +16,9 @@ class SetHead(nn.Module):
         vocab_size,
         hidden_dim,
         local_to_global,
-        dropout=0.1,
-        init_scale=20.0,
-        film_bottleneck=None,
+        dropout,
+        init_scale,
+        film_bottleneck_dim,
     ):
         super().__init__()
 
@@ -35,7 +35,10 @@ class SetHead(nn.Module):
         if self.use_res:
             self.res_scale = nn.Parameter(torch.tensor(0.1))
 
-        bottleneck_dim = int(film_bottleneck) if film_bottleneck is not None else max(1, self.in_dim // 2)
+        bottleneck_dim = int(film_bottleneck_dim)
+        if bottleneck_dim <= 0:
+            raise ValueError("film_bottleneck_dim must be > 0")
+
         self.film_bottleneck = nn.Linear(self.in_dim, bottleneck_dim)
         self.film_act = nn.GELU()
         self.film_out = nn.Linear(bottleneck_dim, self.hidden_dim * 2)
@@ -78,7 +81,7 @@ class SetHead(nn.Module):
         if self.training:
             gamma_centered = gamma - gamma.mean(dim=0, keepdim=True)
             beta_centered = beta - beta.mean(dim=0, keepdim=True)
-            self.last_reg = (gamma_centered.pow(2).mean() + beta_centered.pow(2).mean())
+            self.last_reg = gamma_centered.pow(2).mean() + beta_centered.pow(2).mean()
         else:
             self.last_reg = None
 
@@ -120,11 +123,12 @@ class HybridSetModel(nn.Module):
         movie_head_local_to_global,
         person_head_vocab_sizes,
         person_head_local_to_global,
-        movie_dim=256,
-        hidden_dim=1024,
-        person_dim=None,
-        dropout=0.1,
-        **kwargs,
+        movie_dim,
+        hidden_dim,
+        person_dim,
+        dropout,
+        logit_scale,
+        film_bottleneck_dim,
     ):
         super().__init__()
 
@@ -162,8 +166,6 @@ class HybridSetModel(nn.Module):
         self.movie_heads = nn.ModuleDict()
         self.person_heads = nn.ModuleDict()
 
-        init_scale = kwargs.get("hybrid_set_logit_scale", 20.0)
-
         for name, _ in heads_config.items():
             mvocab = int(movie_head_vocab_sizes.get(name, 0))
             m_l2g = movie_head_local_to_global.get(name)
@@ -175,7 +177,8 @@ class HybridSetModel(nn.Module):
                     hidden_dim=hidden_dim,
                     local_to_global=m_l2g,
                     dropout=dropout,
-                    init_scale=init_scale,
+                    init_scale=logit_scale,
+                    film_bottleneck_dim=film_bottleneck_dim,
                 )
 
             pvocab = int(person_head_vocab_sizes.get(name, 0))
@@ -188,7 +191,8 @@ class HybridSetModel(nn.Module):
                     hidden_dim=hidden_dim,
                     local_to_global=p_l2g,
                     dropout=dropout,
-                    init_scale=init_scale,
+                    init_scale=logit_scale,
+                    film_bottleneck_dim=film_bottleneck_dim,
                 )
 
     def forward(self, movie_indices=None, person_indices=None, film_scale=1.0):
@@ -245,7 +249,7 @@ class HybridSetModel(nn.Module):
             outputs["person"] = (logits_person, recon_person, z_p, idx_p)
 
             if film_reg_p is not None:
-                film_reg_total = film_reg_p if film_reg_total is None else film_reg_total + film_reg_p
+                film_reg_total = film_reg_p if film_reg_total is not None else film_reg_p
 
         if film_reg_total is not None:
             outputs["film_reg"] = film_reg_total

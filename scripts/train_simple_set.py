@@ -5,7 +5,6 @@ import logging
 import json
 import signal
 import math
-import time
 import sys
 from pathlib import Path
 from dataclasses import asdict
@@ -28,10 +27,6 @@ from scripts.simple_set.recon import HybridSetReconLogger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-MOVIE_COUNT_LOSS_WEIGHT = 0.1
-PERSON_COUNT_LOSS_WEIGHT = 0.1
-
-
 class GracefulStopper:
     def __init__(self):
         self.stop = False
@@ -44,10 +39,10 @@ class GracefulStopper:
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
+    def __init__(self, alpha, gamma, reduction="mean"):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
         self.reduction = reduction
 
     def forward(self, inputs, targets):
@@ -228,7 +223,8 @@ def main():
         hidden_dim=cfg.hybrid_set_hidden_dim,
         person_dim=cfg.hybrid_set_person_dim,
         dropout=cfg.hybrid_set_dropout,
-        hybrid_set_logit_scale=cfg.hybrid_set_logit_scale,
+        logit_scale=cfg.hybrid_set_logit_scale,
+        film_bottleneck_dim=cfg.hybrid_set_film_bottleneck_dim,
     )
     model.to(device)
 
@@ -281,9 +277,16 @@ def main():
         movie_ds,
         person_ds,
         interval_steps=int(cfg.hybrid_set_recon_interval),
+        num_samples=int(cfg.hybrid_set_recon_num_samples),
+        table_width=int(cfg.hybrid_set_recon_table_width),
+        threshold=float(cfg.hybrid_set_recon_threshold),
     )
 
-    criterion_set = FocalLoss(alpha=0.25, gamma=2.0, reduction="mean").to(device)
+    criterion_set = FocalLoss(
+        alpha=cfg.hybrid_set_focal_alpha,
+        gamma=cfg.hybrid_set_focal_gamma,
+        reduction="mean",
+    ).to(device)
 
     num_epochs = int(cfg.hybrid_set_epochs)
     movie_steps = len(movie_loader)
@@ -401,9 +404,14 @@ def main():
                             soft_counts = probs.sum(dim=-1)
                             count_loss = F.mse_loss(soft_counts, true_counts)
 
-                            movie_set_loss = movie_set_loss + head_set_loss + MOVIE_COUNT_LOSS_WEIGHT * count_loss
+                            movie_set_loss = movie_set_loss + head_set_loss + cfg.hybrid_set_movie_count_loss_weight * count_loss
 
                         movie_loss_total = cfg.hybrid_set_w_bce * movie_set_loss + cfg.hybrid_set_w_recon * movie_recon_loss
+
+                        film_reg_m = outputs_m.get("film_reg")
+                        if film_reg_m is not None:
+                            movie_loss_total = movie_loss_total + cfg.hybrid_set_film_reg * film_reg_m
+
                         total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
 
                 if batch_person_idx is not None:
@@ -447,9 +455,14 @@ def main():
                             soft_counts = probs.sum(dim=-1)
                             count_loss = F.mse_loss(soft_counts, true_counts)
 
-                            person_set_loss = person_set_loss + head_set_loss + PERSON_COUNT_LOSS_WEIGHT * count_loss
+                            person_set_loss = person_set_loss + head_set_loss + cfg.hybrid_set_person_count_loss_weight * count_loss
 
                         person_loss_total = cfg.hybrid_set_w_bce * person_set_loss + cfg.hybrid_set_w_recon * person_recon_loss
+
+                        film_reg_p = outputs_p.get("film_reg")
+                        if film_reg_p is not None:
+                            person_loss_total = person_loss_total + cfg.hybrid_set_film_reg * film_reg_p
+
                         total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
 
                 if total_loss is None:
