@@ -100,11 +100,9 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
             "model_state_dict": model_state,
         }
 
-        # Binary checkpoint
         torch.save(state, tmp_path)
         tmp_path.replace(final_path)
 
-        # JSON sidecar with editable basic state info
         json_state = {
             "epoch": int(epoch),
             "global_step": int(global_step),
@@ -221,7 +219,7 @@ def main():
         movie_head_vocab_sizes=movie_ds.head_vocab_sizes,
         movie_head_local_to_global=movie_ds.head_local_to_global,
         person_head_vocab_sizes=person_ds.head_vocab_sizes,
-        person_head_local_to_global=person_ds.head_local_to_global,
+        person_head_local_to_global=person_ds.person_head_local_to_global,
         movie_dim=cfg.hybrid_set_movie_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
         person_dim=cfg.hybrid_set_person_dim,
@@ -230,13 +228,25 @@ def main():
     )
     model.to(device)
 
+    emb_params = list(model.movie_embeddings.parameters()) + list(model.person_embeddings.parameters())
+    emb_param_ids = {id(p) for p in emb_params}
+    model_params = [p for p in model.parameters() if id(p) not in emb_param_ids]
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.hybrid_set_lr,
-        weight_decay=cfg.hybrid_set_weight_decay,
+        [
+            {
+                "params": model_params,
+                "lr": cfg.hybrid_set_model_lr,
+                "weight_decay": cfg.hybrid_set_weight_decay,
+            },
+            {
+                "params": emb_params,
+                "lr": cfg.hybrid_set_emb_lr,
+                "weight_decay": cfg.hybrid_set_weight_decay,
+            },
+        ]
     )
 
-    # --- Model summary: run both movie and person paths ---
     sample_movie_idx = next(iter(movie_loader))
     sample_person_idx = next(iter(person_loader))
 
@@ -469,7 +479,6 @@ def main():
     if run_logger:
         run_logger.close()
     print("Done.")
-
 
 
 if __name__ == "__main__":

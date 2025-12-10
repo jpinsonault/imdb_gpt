@@ -33,7 +33,8 @@ class ProjectConfig:
     lr_min_factor: float = 0.05
 
     hybrid_set_epochs: int = 400
-    hybrid_set_lr: float = 1e-3
+    hybrid_set_model_lr: float = 1e-3
+    hybrid_set_emb_lr: float = 1e-3
     hybrid_set_weight_decay: float = 0.0
     
     hybrid_set_movie_dim: int = 256
