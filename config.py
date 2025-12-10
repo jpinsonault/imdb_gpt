@@ -43,7 +43,8 @@ class ProjectConfig:
     
     hybrid_set_w_bce: float = 1.0
     hybrid_set_w_recon: float = 0.5
-    
+    hybrid_set_film_reg: float = 1e-3
+
     hybrid_set_logit_scale: float = 20.0
 
     hybrid_set_save_interval: int = 500

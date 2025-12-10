@@ -28,6 +28,10 @@ from scripts.simple_set.recon import HybridSetReconLogger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+MOVIE_COUNT_LOSS_WEIGHT = 0.1
+PERSON_COUNT_LOSS_WEIGHT = 0.1
+
+
 class GracefulStopper:
     def __init__(self):
         self.stop = False
@@ -390,7 +394,14 @@ def main():
                                     rows_v, loc_v = rows[valid], loc[valid]
                                     targets[rows_v, loc_v] = 1.0
 
-                            movie_set_loss = movie_set_loss + criterion_set(logits, targets)
+                            head_set_loss = criterion_set(logits, targets)
+
+                            probs = torch.sigmoid(logits)
+                            true_counts = targets.sum(dim=-1)
+                            soft_counts = probs.sum(dim=-1)
+                            count_loss = F.mse_loss(soft_counts, true_counts)
+
+                            movie_set_loss = movie_set_loss + head_set_loss + MOVIE_COUNT_LOSS_WEIGHT * count_loss
 
                         movie_loss_total = cfg.hybrid_set_w_bce * movie_set_loss + cfg.hybrid_set_w_recon * movie_recon_loss
                         total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
@@ -429,7 +440,14 @@ def main():
                                     rows_v, loc_v = rows[valid], loc[valid]
                                     targets[rows_v, loc_v] = 1.0
 
-                            person_set_loss = person_set_loss + criterion_set(logits, targets)
+                            head_set_loss = criterion_set(logits, targets)
+
+                            probs = torch.sigmoid(logits)
+                            true_counts = targets.sum(dim=-1)
+                            soft_counts = probs.sum(dim=-1)
+                            count_loss = F.mse_loss(soft_counts, true_counts)
+
+                            person_set_loss = person_set_loss + head_set_loss + PERSON_COUNT_LOSS_WEIGHT * count_loss
 
                         person_loss_total = cfg.hybrid_set_w_bce * person_set_loss + cfg.hybrid_set_w_recon * person_recon_loss
                         total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total

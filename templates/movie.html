@@ -53,32 +53,36 @@
 
         <div class="grid md:grid-cols-3 gap-4">
             {% for head in ['cast', 'director', 'writer'] %}
+                {% set db_list = movie.db.people_by_head.get(head, []) %}
+                {% set pred_list = movie.reconstructed.people_by_head.get(head, []) %}
                 <div class="bg-gray-800 border border-gray-700 rounded-lg p-4">
                     <h2 class="text-lg font-semibold mb-3 text-gray-100">
                         {{ head|capitalize }}
-                        <span class="text-xs text-gray-500">(DB vs model)</span>
+                        <span class="text-xs text-gray-500">
+                            (DB: {{ db_list|length }}, model: {{ pred_list|length }})
+                        </span>
                     </h2>
 
                     <div class="grid gap-3">
                         <div>
                             <h3 class="text-xs uppercase tracking-wide text-gray-500 mb-1">Database (principals)</h3>
-                            {% set db_list = movie.db.people_by_head.get(head, []) %}
                             {% if db_list %}
                                 <ul class="space-y-1 text-sm">
                                     {% for p in db_list %}
-                                        <li>
-                                            {% if p.person_index is not none %}
+                                        {% if p.person_index is not none %}
+                                            <li>
                                                 <a href="/person/{{ p.person_index }}" class="text-blue-300 hover:underline">
                                                     {{ p.primaryName }}
                                                 </a>
-                                            {% else %}
-                                                <span class="text-gray-100">{{ p.primaryName }}</span>
-                                            {% endif %}
-                                            <span class="text-gray-500 text-xs">
-                                                ({{ p.category }}, {{ p.nconst }})
-                                            </span>
-                                        </li>
+                                                <span class="text-gray-500 text-xs">
+                                                    ({{ p.category }}, {{ p.nconst }})
+                                                </span>
+                                            </li>
+                                        {% endif %}
                                     {% endfor %}
+                                    {% if db_list|selectattr("person_index")|list|length == 0 %}
+                                        <li class="text-xs text-gray-500">No linked entries in DB for this head.</li>
+                                    {% endif %}
                                 </ul>
                             {% else %}
                                 <p class="text-xs text-gray-500">No entries in DB for this head.</p>
@@ -87,30 +91,25 @@
 
                         <div>
                             <h3 class="text-xs uppercase tracking-wide text-gray-500 mb-1">Model prediction</h3>
-                            {% set pred_list = movie.reconstructed.people_by_head.get(head, []) %}
                             {% if pred_list %}
                                 <ul class="space-y-1 text-sm">
                                     {% for p in pred_list %}
-                                        <li>
-                                            {% if p.person_index is not none %}
+                                        {% if p.person_index is not none %}
+                                            <li>
                                                 <a href="/person/{{ p.person_index }}"
                                                    class="hover:underline {% if p.is_true %}text-green-300{% else %}text-red-300{% endif %}">
                                                     {{ p.primaryName }}
                                                 </a>
-                                            {% else %}
-                                                <span class="{% if p.is_true %}text-green-300{% else %}text-red-300{% endif %}">
-                                                    {{ p.primaryName }}
+                                                <span class="text-gray-500 text-xs">
+                                                    ({{ "%.2f"|format(p.prob) }}, {{ p.nconst }})
+                                                    {% if p.is_true %} · matches DB{% endif %}
                                                 </span>
-                                            {% endif %}
-                                            <span class="text-gray-500 text-xs">
-                                                ({{ "%.2f"|format(p.prob) }}, {{ p.nconst }})
-                                                {% if p.is_true %} · matches DB{% endif %}
-                                            </span>
-                                        </li>
+                                            </li>
+                                        {% endif %}
                                     {% endfor %}
                                 </ul>
                             {% else %}
-                                <p class="text-xs text-gray-500">No predictions above threshold.</p>
+                                <p class="text-xs text-gray-500">No model predictions for this head.</p>
                             {% endif %}
                         </div>
                     </div>

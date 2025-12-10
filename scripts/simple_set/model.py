@@ -18,23 +18,34 @@ class SetHead(nn.Module):
         local_to_global,
         dropout=0.1,
         init_scale=20.0,
+        film_bottleneck=None,
     ):
         super().__init__()
 
-        self.in_proj = nn.Linear(in_dim, hidden_dim)
-        self.act = nn.GELU()
-        self.ln = nn.LayerNorm(hidden_dim)
-        self.drop = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(hidden_dim, item_dim)
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
 
-        self.use_res = in_dim == item_dim
+        self.in_proj = nn.Linear(self.in_dim, self.hidden_dim)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(self.hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(self.hidden_dim, item_dim)
+
+        self.use_res = self.in_dim == item_dim
         if self.use_res:
             self.res_scale = nn.Parameter(torch.tensor(0.1))
+
+        bottleneck_dim = int(film_bottleneck) if film_bottleneck is not None else max(1, self.in_dim // 2)
+        self.film_bottleneck = nn.Linear(self.in_dim, bottleneck_dim)
+        self.film_act = nn.GELU()
+        self.film_out = nn.Linear(bottleneck_dim, self.hidden_dim * 2)
 
         self.bias = nn.Parameter(torch.empty(vocab_size))
         self.logit_scale = nn.Parameter(torch.ones([]) * math.log(init_scale))
 
         self.register_buffer("local_to_global", local_to_global.long(), persistent=False)
+
+        self.last_reg = None
 
         self._init_weights()
 
@@ -43,12 +54,44 @@ class SetHead(nn.Module):
         nn.init.constant_(self.in_proj.bias, 0.0)
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.constant_(self.out_proj.bias, 0.0)
+
+        nn.init.xavier_uniform_(self.film_bottleneck.weight)
+        nn.init.constant_(self.film_bottleneck.bias, 0.0)
+        nn.init.xavier_uniform_(self.film_out.weight)
+        nn.init.constant_(self.film_out.bias, 0.0)
+
         nn.init.constant_(self.bias, -6.0)
 
-    def forward(self, z, item_weight):
+    def _apply_film(self, x, z, film_scale):
+        if film_scale <= 0.0:
+            self.last_reg = None
+            return x
+
+        h = self.film_bottleneck(z)
+        h = self.film_act(h)
+        gb = self.film_out(h)
+        gb = gb.view(z.size(0), 2, self.hidden_dim)
+
+        gamma = gb[:, 0, :]
+        beta = gb[:, 1, :]
+
+        if self.training:
+            gamma_centered = gamma - gamma.mean(dim=0, keepdim=True)
+            beta_centered = beta - beta.mean(dim=0, keepdim=True)
+            self.last_reg = (gamma_centered.pow(2).mean() + beta_centered.pow(2).mean())
+        else:
+            self.last_reg = None
+
+        gamma = gamma * float(film_scale)
+        beta = beta * float(film_scale)
+
+        return x * (1.0 + gamma) + beta
+
+    def forward(self, z, item_weight, film_scale=1.0):
         x = self.in_proj(z)
         x = self.ln(x)
         x = self.act(x)
+        x = self._apply_film(x, z, film_scale)
         x = self.drop(x)
         q = self.out_proj(x)
 
@@ -148,8 +191,9 @@ class HybridSetModel(nn.Module):
                     init_scale=init_scale,
                 )
 
-    def forward(self, movie_indices=None, person_indices=None):
+    def forward(self, movie_indices=None, person_indices=None, film_scale=1.0):
         outputs = {}
+        film_reg_total = None
 
         if movie_indices is not None:
             idx = movie_indices.to(self.movie_embeddings.weight.device, non_blocking=True).long()
@@ -162,10 +206,20 @@ class HybridSetModel(nn.Module):
             people_weight = self.person_embeddings.weight
 
             logits_dict = {}
+            film_reg = None
             for name, head_module in self.movie_heads.items():
-                logits_dict[name] = head_module(z, people_weight)
+                logits = head_module(z, people_weight, film_scale=film_scale)
+                logits_dict[name] = logits
+                if head_module.last_reg is not None:
+                    if film_reg is None:
+                        film_reg = head_module.last_reg
+                    else:
+                        film_reg = film_reg + head_module.last_reg
 
             outputs["movie"] = (logits_dict, recon_table, z, idx)
+
+            if film_reg is not None:
+                film_reg_total = film_reg if film_reg_total is None else film_reg_total + film_reg
 
         if person_indices is not None:
             idx_p = person_indices.to(self.person_embeddings.weight.device, non_blocking=True).long()
@@ -178,9 +232,22 @@ class HybridSetModel(nn.Module):
             movie_weight = self.movie_embeddings.weight
 
             logits_person = {}
+            film_reg_p = None
             for name, head_module in self.person_heads.items():
-                logits_person[name] = head_module(z_p, movie_weight)
+                logits = head_module(z_p, movie_weight, film_scale=film_scale)
+                logits_person[name] = logits
+                if head_module.last_reg is not None:
+                    if film_reg_p is None:
+                        film_reg_p = head_module.last_reg
+                    else:
+                        film_reg_p = film_reg_p + head_module.last_reg
 
             outputs["person"] = (logits_person, recon_person, z_p, idx_p)
+
+            if film_reg_p is not None:
+                film_reg_total = film_reg_p if film_reg_total is None else film_reg_total + film_reg_p
+
+        if film_reg_total is not None:
+            outputs["film_reg"] = film_reg_total
 
         return outputs

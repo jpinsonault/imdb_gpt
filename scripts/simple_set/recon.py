@@ -94,6 +94,20 @@ class HybridSetReconLogger:
         )
         return wrapper.fill(text)
 
+    def _decode_indices_with_soft_count(self, probs_cpu, true_local_idxs):
+        if probs_cpu.size == 0:
+            return set(), 0
+        soft_count = float(probs_cpu.sum())
+        k_hat = int(round(soft_count))
+        if len(true_local_idxs) > 0 and k_hat == 0:
+            k_hat = 1
+        k_hat = max(0, min(k_hat, probs_cpu.shape[0]))
+        if k_hat == 0:
+            return set(), 0
+        order = np.argsort(-probs_cpu)
+        chosen = set(int(i) for i in order[:k_hat])
+        return chosen, k_hat
+
     def _movie_block(self, model):
         if len(self.movie_dataset) == 0:
             return []
@@ -162,8 +176,12 @@ class HybridSetReconLogger:
 
                 probs = torch.sigmoid(logits_dict[head][local_idx])
                 probs_cpu = probs.float().cpu().numpy()
-                pred_local_idxs = set(np.where(probs_cpu > self.threshold)[0])
-                pred_count = float(probs_cpu.sum())
+                pred_local_idxs, k_hat = self._decode_indices_with_soft_count(
+                    probs_cpu,
+                    true_local_idxs,
+                )
+
+                pred_count = k_hat
 
                 tp_local = true_local_idxs & pred_local_idxs
                 fp_local = pred_local_idxs - true_local_idxs
@@ -188,7 +206,7 @@ class HybridSetReconLogger:
                     return items[:10]
 
                 lines.append(f"\n--- Head: {head.upper()} (Movie -> People) ---")
-                lines.append(f"Count: True={int(true_count)} Pred={pred_count:.1f}")
+                lines.append(f"Count: True={int(true_count)} Pred={pred_count}")
                 lines.append(self._format_list(fmt(tp_local), "[+] Match"))
                 lines.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
                 lines.append(self._format_list(fmt(fn_local), "[-] Missed"))
@@ -263,7 +281,10 @@ class HybridSetReconLogger:
 
                 probs = torch.sigmoid(logits_dict[head][local_idx])
                 probs_cpu = probs.float().cpu().numpy()
-                pred_local_idxs = set(np.where(probs_cpu > self.threshold)[0])
+                pred_local_idxs, k_hat = self._decode_indices_with_soft_count(
+                    probs_cpu,
+                    true_local_idxs,
+                )
 
                 tp_local = true_local_idxs & pred_local_idxs
                 fp_local = pred_local_idxs - true_local_idxs
@@ -288,6 +309,7 @@ class HybridSetReconLogger:
                     return items[:10]
 
                 lines.append(f"\n--- Head: {head.upper()} (Person -> Movies) ---")
+                lines.append(f"Count: True={int(true_count)} Pred={k_hat}")
                 lines.append(self._format_list(fmt(tp_local), "[+] Match"))
                 lines.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
                 lines.append(self._format_list(fmt(fn_local), "[-] Missed"))

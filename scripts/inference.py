@@ -67,7 +67,7 @@ class HybridSearchEngine:
             movie_head_vocab_sizes=self.movie_ds.head_vocab_sizes,
             movie_head_local_to_global=self.movie_ds.head_local_to_global,
             person_head_vocab_sizes=self.person_ds.head_vocab_sizes,
-            person_head_local_to_global=self.person_ds.head_local_to_global,
+            person_head_local_to_global=self.person_ds.person_head_local_to_global,
             movie_dim=self.cfg.hybrid_set_movie_dim,
             hidden_dim=self.cfg.hybrid_set_hidden_dim,
             person_dim=self.cfg.hybrid_set_person_dim,
@@ -360,6 +360,8 @@ class HybridSearchEngine:
             if head is None:
                 continue
             person_idx = self.nconst_to_index.get(nconst)
+            if person_idx is None:
+                continue
             by_head.setdefault(head, []).append(
                 {
                     "nconst": nconst,
@@ -393,6 +395,8 @@ class HybridSearchEngine:
             if head is None:
                 continue
             movie_idx = self.tconst_to_index.get(tconst)
+            if movie_idx is None:
+                continue
             by_head.setdefault(head, []).append(
                 {
                     "tconst": tconst,
@@ -440,9 +444,23 @@ class HybridSearchEngine:
 
             pred_heads: Dict[str, List[Dict[str, Any]]] = {}
             for head, logits in logits_dict.items():
-                probs = torch.sigmoid(logits[0]).cpu().numpy()
+                probs_t = torch.sigmoid(logits[0])
+                probs = probs_t.cpu().numpy()
                 local_to_global = self.movie_ds.head_local_to_global.get(head)
                 if local_to_global is None or local_to_global.numel() == 0:
+                    continue
+
+                vocab_size = int(local_to_global.shape[0])
+                soft_count = float(probs.sum())
+                k_hat = int(round(soft_count))
+                if k_hat < 0:
+                    k_hat = 0
+                if k_hat > vocab_size:
+                    k_hat = vocab_size
+                if max_items is not None:
+                    k_hat = min(k_hat, int(max_items))
+                if k_hat == 0:
+                    pred_heads[head] = []
                     continue
 
                 order = probs.argsort()[::-1]
@@ -450,12 +468,10 @@ class HybridSearchEngine:
 
                 true_nconsts = set(p["nconst"] for p in db_people.get(head, []) if p.get("nconst"))
 
-                for li in order[: max_items]:
-                    p_val = float(probs[li])
-                    if p_val < threshold:
-                        break
-                    if li < 0 or li >= int(local_to_global.shape[0]):
+                for li in order[:k_hat]:
+                    if li < 0 or li >= vocab_size:
                         continue
+                    p_val = float(probs[li])
                     global_idx = int(local_to_global[li].item())
                     if global_idx < 0 or global_idx >= self.num_people:
                         continue
@@ -525,9 +541,23 @@ class HybridSearchEngine:
 
             pred_heads = {}
             for head, logits in logits_dict.items():
-                probs = torch.sigmoid(logits[0]).cpu().numpy()
+                probs_t = torch.sigmoid(logits[0])
+                probs = probs_t.cpu().numpy()
                 local_to_global = self.person_ds.head_local_to_global.get(head)
                 if local_to_global is None or local_to_global.numel() == 0:
+                    continue
+
+                vocab_size = int(local_to_global.shape[0])
+                soft_count = float(probs.sum())
+                k_hat = int(round(soft_count))
+                if k_hat < 0:
+                    k_hat = 0
+                if k_hat > vocab_size:
+                    k_hat = vocab_size
+                if max_items is not None:
+                    k_hat = min(k_hat, int(max_items))
+                if k_hat == 0:
+                    pred_heads[head] = []
                     continue
 
                 order = probs.argsort()[::-1]
@@ -535,12 +565,10 @@ class HybridSearchEngine:
 
                 true_tconsts = set(m["tconst"] for m in db_movies.get(head, []) if m.get("tconst"))
 
-                for li in order[: max_items]:
-                    p_val = float(probs[li])
-                    if p_val < threshold:
-                        break
-                    if li < 0 or li >= int(local_to_global.shape[0]):
+                for li in order[:k_hat]:
+                    if li < 0 or li >= vocab_size:
                         continue
+                    p_val = float(probs[li])
                     global_idx = int(local_to_global[li].item())
                     if global_idx < 0 or global_idx >= self.num_movies:
                         continue

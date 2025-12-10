@@ -81,6 +81,10 @@ class PersonHybridSetDataset(Dataset):
 
         self.num_items = self.stacked_fields[0].shape[0]
 
+    @property
+    def person_head_local_to_global(self):
+        return self.head_local_to_global
+
     def __len__(self):
         return self.num_items
 
