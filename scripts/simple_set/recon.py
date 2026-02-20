@@ -29,6 +29,13 @@ class HybridSetReconLogger:
             getattr(self.person_dataset, "head_mappings", {})
         )
 
+        self.movie_head_count_field_idx = self._find_count_field_indices(
+            getattr(self.movie_dataset, "fields", [])
+        )
+        self.person_head_count_field_idx = self._find_count_field_indices(
+            getattr(self.person_dataset, "fields", [])
+        )
+
     def _build_inverse_mappings(self, head_mappings):
         inv_maps = {}
         if not head_mappings:
@@ -47,6 +54,24 @@ class HybridSetReconLogger:
             inverse[local_indices] = global_indices
             inv_maps[head] = inverse
         return inv_maps
+
+    def _find_count_field_indices(self, fields):
+        mapping = {}
+        if not fields:
+            return mapping
+        name_map = {
+            "cast": "castCount",
+            "director": "directorCount",
+            "writer": "writerCount",
+        }
+        for idx, f in enumerate(fields):
+            fname = getattr(f, "name", None)
+            if not fname:
+                continue
+            for head, field_name in name_map.items():
+                if fname == field_name:
+                    mapping[head] = idx
+        return mapping
 
     def _decode_movie_title(self, field_tensors):
         title, year = "???", ""
@@ -94,16 +119,39 @@ class HybridSetReconLogger:
         )
         return wrapper.fill(text)
 
-    def _decode_indices_with_soft_count(self, probs_cpu, true_local_idxs):
+    def _get_head_true_count(self, dataset, field_idx_map, dataset_idx, head, true_local_idxs):
+        idx = field_idx_map.get(head)
+        if idx is None:
+            return len(true_local_idxs)
+        try:
+            field = dataset.fields[idx]
+            tensor = dataset.stacked_fields[idx][dataset_idx].cpu()
+            s = field.render_ground_truth(tensor)
+            v = int(round(float(s)))
+            if v < 0:
+                v = 0
+            return v
+        except Exception:
+            return len(true_local_idxs)
+
+    def _decode_indices_with_true_count(self, probs_cpu, true_local_idxs, true_count):
         if probs_cpu.size == 0:
             return set(), 0
-        soft_count = float(probs_cpu.sum())
-        k_hat = int(round(soft_count))
-        if len(true_local_idxs) > 0 and k_hat == 0:
-            k_hat = 1
-        k_hat = max(0, min(k_hat, probs_cpu.shape[0]))
+
+        if true_count is None:
+            soft_count = float(probs_cpu.sum())
+            k_hat = int(round(soft_count))
+            if len(true_local_idxs) > 0 and k_hat == 0:
+                k_hat = 1
+        else:
+            k_hat = int(true_count)
+            k_hat = max(0, min(k_hat, probs_cpu.shape[0]))
+            if k_hat == 0 and len(true_local_idxs) > 0:
+                k_hat = min(len(true_local_idxs), probs_cpu.shape[0])
+
         if k_hat == 0:
             return set(), 0
+
         order = np.argsort(-probs_cpu)
         chosen = set(int(i) for i in order[:k_hat])
         return chosen, k_hat
@@ -173,12 +221,20 @@ class HybridSetReconLogger:
                         true_local_idxs.add(loc)
 
                 true_count = len(true_local_idxs)
+                true_count = self._get_head_true_count(
+                    self.movie_dataset,
+                    self.movie_head_count_field_idx,
+                    dataset_idx,
+                    head,
+                    true_local_idxs,
+                )
 
                 probs = torch.sigmoid(logits_dict[head][local_idx])
                 probs_cpu = probs.float().cpu().numpy()
-                pred_local_idxs, k_hat = self._decode_indices_with_soft_count(
+                pred_local_idxs, k_hat = self._decode_indices_with_true_count(
                     probs_cpu,
                     true_local_idxs,
+                    true_count,
                 )
 
                 pred_count = k_hat
@@ -278,12 +334,20 @@ class HybridSetReconLogger:
                         true_local_idxs.add(loc)
 
                 true_count = len(true_local_idxs)
+                true_count = self._get_head_true_count(
+                    self.person_dataset,
+                    self.person_head_count_field_idx,
+                    dataset_idx,
+                    head,
+                    true_local_idxs,
+                )
 
                 probs = torch.sigmoid(logits_dict[head][local_idx])
                 probs_cpu = probs.float().cpu().numpy()
-                pred_local_idxs, k_hat = self._decode_indices_with_soft_count(
+                pred_local_idxs, k_hat = self._decode_indices_with_true_count(
                     probs_cpu,
                     true_local_idxs,
+                    true_count,
                 )
 
                 tp_local = true_local_idxs & pred_local_idxs

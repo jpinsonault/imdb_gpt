@@ -179,7 +179,13 @@ def build_hybrid_cache(cfg: ProjectConfig):
         row_dict = fetched_rows[tconst]
 
         heads_data = movie_data[tconst]
-        row_dict["peopleCount"] = sum(len(s) for s in heads_data.values())
+        cast_count = len(heads_data.get("cast", []))
+        director_count = len(heads_data.get("director", []))
+        writer_count = len(heads_data.get("writer", []))
+
+        row_dict["castCount"] = cast_count
+        row_dict["directorCount"] = director_count
+        row_dict["writerCount"] = writer_count
 
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
@@ -265,8 +271,17 @@ def build_hybrid_cache(cfg: ProjectConfig):
     temp_person_heads_lists = defaultdict(lambda: [[] for _ in range(num_people)])
 
     for idx, nconst in enumerate(tqdm(sorted_nconsts, desc="Stacking people")):
-        row_dict = fetched_people_rows.get(nconst, {})
+        base_row = fetched_people_rows.get(nconst, {})
         heads_data = person_data_final.get(nconst, {})
+
+        cast_count = len(heads_data.get("cast", []))
+        director_count = len(heads_data.get("director", []))
+        writer_count = len(heads_data.get("writer", []))
+
+        row_dict = dict(base_row)
+        row_dict["castCount"] = cast_count
+        row_dict["directorCount"] = director_count
+        row_dict["writerCount"] = writer_count
 
         for i, field in enumerate(people_ae.fields):
             val = row_dict.get(field.name)

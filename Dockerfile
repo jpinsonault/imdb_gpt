@@ -19,6 +19,7 @@ RUN pip install \
   tqdm \
   scipy \
   openai \
+  matplotlib \
   datasets \
   requests
 

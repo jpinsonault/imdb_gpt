@@ -398,13 +398,7 @@ def main():
                                     targets[rows_v, loc_v] = 1.0
 
                             head_set_loss = criterion_set(logits, targets)
-
-                            probs = torch.sigmoid(logits)
-                            true_counts = targets.sum(dim=-1)
-                            soft_counts = probs.sum(dim=-1)
-                            count_loss = F.mse_loss(soft_counts, true_counts)
-
-                            movie_set_loss = movie_set_loss + head_set_loss + cfg.hybrid_set_movie_count_loss_weight * count_loss
+                            movie_set_loss = movie_set_loss + head_set_loss
 
                         movie_loss_total = cfg.hybrid_set_w_bce * movie_set_loss + cfg.hybrid_set_w_recon * movie_recon_loss
 
@@ -449,13 +443,7 @@ def main():
                                     targets[rows_v, loc_v] = 1.0
 
                             head_set_loss = criterion_set(logits, targets)
-
-                            probs = torch.sigmoid(logits)
-                            true_counts = targets.sum(dim=-1)
-                            soft_counts = probs.sum(dim=-1)
-                            count_loss = F.mse_loss(soft_counts, true_counts)
-
-                            person_set_loss = person_set_loss + head_set_loss + cfg.hybrid_set_person_count_loss_weight * count_loss
+                            person_set_loss = person_set_loss + head_set_loss
 
                         person_loss_total = cfg.hybrid_set_w_bce * person_set_loss + cfg.hybrid_set_w_recon * person_recon_loss
 

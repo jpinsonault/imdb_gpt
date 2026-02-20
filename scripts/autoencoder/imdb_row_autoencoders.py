@@ -41,7 +41,9 @@ class TitlesAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("averageRating", fraction_digits=1),
             NumericDigitCategoryField("numVotes"),
             MultiCategoryField("genres"),
-            NumericDigitCategoryField("peopleCount"),
+            NumericDigitCategoryField("castCount"),
+            NumericDigitCategoryField("directorCount"),
+            NumericDigitCategoryField("writerCount"),
         ]
 
     def accumulate_stats(self):
@@ -83,16 +85,13 @@ class TitlesAutoencoder(RowAutoencoder):
             else:
                 logging.warning("[Titles] No data found matching filter!")
 
-            # 2. peopleCount
+            # 2. peopleCount-ish upper bound (reuse for per-head counts)
             # We use the new index on `principals(tconst)`. 
             # We assume the max people count won't exceed 5000 to save compute, 
             # or we calculate it efficiently.
-            logging.info("[Titles] Calculating max peopleCount...")
+            logging.info("[Titles] Calculating max people per title...")
             
-            # Optimization: Instead of joining Titles->Principals (Slow), 
-            # we query Principals directly using a WHERE IN clause on valid tconsts
-            # OR we just grab the global max from principals if we trust the data isn't outliers.
-            # Let's do the rigorous join but strictly on IDs.
+            logging.info("[Titles] Calculating max peopleCount...")
             q_pc = f"""
             SELECT MAX(cnt) FROM (
                 SELECT COUNT(pr.ordering) as cnt 
@@ -101,10 +100,13 @@ class TitlesAutoencoder(RowAutoencoder):
                 GROUP BY pr.tconst
             )
             """
-            # Note: If the subquery is too slow, fallback to: SELECT MAX(ordering) FROM principals
             mx_pc = cur.execute(q_pc).fetchone()
             mx_pc_val = mx_pc[0] if mx_pc and mx_pc[0] else 50
-            self._manual_inject_digits("peopleCount", 0, mx_pc_val)
+
+            # Use the same upper bound for each per-head count.
+            self._manual_inject_digits("castCount", 0, mx_pc_val)
+            self._manual_inject_digits("directorCount", 0, mx_pc_val)
+            self._manual_inject_digits("writerCount", 0, mx_pc_val)
 
             # 3. CATEGORICAL: Genres
             logging.info("[Titles] Accumulating Genres...")
@@ -199,7 +201,9 @@ class PeopleAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("birthYear"),
             NumericDigitCategoryField("deathYear"),
             MultiCategoryField("professions"),
-            NumericDigitCategoryField("titleCount"),
+            NumericDigitCategoryField("castCount"),
+            NumericDigitCategoryField("directorCount"),
+            NumericDigitCategoryField("writerCount"),
         ]
 
     def accumulate_stats(self):
@@ -227,7 +231,7 @@ class PeopleAutoencoder(RowAutoencoder):
                 self._manual_inject_digits("birthYear", row[0], row[1])
                 self._manual_inject_digits("deathYear", row[2], row[3])
 
-            # 2. titleCount (Principals aggregation)
+            # 2. titleCount-ish upper bound for per-head counts
             # Optimized to use Index
             logging.info("[People] Calculating max titleCount...")
             q_tc = f"""
@@ -238,14 +242,15 @@ class PeopleAutoencoder(RowAutoencoder):
                 GROUP BY pr.nconst
             )
             """
-            # Optimization: We limit the WHERE IN clause to a sample. 
-            # Finding the exact global maximum title count might be slow, 
-            # but finding a "sufficiently large" max from a 100k sample is instant and safe for encoding.
             mx_tc = cur.execute(q_tc).fetchone()
             if mx_tc and mx_tc[0]:
-                self._manual_inject_digits("titleCount", 0, mx_tc[0])
+                max_titles = mx_tc[0]
             else:
-                self._manual_inject_digits("titleCount", 0, 200)
+                max_titles = 200
+
+            self._manual_inject_digits("castCount", 0, max_titles)
+            self._manual_inject_digits("directorCount", 0, max_titles)
+            self._manual_inject_digits("writerCount", 0, max_titles)
 
             # 3. Professions
             logging.info("[People] Accumulating Professions...")

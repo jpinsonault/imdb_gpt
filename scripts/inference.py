@@ -72,7 +72,8 @@ class HybridSearchEngine:
             hidden_dim=self.cfg.hybrid_set_hidden_dim,
             person_dim=self.cfg.hybrid_set_person_dim,
             dropout=self.cfg.hybrid_set_dropout,
-            hybrid_set_logit_scale=self.cfg.hybrid_set_logit_scale,
+            logit_scale=self.cfg.hybrid_set_logit_scale,
+            film_bottleneck_dim=self.cfg.hybrid_set_film_bottleneck_dim,
         )
 
         ckpt_path = Path(self.cfg.model_dir) / "hybrid_set_state.pt"
@@ -432,15 +433,26 @@ class HybridSearchEngine:
             logits_dict, recon_table, _, _ = movie_out
 
             recon_fields = []
+            recon_counts: Dict[str, int] = {}
+
             for f, orig_t, rec_field in zip(self.movie_ds.fields, orig_inputs, recon_table):
                 rec_t = rec_field[0].cpu()
+                db_render = f.render_ground_truth(orig_t)
+                pred_render = f.render_prediction(rec_t)
+
                 recon_fields.append(
                     {
                         "name": f.name,
-                        "db": f.render_ground_truth(orig_t),
-                        "recon": f.render_prediction(rec_t),
+                        "db": db_render,
+                        "recon": pred_render,
                     }
                 )
+
+                if f.name.endswith("Count"):
+                    try:
+                        recon_counts[f.name] = int(pred_render)
+                    except (TypeError, ValueError):
+                        pass
 
             pred_heads: Dict[str, List[Dict[str, Any]]] = {}
             for head, logits in logits_dict.items():
@@ -451,14 +463,33 @@ class HybridSearchEngine:
                     continue
 
                 vocab_size = int(local_to_global.shape[0])
+
+                true_nconsts = {
+                    p["nconst"]
+                    for p in db_people.get(head, [])
+                    if p.get("nconst")
+                }
+                true_count = len(true_nconsts)
+
+                count_field_name = f"{head}Count"
+                pred_count = recon_counts.get(count_field_name)
+
                 soft_count = float(probs.sum())
-                k_hat = int(round(soft_count))
+
+                if true_count > 0:
+                    k_hat = true_count
+                elif pred_count is not None:
+                    k_hat = max(0, int(pred_count))
+                else:
+                    k_hat = int(round(soft_count))
+
                 if k_hat < 0:
                     k_hat = 0
                 if k_hat > vocab_size:
                     k_hat = vocab_size
                 if max_items is not None:
                     k_hat = min(k_hat, int(max_items))
+
                 if k_hat == 0:
                     pred_heads[head] = []
                     continue
@@ -466,12 +497,14 @@ class HybridSearchEngine:
                 order = probs.argsort()[::-1]
                 head_list: List[Dict[str, Any]] = []
 
-                true_nconsts = set(p["nconst"] for p in db_people.get(head, []) if p.get("nconst"))
-
-                for li in order[:k_hat]:
+                for li in order:
                     if li < 0 or li >= vocab_size:
                         continue
+
                     p_val = float(probs[li])
+                    if p_val < threshold:
+                        break
+
                     global_idx = int(local_to_global[li].item())
                     if global_idx < 0 or global_idx >= self.num_people:
                         continue
@@ -489,6 +522,37 @@ class HybridSearchEngine:
                             "is_true": is_true,
                         }
                     )
+
+                    if len(head_list) >= k_hat:
+                        break
+
+                if len(head_list) < k_hat and k_hat > 0:
+                    head_list = []
+                    for li in order:
+                        if li < 0 or li >= vocab_size:
+                            continue
+
+                        p_val = float(probs[li])
+                        global_idx = int(local_to_global[li].item())
+                        if global_idx < 0 or global_idx >= self.num_people:
+                            continue
+
+                        name = self.person_names[global_idx]
+                        nconst = self.person_nconst[global_idx]
+                        is_true = nconst in true_nconsts
+
+                        head_list.append(
+                            {
+                                "person_index": global_idx,
+                                "primaryName": name,
+                                "nconst": nconst,
+                                "prob": p_val,
+                                "is_true": is_true,
+                            }
+                        )
+
+                        if len(head_list) >= k_hat:
+                            break
 
                 pred_heads[head] = head_list
 
@@ -529,17 +593,28 @@ class HybridSearchEngine:
             logits_dict, recon_table, _, _ = person_out
 
             recon_fields = []
+            recon_counts: Dict[str, int] = {}
+
             for f, orig_t, rec_field in zip(self.person_ds.fields, orig_inputs, recon_table):
                 rec_t = rec_field[0].cpu()
+                db_render = f.render_ground_truth(orig_t)
+                pred_render = f.render_prediction(rec_t)
+
                 recon_fields.append(
                     {
                         "name": f.name,
-                        "db": f.render_ground_truth(orig_t),
-                        "recon": f.render_prediction(rec_t),
+                        "db": db_render,
+                        "recon": pred_render,
                     }
                 )
 
-            pred_heads = {}
+                if f.name.endswith("Count"):
+                    try:
+                        recon_counts[f.name] = int(pred_render)
+                    except (TypeError, ValueError):
+                        pass
+
+            pred_heads: Dict[str, List[Dict[str, Any]]] = {}
             for head, logits in logits_dict.items():
                 probs_t = torch.sigmoid(logits[0])
                 probs = probs_t.cpu().numpy()
@@ -548,14 +623,33 @@ class HybridSearchEngine:
                     continue
 
                 vocab_size = int(local_to_global.shape[0])
+
+                true_tconsts = {
+                    m["tconst"]
+                    for m in db_movies.get(head, [])
+                    if m.get("tconst")
+                }
+                true_count = len(true_tconsts)
+
+                count_field_name = f"{head}Count"
+                pred_count = recon_counts.get(count_field_name)
+
                 soft_count = float(probs.sum())
-                k_hat = int(round(soft_count))
+
+                if true_count > 0:
+                    k_hat = true_count
+                elif pred_count is not None:
+                    k_hat = max(0, int(pred_count))
+                else:
+                    k_hat = int(round(soft_count))
+
                 if k_hat < 0:
                     k_hat = 0
                 if k_hat > vocab_size:
                     k_hat = vocab_size
                 if max_items is not None:
                     k_hat = min(k_hat, int(max_items))
+
                 if k_hat == 0:
                     pred_heads[head] = []
                     continue
@@ -563,12 +657,14 @@ class HybridSearchEngine:
                 order = probs.argsort()[::-1]
                 head_list: List[Dict[str, Any]] = []
 
-                true_tconsts = set(m["tconst"] for m in db_movies.get(head, []) if m.get("tconst"))
-
-                for li in order[:k_hat]:
+                for li in order:
                     if li < 0 or li >= vocab_size:
                         continue
+
                     p_val = float(probs[li])
+                    if p_val < threshold:
+                        break
+
                     global_idx = int(local_to_global[li].item())
                     if global_idx < 0 or global_idx >= self.num_movies:
                         continue
@@ -587,6 +683,37 @@ class HybridSearchEngine:
                         }
                     )
 
+                    if len(head_list) >= k_hat:
+                        break
+
+                if len(head_list) < k_hat and k_hat > 0:
+                    head_list = []
+                    for li in order:
+                        if li < 0 or li >= vocab_size:
+                            continue
+
+                        p_val = float(probs[li])
+                        global_idx = int(local_to_global[li].item())
+                        if global_idx < 0 or global_idx >= self.num_movies:
+                            continue
+
+                        title = self.movie_titles[global_idx]
+                        tconst = self.movie_tconst[global_idx]
+                        is_true = tconst in true_tconsts
+
+                        head_list.append(
+                            {
+                                "movie_index": global_idx,
+                                "primaryTitle": title,
+                                "tconst": tconst,
+                                "prob": p_val,
+                                "is_true": is_true,
+                            }
+                        )
+
+                        if len(head_list) >= k_hat:
+                            break
+
                 pred_heads[head] = head_list
 
         return {
@@ -602,6 +729,7 @@ class HybridSearchEngine:
                 "movies_by_head": pred_heads,
             },
         }
+
 
 
 MovieSearchEngine = HybridSearchEngine
