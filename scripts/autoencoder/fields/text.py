@@ -162,6 +162,57 @@ class TextField(BaseField):
         
         return loss_sum / valid_count.clamp(min=1.0)
 
+    def get_state(self):
+        state = super().get_state()
+        tok = self.tokenizer
+        vocab = None
+        specials = None
+        if tok is not None and getattr(tok, "char_to_index", None):
+            max_id = max(tok.index_to_char.keys()) if tok.index_to_char else -1
+            vocab = [tok.index_to_char.get(i, "") for i in range(max_id + 1)]
+            specials = list(getattr(tok, "special_tokens", []) or [])
+        state.update({
+            "user_max_length": self.user_max_length,
+            "downsample_steps": self.downsample_steps,
+            "base_size": self.base_size,
+            "num_blocks_per_step": list(self.num_blocks_per_step),
+            "dynamic_max_len": self.dynamic_max_len,
+            "max_length": self.max_length or 1,
+            "pad_token_id": self.pad_token_id or 0,
+            "avg_raw_length": float(self.avg_raw_length or 0.0),
+            "avg_token_count": float(self.avg_token_count or 0.0),
+            "avg_chars_saved": float(self.avg_chars_saved or 0.0),
+            "compression_ratio": float(self.compression_ratio or 0.0),
+            "tokenizer_vocab": vocab,
+            "tokenizer_specials": specials,
+        })
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.user_max_length = state.get("user_max_length", self.user_max_length)
+        self.downsample_steps = int(state.get("downsample_steps", self.downsample_steps))
+        self.base_size = int(state.get("base_size", self.base_size))
+        self.num_blocks_per_step = list(state.get("num_blocks_per_step", self.num_blocks_per_step))
+        self.dynamic_max_len = int(state.get("dynamic_max_len", self.dynamic_max_len))
+        self.max_length = int(state.get("max_length", self.max_length or 1))
+        self.pad_token_id = int(state.get("pad_token_id", self.pad_token_id or 0))
+        self.avg_raw_length = float(state.get("avg_raw_length", self.avg_raw_length or 0.0) or 0.0)
+        self.avg_token_count = float(state.get("avg_token_count", self.avg_token_count or 0.0) or 0.0)
+        self.avg_chars_saved = float(state.get("avg_chars_saved", self.avg_chars_saved or 0.0) or 0.0)
+        self.compression_ratio = float(state.get("compression_ratio", self.compression_ratio or 0.0) or 0.0)
+
+        vocab = state.get("tokenizer_vocab")
+        specials = state.get("tokenizer_specials")
+        if vocab is not None:
+            from ..character_tokenizer import CharacterTokenizer
+            tok = CharacterTokenizer(special_tokens=specials or [])
+            tok.char_to_index = {ch: i for i, ch in enumerate(vocab)}
+            tok.index_to_char = {i: ch for i, ch in enumerate(vocab)}
+            tok.alphabet = set(c for c in vocab if c not in (specials or []))
+            tok.trained = True
+            self.tokenizer = tok
+
     def print_stats(self):
         return
 

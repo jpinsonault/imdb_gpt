@@ -92,39 +92,3 @@ class PersonHybridSetDataset(Dataset):
         return idx
 
 
-class FastInfiniteLoader:
-    def __init__(self, dataset, batch_size, shuffle=True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-        self.indices = torch.arange(len(dataset))
-        if self.shuffle:
-            self.indices = self.indices[torch.randperm(len(dataset))]
-
-        self.ptr = 0
-        self.n = len(dataset)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.ptr + self.batch_size > self.n:
-            if self.shuffle:
-                self.indices = self.indices[torch.randperm(self.n)]
-            self.ptr = 0
-
-        batch_idx = self.indices[self.ptr : self.ptr + self.batch_size]
-        self.ptr += self.batch_size
-
-        inputs = [t[batch_idx] for t in self.dataset.stacked_fields]
-        heads_padded_batch = {k: v[batch_idx] for k, v in self.dataset.heads_padded.items()}
-
-        return inputs, heads_padded_batch, batch_idx
-
-    def __len__(self):
-        return (self.n + self.batch_size - 1) // self.batch_size
-
-
-def collate_hybrid_set(batch_indices, dataset):
-    pass

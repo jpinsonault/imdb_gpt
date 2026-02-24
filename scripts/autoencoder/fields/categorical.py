@@ -5,7 +5,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .base import BaseField
 
-class MultiCategoryField(BaseField):
+class _CategoryStateMixin:
+    """Shared get_state/set_state for Multi/SingleCategoryField."""
+    category_list: List[str]
+    category_set: set
+    category_counts: Dict[str, int]
+
+    def get_state(self):
+        state = super().get_state()
+        state.update({
+            "category_list": list(self.category_list or []),
+            "category_counts": dict(self.category_counts or {}),
+        })
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.category_list = list(state.get("category_list", []) or [])
+        self.category_set = set(self.category_list)
+        self.category_counts = dict(state.get("category_counts", {}) or {})
+
+
+class MultiCategoryField(_CategoryStateMixin, BaseField):
     def __init__(self, name: str, optional: bool = False):
         super().__init__(name, optional)
         self.category_set = set()
@@ -105,7 +126,7 @@ class MultiCategoryField(BaseField):
         return
 
 
-class SingleCategoryField(BaseField):
+class SingleCategoryField(_CategoryStateMixin, BaseField):
     def __init__(self, name: str, optional: bool = False):
         super().__init__(name, optional)
         self.category_set = set()

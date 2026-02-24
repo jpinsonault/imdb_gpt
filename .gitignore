@@ -172,3 +172,14 @@ cython_debug/
 **/*.h5
 
 models/
+
+# Experiment artifacts
+decoder_experiments.json
+decoder_results.json
+decoder_results_v2.json
+transformer_decoder_results.json
+*.npz
+user_prefs.db
+nlp.py
+numeric_rep_bench_report.aux
+numeric_rep_bench_report.out

@@ -88,5 +88,20 @@ class BooleanField(BaseField):
             return F.binary_cross_entropy_with_logits(pred, target)
         return F.mse_loss(torch.tanh(pred), target)
 
+    def get_state(self):
+        state = super().get_state()
+        state.update({
+            "use_bce_loss": self.use_bce_loss,
+            "count_total": self.count_total,
+            "count_ones": self.count_ones,
+        })
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.use_bce_loss = bool(state.get("use_bce_loss", self.use_bce_loss))
+        self.count_total = int(state.get("count_total", 0))
+        self.count_ones = int(state.get("count_ones", 0))
+
     def print_stats(self):
         return

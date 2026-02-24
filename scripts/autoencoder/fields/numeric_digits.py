@@ -281,6 +281,34 @@ class NumericDigitCategoryField(BaseField):
         # Avoid division by zero
         return loss_sum / valid_count.clamp(min=1.0)
 
+    def get_state(self):
+        self._ensure_finalized()
+        state = super().get_state()
+        state.update({
+            "base": self.base,
+            "fraction_digits": self.fraction_digits,
+            "strip_nonnumeric": self.strip_nonnumeric,
+            "has_negative": self.has_negative,
+            "has_nan": self.has_nan,
+            "integer_digits": self.integer_digits or 1,
+            "total_positions": self.total_positions or 1,
+            "mask_index": self.mask_index,
+            "vocab_size": self.vocab_size,
+        })
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.base = int(state.get("base", self.base))
+        self.fraction_digits = int(state.get("fraction_digits", self.fraction_digits))
+        self.strip_nonnumeric = bool(state.get("strip_nonnumeric", self.strip_nonnumeric))
+        self.has_negative = bool(state.get("has_negative", self.has_negative))
+        self.has_nan = bool(state.get("has_nan", self.has_nan))
+        self.integer_digits = int(state.get("integer_digits", self.integer_digits or 1))
+        self.total_positions = int(state.get("total_positions", self.total_positions or self.integer_digits))
+        self.mask_index = self.base
+        self.vocab_size = self.base + 1
+
     def print_stats(self):
         return
 

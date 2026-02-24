@@ -238,7 +238,6 @@ class HybridSetModel(nn.Module):
 
             recon_table = self.movie_field_decoder(z)
 
-            _ = self.person_embeddings.weight
             people_weight = self.person_embeddings.weight
 
             logits_dict = {}
@@ -268,7 +267,6 @@ class HybridSetModel(nn.Module):
 
             recon_person = self.person_field_decoder(z_p)
 
-            _ = self.movie_embeddings.weight
             movie_weight = self.movie_embeddings.weight
 
             logits_person = {}

@@ -80,6 +80,52 @@ def make_lr_scheduler(optimizer, total_steps, schedule, warmup_steps, warmup_rat
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_fn, last_epoch=last_epoch)
 
 
+def compute_side_loss(batch_idx, model, dataset, mapping_tensors, criterion_set, cfg, device, model_key, **model_kwargs):
+    """Compute recon + set loss for one side (movie or person).
+    Returns (set_loss, recon_loss, side_total)."""
+    outputs = model(**model_kwargs)
+    side_out = outputs.get(model_key)
+    zero = torch.tensor(0.0, device=device)
+    if side_out is None:
+        return zero, zero, zero
+
+    logits_dict, recon_table, _, _ = side_out
+    inputs = [t[batch_idx].to(device, non_blocking=False) for t in dataset.stacked_fields]
+
+    recon_loss = torch.tensor(0.0, device=device)
+    for f, p_pred, t_in in zip(dataset.fields, recon_table, inputs):
+        recon_loss = recon_loss + f.compute_loss(p_pred, t_in) * f.weight
+
+    set_loss = torch.tensor(0.0, device=device)
+    for head_name, logits in logits_dict.items():
+        mapping = mapping_tensors.get(head_name)
+        padded = dataset.heads_padded.get(head_name)
+        if mapping is None or padded is None:
+            continue
+        raw_padded = padded[batch_idx].to(device, non_blocking=False)
+
+        mask = raw_padded != -1
+        rows, cols = torch.nonzero(mask, as_tuple=True)
+
+        targets = torch.zeros_like(logits)
+        if rows.numel() > 0:
+            glob = raw_padded[rows, cols].long()
+            loc = mapping[glob]
+            valid = loc != -1
+            if valid.any():
+                rows_v, loc_v = rows[valid], loc[valid]
+                targets[rows_v, loc_v] = 1.0
+
+        set_loss = set_loss + criterion_set(logits, targets)
+
+    side_total = cfg.hybrid_set_w_bce * set_loss + cfg.hybrid_set_w_recon * recon_loss
+    film_reg = outputs.get("film_reg")
+    if film_reg is not None:
+        side_total = side_total + cfg.hybrid_set_film_reg * film_reg
+
+    return set_loss, recon_loss, side_total
+
+
 def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, config):
     try:
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -413,94 +459,20 @@ def main():
                 person_recon_loss = torch.tensor(0.0, device=device)
 
                 if batch_movie_idx is not None:
-                    idx_m = batch_movie_idx.to(device).long()
-                    outputs_m = model(movie_indices=idx_m)
-                    movie_out = outputs_m.get("movie")
-                    if movie_out is not None:
-                        logits_dict_m, recon_table_m, _, _ = movie_out
-                        movie_inputs = [
-                            t[batch_movie_idx].to(device)
-                            for t in movie_ds.stacked_fields
-                        ]
-
-                        for f, p_pred, t_in in zip(movie_ds.fields, recon_table_m, movie_inputs):
-                            movie_recon_loss = movie_recon_loss + f.compute_loss(p_pred, t_in) * f.weight
-
-                        for head_name, logits in logits_dict_m.items():
-                            mapping = movie_mapping_tensors.get(head_name)
-                            padded = movie_ds.heads_padded.get(head_name)
-                            if mapping is None or padded is None:
-                                continue
-                            raw_padded = padded[batch_movie_idx]
-                            raw_padded = raw_padded.to(device, non_blocking=False)
-
-                            mask = raw_padded != -1
-                            rows, cols = torch.nonzero(mask, as_tuple=True)
-
-                            targets = torch.zeros_like(logits)
-                            if rows.numel() > 0:
-                                glob = raw_padded[rows, cols].long()
-                                loc = mapping[glob]
-                                valid = loc != -1
-                                if valid.any():
-                                    rows_v, loc_v = rows[valid], loc[valid]
-                                    targets[rows_v, loc_v] = 1.0
-
-                            head_set_loss = criterion_set(logits, targets)
-                            movie_set_loss = movie_set_loss + head_set_loss
-
-                        movie_loss_total = cfg.hybrid_set_w_bce * movie_set_loss + cfg.hybrid_set_w_recon * movie_recon_loss
-
-                        film_reg_m = outputs_m.get("film_reg")
-                        if film_reg_m is not None:
-                            movie_loss_total = movie_loss_total + cfg.hybrid_set_film_reg * film_reg_m
-
-                        total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
+                    movie_set_loss, movie_recon_loss, movie_loss_total = compute_side_loss(
+                        batch_movie_idx, model, movie_ds, movie_mapping_tensors,
+                        criterion_set, cfg, device, "movie",
+                        movie_indices=batch_movie_idx.to(device).long(),
+                    )
+                    total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
 
                 if batch_person_idx is not None:
-                    idx_p = batch_person_idx.to(device, non_blocking=False).long()
-                    outputs_p = model(person_indices=idx_p)
-                    person_out = outputs_p.get("person")
-                    if person_out is not None:
-                        logits_dict_p, recon_table_p, _, _ = person_out
-                        person_inputs = [
-                            t[batch_person_idx].to(device, non_blocking=False)
-                            for t in person_ds.stacked_fields
-                        ]
-
-                        for f, p_pred, t_in in zip(person_ds.fields, recon_table_p, person_inputs):
-                            person_recon_loss = person_recon_loss + f.compute_loss(p_pred, t_in) * f.weight
-
-                        for head_name, logits in logits_dict_p.items():
-                            mapping = person_mapping_tensors.get(head_name)
-                            padded = person_ds.heads_padded.get(head_name)
-                            if mapping is None or padded is None:
-                                continue
-                            raw_padded = padded[batch_person_idx]
-                            raw_padded = raw_padded.to(device, non_blocking=False)
-
-                            mask = raw_padded != -1
-                            rows, cols = torch.nonzero(mask, as_tuple=True)
-
-                            targets = torch.zeros_like(logits)
-                            if rows.numel() > 0:
-                                glob = raw_padded[rows, cols].long()
-                                loc = mapping[glob]
-                                valid = loc != -1
-                                if valid.any():
-                                    rows_v, loc_v = rows[valid], loc[valid]
-                                    targets[rows_v, loc_v] = 1.0
-
-                            head_set_loss = criterion_set(logits, targets)
-                            person_set_loss = person_set_loss + head_set_loss
-
-                        person_loss_total = cfg.hybrid_set_w_bce * person_set_loss + cfg.hybrid_set_w_recon * person_recon_loss
-
-                        film_reg_p = outputs_p.get("film_reg")
-                        if film_reg_p is not None:
-                            person_loss_total = person_loss_total + cfg.hybrid_set_film_reg * film_reg_p
-
-                        total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
+                    person_set_loss, person_recon_loss, person_loss_total = compute_side_loss(
+                        batch_person_idx, model, person_ds, person_mapping_tensors,
+                        criterion_set, cfg, device, "person",
+                        person_indices=batch_person_idx.to(device).long(),
+                    )
+                    total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
 
                 # Search encoder loss
                 search_loss = torch.tensor(0.0, device=device)

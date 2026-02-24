@@ -108,10 +108,10 @@ class BaseField:
         return {
             "name": self.name,
             "optional": self.optional,
-            "stats_finalized": self._stats_finalized,
+            "type": self.__class__.__name__,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
-        self.name = state.get("name", self.name)
+        if state.get("name") and self.name != state["name"]:
+            return
         self.optional = bool(state.get("optional", self.optional))
-        self._stats_finalized = bool(state.get("stats_finalized", True))

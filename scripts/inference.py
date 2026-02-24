@@ -67,12 +67,12 @@ class HybridSearchEngine:
             dropout=self.cfg.hybrid_set_dropout,
             logit_scale=self.cfg.hybrid_set_logit_scale,
             film_bottleneck_dim=self.cfg.hybrid_set_film_bottleneck_dim,
-            noise_std=getattr(self.cfg, 'hybrid_set_noise_std', 0.0),
-            decoder_num_layers=getattr(self.cfg, 'hybrid_set_decoder_num_layers', 2),
-            decoder_num_heads=getattr(self.cfg, 'hybrid_set_decoder_num_heads', 4),
-            decoder_ff_multiplier=getattr(self.cfg, 'hybrid_set_decoder_ff_multiplier', 4),
-            decoder_dropout=getattr(self.cfg, 'hybrid_set_decoder_dropout', 0.1),
-            decoder_norm_first=getattr(self.cfg, 'hybrid_set_decoder_norm_first', False),
+            noise_std=self.cfg.hybrid_set_noise_std,
+            decoder_num_layers=self.cfg.hybrid_set_decoder_num_layers,
+            decoder_num_heads=self.cfg.hybrid_set_decoder_num_heads,
+            decoder_ff_multiplier=self.cfg.hybrid_set_decoder_ff_multiplier,
+            decoder_dropout=self.cfg.hybrid_set_decoder_dropout,
+            decoder_norm_first=self.cfg.hybrid_set_decoder_norm_first,
         )
 
         ckpt_path = Path(self.cfg.model_dir) / "hybrid_set_state.pt"
@@ -128,7 +128,7 @@ class HybridSearchEngine:
 
             tconst_tokens = self.movie_ds.stacked_fields[self.movie_field_idx["tconst"]][idx]
             digits_str = tconst_field.render_ground_truth(tconst_tokens.cpu())
-            tconst = self._digits_to_tconst(digits_str)
+            tconst = self._digits_to_id(digits_str, "tt")
             self.movie_tconst.append(tconst)
             if tconst:
                 if tconst not in self.tconst_to_index:
@@ -149,7 +149,7 @@ class HybridSearchEngine:
 
             nconst_tokens = self.person_ds.stacked_fields[self.person_field_idx["nconst"]][idx]
             digits_str = nconst_field.render_ground_truth(nconst_tokens.cpu())
-            nconst = self._digits_to_nconst(digits_str)
+            nconst = self._digits_to_id(digits_str, "nm")
             self.person_nconst.append(nconst)
             if nconst:
                 if nconst not in self.nconst_to_index:
@@ -187,23 +187,15 @@ class HybridSearchEngine:
                 return f
         return None
 
-    def _digits_to_tconst(self, s: str) -> str:
+    @staticmethod
+    def _digits_to_id(s: str, prefix: str) -> str:
         s = str(s or "").strip()
         if not s:
             return ""
         digits = "".join(ch for ch in s if ch.isdigit())
         if not digits:
             return ""
-        return "tt" + digits.zfill(7)
-
-    def _digits_to_nconst(self, s: str) -> str:
-        s = str(s or "").strip()
-        if not s:
-            return ""
-        digits = "".join(ch for ch in s if ch.isdigit())
-        if not digits:
-            return ""
-        return "nm" + digits.zfill(7)
+        return prefix + digits.zfill(7)
 
     def _string_similarity(self, q: str, text: str) -> float:
         q = (q or "").strip().lower()
@@ -492,6 +484,110 @@ class HybridSearchEngine:
             )
         return by_head
 
+    @staticmethod
+    def _render_recon_fields(fields, orig_inputs, recon_table):
+        recon_fields = []
+        recon_counts: Dict[str, int] = {}
+        for f, orig_t, rec_field in zip(fields, orig_inputs, recon_table):
+            rec_t = rec_field[0].cpu()
+            db_render = f.render_ground_truth(orig_t)
+            pred_render = f.render_prediction(rec_t)
+            recon_fields.append({"name": f.name, "db": db_render, "recon": pred_render})
+            if f.name.endswith("Count"):
+                try:
+                    recon_counts[f.name] = int(pred_render)
+                except (TypeError, ValueError):
+                    pass
+        return recon_fields, recon_counts
+
+    @staticmethod
+    def _select_top_k(probs, local_to_global, k_hat, num_items, true_ids, item_render_fn, threshold):
+        vocab_size = int(local_to_global.shape[0])
+        order = probs.argsort()[::-1]
+
+        def _collect(use_threshold):
+            items: List[Dict[str, Any]] = []
+            for li in order:
+                if li < 0 or li >= vocab_size:
+                    continue
+                p_val = float(probs[li])
+                if use_threshold and p_val < threshold:
+                    break
+                global_idx = int(local_to_global[li].item())
+                if global_idx < 0 or global_idx >= num_items:
+                    continue
+                item = item_render_fn(global_idx, p_val, true_ids)
+                items.append(item)
+                if len(items) >= k_hat:
+                    break
+            return items
+
+        head_list = _collect(use_threshold=True)
+        if len(head_list) < k_hat and k_hat > 0:
+            head_list = _collect(use_threshold=False)
+        return head_list
+
+    def _decode_head_predictions(self, logits_dict, head_l2g, db_relations, id_key,
+                                 recon_counts, num_items, item_render_fn, threshold, max_items):
+        pred_heads: Dict[str, List[Dict[str, Any]]] = {}
+        for head, logits in logits_dict.items():
+            probs_t = torch.sigmoid(logits[0])
+            probs = probs_t.cpu().numpy()
+            local_to_global = head_l2g.get(head)
+            if local_to_global is None or local_to_global.numel() == 0:
+                continue
+
+            vocab_size = int(local_to_global.shape[0])
+            true_ids = {
+                item[id_key]
+                for item in db_relations.get(head, [])
+                if item.get(id_key)
+            }
+            true_count = len(true_ids)
+
+            pred_count = recon_counts.get(f"{head}Count")
+            soft_count = float(probs.sum())
+
+            if true_count > 0:
+                k_hat = true_count
+            elif pred_count is not None:
+                k_hat = max(0, int(pred_count))
+            else:
+                k_hat = int(round(soft_count))
+
+            k_hat = max(0, min(k_hat, vocab_size))
+            if max_items is not None:
+                k_hat = min(k_hat, int(max_items))
+
+            if k_hat == 0:
+                pred_heads[head] = []
+                continue
+
+            pred_heads[head] = self._select_top_k(
+                probs, local_to_global, k_hat, num_items, true_ids, item_render_fn, threshold,
+            )
+        return pred_heads
+
+    def _movie_item_render(self, global_idx, p_val, true_ids):
+        nconst = self.person_nconst[global_idx]
+        return {
+            "person_index": global_idx,
+            "primaryName": self.person_names[global_idx],
+            "nconst": nconst,
+            "prob": p_val,
+            "is_true": nconst in true_ids,
+        }
+
+    def _person_item_render(self, global_idx, p_val, true_ids):
+        tconst = self.movie_tconst[global_idx]
+        return {
+            "movie_index": global_idx,
+            "primaryTitle": self.movie_titles[global_idx],
+            "tconst": tconst,
+            "prob": p_val,
+            "is_true": tconst in true_ids,
+        }
+
     def get_movie_detail(self, movie_index: int, threshold: float = 0.5, max_items: int = 20) -> Dict[str, Any]:
         idx = int(movie_index)
         if idx < 0 or idx >= self.num_movies:
@@ -500,156 +596,30 @@ class HybridSearchEngine:
         tconst = self.movie_tconst[idx]
         db_row = self._db_fetch_movie_row(tconst)
         db_people = self._db_fetch_movie_people(tconst)
-
         orig_inputs = [t[idx].cpu() for t in self.movie_ds.stacked_fields]
 
         with torch.no_grad():
             idx_t = torch.tensor([idx], device=self.device, dtype=torch.long)
-            outputs = self.model(movie_indices=idx_t)
-            movie_out = outputs.get("movie")
+            model_out = self.model(movie_indices=idx_t).get("movie")
 
-        if movie_out is None:
-            recon_fields: List[Dict[str, Any]] = []
-            pred_heads: Dict[str, List[Dict[str, Any]]] = {}
+        if model_out is None:
+            recon_fields, pred_heads = [], {}
         else:
-            logits_dict, recon_table, _, _ = movie_out
-
-            recon_fields = []
-            recon_counts: Dict[str, int] = {}
-
-            for f, orig_t, rec_field in zip(self.movie_ds.fields, orig_inputs, recon_table):
-                rec_t = rec_field[0].cpu()
-                db_render = f.render_ground_truth(orig_t)
-                pred_render = f.render_prediction(rec_t)
-
-                recon_fields.append(
-                    {
-                        "name": f.name,
-                        "db": db_render,
-                        "recon": pred_render,
-                    }
-                )
-
-                if f.name.endswith("Count"):
-                    try:
-                        recon_counts[f.name] = int(pred_render)
-                    except (TypeError, ValueError):
-                        pass
-
-            pred_heads: Dict[str, List[Dict[str, Any]]] = {}
-            for head, logits in logits_dict.items():
-                probs_t = torch.sigmoid(logits[0])
-                probs = probs_t.cpu().numpy()
-                local_to_global = self.movie_ds.head_local_to_global.get(head)
-                if local_to_global is None or local_to_global.numel() == 0:
-                    continue
-
-                vocab_size = int(local_to_global.shape[0])
-
-                true_nconsts = {
-                    p["nconst"]
-                    for p in db_people.get(head, [])
-                    if p.get("nconst")
-                }
-                true_count = len(true_nconsts)
-
-                count_field_name = f"{head}Count"
-                pred_count = recon_counts.get(count_field_name)
-
-                soft_count = float(probs.sum())
-
-                if true_count > 0:
-                    k_hat = true_count
-                elif pred_count is not None:
-                    k_hat = max(0, int(pred_count))
-                else:
-                    k_hat = int(round(soft_count))
-
-                if k_hat < 0:
-                    k_hat = 0
-                if k_hat > vocab_size:
-                    k_hat = vocab_size
-                if max_items is not None:
-                    k_hat = min(k_hat, int(max_items))
-
-                if k_hat == 0:
-                    pred_heads[head] = []
-                    continue
-
-                order = probs.argsort()[::-1]
-                head_list: List[Dict[str, Any]] = []
-
-                for li in order:
-                    if li < 0 or li >= vocab_size:
-                        continue
-
-                    p_val = float(probs[li])
-                    if p_val < threshold:
-                        break
-
-                    global_idx = int(local_to_global[li].item())
-                    if global_idx < 0 or global_idx >= self.num_people:
-                        continue
-
-                    name = self.person_names[global_idx]
-                    nconst = self.person_nconst[global_idx]
-                    is_true = nconst in true_nconsts
-
-                    head_list.append(
-                        {
-                            "person_index": global_idx,
-                            "primaryName": name,
-                            "nconst": nconst,
-                            "prob": p_val,
-                            "is_true": is_true,
-                        }
-                    )
-
-                    if len(head_list) >= k_hat:
-                        break
-
-                if len(head_list) < k_hat and k_hat > 0:
-                    head_list = []
-                    for li in order:
-                        if li < 0 or li >= vocab_size:
-                            continue
-
-                        p_val = float(probs[li])
-                        global_idx = int(local_to_global[li].item())
-                        if global_idx < 0 or global_idx >= self.num_people:
-                            continue
-
-                        name = self.person_names[global_idx]
-                        nconst = self.person_nconst[global_idx]
-                        is_true = nconst in true_nconsts
-
-                        head_list.append(
-                            {
-                                "person_index": global_idx,
-                                "primaryName": name,
-                                "nconst": nconst,
-                                "prob": p_val,
-                                "is_true": is_true,
-                            }
-                        )
-
-                        if len(head_list) >= k_hat:
-                            break
-
-                pred_heads[head] = head_list
+            logits_dict, recon_table, _, _ = model_out
+            recon_fields, recon_counts = self._render_recon_fields(
+                self.movie_ds.fields, orig_inputs, recon_table,
+            )
+            pred_heads = self._decode_head_predictions(
+                logits_dict, self.movie_ds.head_local_to_global, db_people, "nconst",
+                recon_counts, self.num_people, self._movie_item_render, threshold, max_items,
+            )
 
         return {
             "movie_index": idx,
             "tconst": tconst,
             "title": self.movie_titles[idx],
-            "db": {
-                "row": db_row,
-                "people_by_head": db_people,
-            },
-            "reconstructed": {
-                "fields": recon_fields,
-                "people_by_head": pred_heads,
-            },
+            "db": {"row": db_row, "people_by_head": db_people},
+            "reconstructed": {"fields": recon_fields, "people_by_head": pred_heads},
         }
 
     def get_person_detail(self, person_index: int, threshold: float = 0.5, max_items: int = 20) -> Dict[str, Any]:
@@ -660,156 +630,30 @@ class HybridSearchEngine:
         nconst = self.person_nconst[idx]
         db_row = self._db_fetch_person_row(nconst)
         db_movies = self._db_fetch_person_movies(nconst)
-
         orig_inputs = [t[idx].cpu() for t in self.person_ds.stacked_fields]
 
         with torch.no_grad():
             idx_t = torch.tensor([idx], device=self.device, dtype=torch.long)
-            outputs = self.model(person_indices=idx_t)
-            person_out = outputs.get("person")
+            model_out = self.model(person_indices=idx_t).get("person")
 
-        if person_out is None:
-            recon_fields: List[Dict[str, Any]] = []
-            pred_heads: Dict[str, List[Dict[str, Any]]] = {}
+        if model_out is None:
+            recon_fields, pred_heads = [], {}
         else:
-            logits_dict, recon_table, _, _ = person_out
-
-            recon_fields = []
-            recon_counts: Dict[str, int] = {}
-
-            for f, orig_t, rec_field in zip(self.person_ds.fields, orig_inputs, recon_table):
-                rec_t = rec_field[0].cpu()
-                db_render = f.render_ground_truth(orig_t)
-                pred_render = f.render_prediction(rec_t)
-
-                recon_fields.append(
-                    {
-                        "name": f.name,
-                        "db": db_render,
-                        "recon": pred_render,
-                    }
-                )
-
-                if f.name.endswith("Count"):
-                    try:
-                        recon_counts[f.name] = int(pred_render)
-                    except (TypeError, ValueError):
-                        pass
-
-            pred_heads: Dict[str, List[Dict[str, Any]]] = {}
-            for head, logits in logits_dict.items():
-                probs_t = torch.sigmoid(logits[0])
-                probs = probs_t.cpu().numpy()
-                local_to_global = self.person_ds.head_local_to_global.get(head)
-                if local_to_global is None or local_to_global.numel() == 0:
-                    continue
-
-                vocab_size = int(local_to_global.shape[0])
-
-                true_tconsts = {
-                    m["tconst"]
-                    for m in db_movies.get(head, [])
-                    if m.get("tconst")
-                }
-                true_count = len(true_tconsts)
-
-                count_field_name = f"{head}Count"
-                pred_count = recon_counts.get(count_field_name)
-
-                soft_count = float(probs.sum())
-
-                if true_count > 0:
-                    k_hat = true_count
-                elif pred_count is not None:
-                    k_hat = max(0, int(pred_count))
-                else:
-                    k_hat = int(round(soft_count))
-
-                if k_hat < 0:
-                    k_hat = 0
-                if k_hat > vocab_size:
-                    k_hat = vocab_size
-                if max_items is not None:
-                    k_hat = min(k_hat, int(max_items))
-
-                if k_hat == 0:
-                    pred_heads[head] = []
-                    continue
-
-                order = probs.argsort()[::-1]
-                head_list: List[Dict[str, Any]] = []
-
-                for li in order:
-                    if li < 0 or li >= vocab_size:
-                        continue
-
-                    p_val = float(probs[li])
-                    if p_val < threshold:
-                        break
-
-                    global_idx = int(local_to_global[li].item())
-                    if global_idx < 0 or global_idx >= self.num_movies:
-                        continue
-
-                    title = self.movie_titles[global_idx]
-                    tconst = self.movie_tconst[global_idx]
-                    is_true = tconst in true_tconsts
-
-                    head_list.append(
-                        {
-                            "movie_index": global_idx,
-                            "primaryTitle": title,
-                            "tconst": tconst,
-                            "prob": p_val,
-                            "is_true": is_true,
-                        }
-                    )
-
-                    if len(head_list) >= k_hat:
-                        break
-
-                if len(head_list) < k_hat and k_hat > 0:
-                    head_list = []
-                    for li in order:
-                        if li < 0 or li >= vocab_size:
-                            continue
-
-                        p_val = float(probs[li])
-                        global_idx = int(local_to_global[li].item())
-                        if global_idx < 0 or global_idx >= self.num_movies:
-                            continue
-
-                        title = self.movie_titles[global_idx]
-                        tconst = self.movie_tconst[global_idx]
-                        is_true = tconst in true_tconsts
-
-                        head_list.append(
-                            {
-                                "movie_index": global_idx,
-                                "primaryTitle": title,
-                                "tconst": tconst,
-                                "prob": p_val,
-                                "is_true": is_true,
-                            }
-                        )
-
-                        if len(head_list) >= k_hat:
-                            break
-
-                pred_heads[head] = head_list
+            logits_dict, recon_table, _, _ = model_out
+            recon_fields, recon_counts = self._render_recon_fields(
+                self.person_ds.fields, orig_inputs, recon_table,
+            )
+            pred_heads = self._decode_head_predictions(
+                logits_dict, self.person_ds.head_local_to_global, db_movies, "tconst",
+                recon_counts, self.num_movies, self._person_item_render, threshold, max_items,
+            )
 
         return {
             "person_index": idx,
             "nconst": nconst,
             "name": self.person_names[idx],
-            "db": {
-                "row": db_row,
-                "movies_by_head": db_movies,
-            },
-            "reconstructed": {
-                "fields": recon_fields,
-                "movies_by_head": pred_heads,
-            },
+            "db": {"row": db_row, "movies_by_head": db_movies},
+            "reconstructed": {"fields": recon_fields, "movies_by_head": pred_heads},
         }
 
 

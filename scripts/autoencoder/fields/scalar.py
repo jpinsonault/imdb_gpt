@@ -132,5 +132,32 @@ class ScalarField(BaseField):
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.mse_loss(pred, target)
 
+    def get_state(self):
+        state = super().get_state()
+        state.update({
+            "scaling": self.scaling.value,
+            "clip_max": self.clip_max,
+            "n": self.n,
+            "sum_": self.sum_,
+            "sum_sq": self.sum_sq,
+            "min_val": float(self.min_val) if np.isfinite(self.min_val) else 0.0,
+            "max_val": float(self.max_val) if np.isfinite(self.max_val) else 0.0,
+            "mean_val": self.mean_val,
+            "std_val": self.std_val,
+        })
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        self.scaling = Scaling(int(state.get("scaling", self.scaling.value)))
+        self.clip_max = state.get("clip_max", None)
+        self.n = int(state.get("n", 0))
+        self.sum_ = float(state.get("sum_", 0.0))
+        self.sum_sq = float(state.get("sum_sq", 0.0))
+        self.min_val = float(state.get("min_val", 0.0))
+        self.max_val = float(state.get("max_val", 0.0))
+        self.mean_val = float(state.get("mean_val", 0.0))
+        self.std_val = float(state.get("std_val", 1.0))
+
     def print_stats(self):
         return
