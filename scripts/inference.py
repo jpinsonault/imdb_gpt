@@ -60,7 +60,7 @@ class HybridSearchEngine:
             movie_head_vocab_sizes=self.movie_ds.head_vocab_sizes,
             movie_head_local_to_global=self.movie_ds.head_local_to_global,
             person_head_vocab_sizes=self.person_ds.head_vocab_sizes,
-            person_head_local_to_global=self.person_ds.person_head_local_to_global,
+            person_head_local_to_global=self.person_ds.head_local_to_global,
             movie_dim=self.cfg.hybrid_set_movie_dim,
             hidden_dim=self.cfg.hybrid_set_hidden_dim,
             person_dim=self.cfg.hybrid_set_person_dim,
@@ -264,10 +264,10 @@ class HybridSearchEngine:
         return results
 
     def _string_search_movies(self, title: str, top_k: int = 50) -> List[Dict[str, Any]]:
-        q_lower = title.lower()
+        query_lower = title.lower()
         sims: List[tuple[int, float]] = []
-        for idx, t in enumerate(self.movie_titles_lower):
-            sim = self._string_similarity(q_lower, t)
+        for idx, candidate in enumerate(self.movie_titles_lower):
+            sim = self._string_similarity(query_lower, candidate)
             if sim > 0.0:
                 sims.append((idx, sim))
 
@@ -287,10 +287,10 @@ class HybridSearchEngine:
         return results
 
     def _string_search_people(self, name: str, top_k: int = 50) -> List[Dict[str, Any]]:
-        q_lower = name.lower()
+        query_lower = name.lower()
         sims: List[tuple[int, float]] = []
-        for idx, t in enumerate(self.person_names_lower):
-            sim = self._string_similarity(q_lower, t)
+        for idx, candidate in enumerate(self.person_names_lower):
+            sim = self._string_similarity(query_lower, candidate)
             if sim > 0.0:
                 sims.append((idx, sim))
 
@@ -315,7 +315,7 @@ class HybridSearchEngine:
             tensor = self.movie_ds.stacked_fields[field_idx][idx]
             row[f.name] = f.render_ground_truth(tensor.cpu())
         row["tconst"] = self.movie_tconst[idx]
-        row["titleType"] = "movie"
+        row["entityType"] = "movie"
         return row
 
     def _decode_person_row_from_dataset(self, idx: int) -> Dict[str, Any]:
@@ -324,7 +324,7 @@ class HybridSearchEngine:
             tensor = self.person_ds.stacked_fields[field_idx][idx]
             row[f.name] = f.render_ground_truth(tensor.cpu())
         row["nconst"] = self.person_nconst[idx]
-        row["titleType"] = "person"
+        row["entityType"] = "person"
         return row
 
     def search_movies(self, title: str, top_k: int = 50) -> List[Dict[str, Any]]:

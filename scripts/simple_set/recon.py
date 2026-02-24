@@ -17,9 +17,9 @@ class HybridSetReconLogger:
     ):
         self.movie_dataset = movie_dataset
         self.person_dataset = person_dataset
-        self.every = max(1, int(interval_steps))
+        self.log_interval_steps = max(1, int(interval_steps))
         self.num_samples = num_samples
-        self.w = table_width
+        self.table_width = table_width
         self.threshold = threshold
 
         self.movie_inverse_mappings = self._build_inverse_mappings(
@@ -115,7 +115,7 @@ class HybridSetReconLogger:
         wrapper = textwrap.TextWrapper(
             initial_indent=f"{header}: ",
             subsequent_indent="    ",
-            width=self.w,
+            width=self.table_width,
         )
         return wrapper.fill(text)
 
@@ -243,29 +243,29 @@ class HybridSetReconLogger:
                 fp_local = pred_local_idxs - true_local_idxs
                 fn_local = true_local_idxs - pred_local_idxs
 
-                def fmt(idx_set):
+                def resolve_person_names(idx_set):
                     items = []
                     for local_idx2 in idx_set:
                         if local_idx2 < 0 or local_idx2 >= len(inv_map):
-                            name = f"UnkLocal:{local_idx2}"
-                            p_val = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
-                            items.append((name, p_val))
+                            person_name = f"UnkLocal:{local_idx2}"
+                            prob = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
+                            items.append((person_name, prob))
                             continue
                         global_idx = inv_map[local_idx2].item()
                         if global_idx != -1:
-                            name = self._get_person_name(global_idx)
+                            person_name = self._get_person_name(global_idx)
                         else:
-                            name = f"UnkLocal:{local_idx2}"
-                        p_val = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
-                        items.append((name, p_val))
+                            person_name = f"UnkLocal:{local_idx2}"
+                        prob = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
+                        items.append((person_name, prob))
                     items.sort(key=lambda x: x[1], reverse=True)
                     return items[:10]
 
                 lines.append(f"\n--- Head: {head.upper()} (Movie -> People) ---")
                 lines.append(f"Count: True={int(true_count)} Pred={pred_count}")
-                lines.append(self._format_list(fmt(tp_local), "[+] Match"))
-                lines.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
-                lines.append(self._format_list(fmt(fn_local), "[-] Missed"))
+                lines.append(self._format_list(resolve_person_names(tp_local), "[+] Match"))
+                lines.append(self._format_list(resolve_person_names(fp_local), "[x] FalsePos"))
+                lines.append(self._format_list(resolve_person_names(fn_local), "[-] Missed"))
 
         return lines
 
@@ -354,35 +354,35 @@ class HybridSetReconLogger:
                 fp_local = pred_local_idxs - true_local_idxs
                 fn_local = true_local_idxs - pred_local_idxs
 
-                def fmt(idx_set):
+                def resolve_movie_titles(idx_set):
                     items = []
                     for local_idx2 in idx_set:
                         if local_idx2 < 0 or local_idx2 >= len(inv_map):
-                            name = f"UnkLocal:{local_idx2}"
-                            p_val = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
-                            items.append((name, p_val))
+                            title = f"UnkLocal:{local_idx2}"
+                            prob = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
+                            items.append((title, prob))
                             continue
                         global_idx = inv_map[local_idx2].item()
                         if global_idx != -1:
-                            name = self._get_movie_title_by_idx(global_idx)
+                            title = self._get_movie_title_by_idx(global_idx)
                         else:
-                            name = f"UnkLocal:{local_idx2}"
-                        p_val = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
-                        items.append((name, p_val))
+                            title = f"UnkLocal:{local_idx2}"
+                        prob = probs_cpu[local_idx2] if 0 <= local_idx2 < len(probs_cpu) else 0.0
+                        items.append((title, prob))
                     items.sort(key=lambda x: x[1], reverse=True)
                     return items[:10]
 
                 lines.append(f"\n--- Head: {head.upper()} (Person -> Movies) ---")
                 lines.append(f"Count: True={int(true_count)} Pred={k_hat}")
-                lines.append(self._format_list(fmt(tp_local), "[+] Match"))
-                lines.append(self._format_list(fmt(fp_local), "[x] FalsePos"))
-                lines.append(self._format_list(fmt(fn_local), "[-] Missed"))
+                lines.append(self._format_list(resolve_movie_titles(tp_local), "[+] Match"))
+                lines.append(self._format_list(resolve_movie_titles(fp_local), "[x] FalsePos"))
+                lines.append(self._format_list(resolve_movie_titles(fn_local), "[-] Missed"))
 
         return lines
 
     @torch.no_grad()
     def step(self, global_step, model, run_logger):
-        if (global_step + 1) % self.every != 0:
+        if (global_step + 1) % self.log_interval_steps != 0:
             return
 
         model.eval()

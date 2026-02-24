@@ -85,7 +85,8 @@ class BaseField:
         self._finalize_stats()
         self._stats_finalized = True
 
-    def stats_finalized(self) -> bool:
+    @property
+    def is_stats_finalized(self) -> bool:
         return self._stats_finalized
 
     def transform(self, raw_value):

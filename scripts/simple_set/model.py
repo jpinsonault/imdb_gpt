@@ -181,29 +181,29 @@ class HybridSetModel(nn.Module):
         self.person_heads = nn.ModuleDict()
 
         for name, _ in heads_config.items():
-            mvocab = int(movie_head_vocab_sizes.get(name, 0))
-            m_l2g = movie_head_local_to_global.get(name)
-            if mvocab > 0 and m_l2g is not None:
+            movie_vocab_size = int(movie_head_vocab_sizes.get(name, 0))
+            movie_l2g_map = movie_head_local_to_global.get(name)
+            if movie_vocab_size > 0 and movie_l2g_map is not None:
                 self.movie_heads[name] = SetHead(
                     in_dim=self.movie_dim,
                     item_dim=self.person_dim,
-                    vocab_size=mvocab,
+                    vocab_size=movie_vocab_size,
                     hidden_dim=hidden_dim,
-                    local_to_global=m_l2g,
+                    local_to_global=movie_l2g_map,
                     dropout=dropout,
                     init_scale=logit_scale,
                     film_bottleneck_dim=film_bottleneck_dim,
                 )
 
-            pvocab = int(person_head_vocab_sizes.get(name, 0))
-            p_l2g = person_head_local_to_global.get(name)
-            if pvocab > 0 and p_l2g is not None:
+            person_vocab_size = int(person_head_vocab_sizes.get(name, 0))
+            person_l2g_map = person_head_local_to_global.get(name)
+            if person_vocab_size > 0 and person_l2g_map is not None:
                 self.person_heads[name] = SetHead(
                     in_dim=self.person_dim,
                     item_dim=self.movie_dim,
-                    vocab_size=pvocab,
+                    vocab_size=person_vocab_size,
                     hidden_dim=hidden_dim,
-                    local_to_global=p_l2g,
+                    local_to_global=person_l2g_map,
                     dropout=dropout,
                     init_scale=logit_scale,
                     film_bottleneck_dim=film_bottleneck_dim,

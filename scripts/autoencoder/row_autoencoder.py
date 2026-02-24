@@ -57,7 +57,7 @@ class TransformerFieldDecoder(nn.Module):
             [f.build_decoder(self.latent_dim) for f in self.fields]
         )
 
-        self._decs = None
+        self._field_decoders = None
 
     def _decode_all_fields(self, z: torch.Tensor) -> List[torch.Tensor]:
         if z.dim() == 1:
@@ -88,14 +88,14 @@ class TransformerFieldDecoder(nn.Module):
         return self._decode_all_fields(z)
 
     @property
-    def decs(self):
-        # Backward-compatible per-field decoders used by PathSiren code.
-        if self._decs is None:
-            decs = []
+    def field_decoders(self):
+        """Per-field decoder callables. Each takes a latent vector and returns that field's output."""
+        if self._field_decoders is None:
+            decoders = []
 
             for field_index in range(self.num_fields):
-                def make_dec(idx: int):
-                    def dec_fn(z: torch.Tensor, idx: int = idx):
+                def make_decoder(idx: int):
+                    def decode_field(z: torch.Tensor, idx: int = idx):
                         if z.dim() == 1:
                             z_in = z.unsqueeze(0)
                             single = True
@@ -103,10 +103,10 @@ class TransformerFieldDecoder(nn.Module):
                             z_in = z
                             single = False
 
-                        b = z_in.size(0)
+                        batch_size = z_in.size(0)
 
-                        g = self.global_token.expand(b, -1).unsqueeze(1)
-                        f = self.field_tokens.unsqueeze(0).expand(b, -1, -1)
+                        g = self.global_token.expand(batch_size, -1).unsqueeze(1)
+                        f = self.field_tokens.unsqueeze(0).expand(batch_size, -1, -1)
 
                         x = torch.cat([g, f], dim=1)
                         x = x + z_in.unsqueeze(1)
@@ -121,13 +121,13 @@ class TransformerFieldDecoder(nn.Module):
                             return y[0]
                         return y
 
-                    return dec_fn
+                    return decode_field
 
-                decs.append(make_dec(field_index))
+                decoders.append(make_decoder(field_index))
 
-            self._decs = decs
+            self._field_decoders = decoders
 
-        return self._decs
+        return self._field_decoders
 
 def _out_dim(m: nn.Module) -> int:
     for p in reversed(list(m.parameters())):

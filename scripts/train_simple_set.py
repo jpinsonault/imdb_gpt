@@ -287,7 +287,7 @@ def main():
         movie_head_vocab_sizes=movie_ds.head_vocab_sizes,
         movie_head_local_to_global=movie_ds.head_local_to_global,
         person_head_vocab_sizes=person_ds.head_vocab_sizes,
-        person_head_local_to_global=person_ds.person_head_local_to_global,
+        person_head_local_to_global=person_ds.head_local_to_global,
         movie_dim=cfg.hybrid_set_movie_dim,
         hidden_dim=cfg.hybrid_set_hidden_dim,
         person_dim=cfg.hybrid_set_person_dim,

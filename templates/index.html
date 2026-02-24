@@ -155,7 +155,7 @@
                     </div>
 
                     <div class="flex-grow">
-                        <template x-if="item.titleType === 'movie'">
+                        <template x-if="item.entityType === 'movie'">
                             <div>
                                 <div class="flex justify-between items-start">
                                     <a :href="'/movie/' + item._id"
@@ -198,7 +198,7 @@
                             </div>
                         </template>
 
-                        <template x-if="item.titleType === 'person'">
+                        <template x-if="item.entityType === 'person'">
                             <div>
                                 <div class="flex justify-between items-start">
                                     <a :href="'/person/' + item._id"
