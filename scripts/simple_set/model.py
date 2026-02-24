@@ -1,12 +1,22 @@
 # scripts/simple_set/model.py
 
 import math
+from typing import Dict, List, NamedTuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder
 from scripts.autoencoder.fields import TextField
+
+
+class SideOutput(NamedTuple):
+    """Output for one side (movie or person) of HybridSetModel.forward()."""
+    logits_dict: Dict[str, torch.Tensor]
+    recon_table: List[torch.Tensor]
+    embeddings: torch.Tensor
+    indices: torch.Tensor
 
 
 class SetHead(nn.Module):
@@ -251,7 +261,7 @@ class HybridSetModel(nn.Module):
                     else:
                         film_reg = film_reg + head_module.last_reg
 
-            outputs["movie"] = (logits_dict, recon_table, z, idx)
+            outputs["movie"] = SideOutput(logits_dict, recon_table, z, idx)
 
             if film_reg is not None:
                 film_reg_total = film_reg if film_reg_total is None else film_reg_total + film_reg
@@ -280,7 +290,7 @@ class HybridSetModel(nn.Module):
                     else:
                         film_reg_p = film_reg_p + head_module.last_reg
 
-            outputs["person"] = (logits_person, recon_person, z_p, idx_p)
+            outputs["person"] = SideOutput(logits_person, recon_person, z_p, idx_p)
 
             if film_reg_p is not None:
                 film_reg_total = film_reg_total + film_reg_p if film_reg_total is not None else film_reg_p

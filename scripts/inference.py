@@ -605,12 +605,11 @@ class HybridSearchEngine:
         if model_out is None:
             recon_fields, pred_heads = [], {}
         else:
-            logits_dict, recon_table, _, _ = model_out
             recon_fields, recon_counts = self._render_recon_fields(
-                self.movie_ds.fields, orig_inputs, recon_table,
+                self.movie_ds.fields, orig_inputs, model_out.recon_table,
             )
             pred_heads = self._decode_head_predictions(
-                logits_dict, self.movie_ds.head_local_to_global, db_people, "nconst",
+                model_out.logits_dict, self.movie_ds.head_local_to_global, db_people, "nconst",
                 recon_counts, self.num_people, self._movie_item_render, threshold, max_items,
             )
 
@@ -639,12 +638,11 @@ class HybridSearchEngine:
         if model_out is None:
             recon_fields, pred_heads = [], {}
         else:
-            logits_dict, recon_table, _, _ = model_out
             recon_fields, recon_counts = self._render_recon_fields(
-                self.person_ds.fields, orig_inputs, recon_table,
+                self.person_ds.fields, orig_inputs, model_out.recon_table,
             )
             pred_heads = self._decode_head_predictions(
-                logits_dict, self.person_ds.head_local_to_global, db_movies, "tconst",
+                model_out.logits_dict, self.person_ds.head_local_to_global, db_movies, "tconst",
                 recon_counts, self.num_movies, self._person_item_render, threshold, max_items,
             )
 

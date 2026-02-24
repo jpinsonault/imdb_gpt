@@ -89,7 +89,7 @@ def compute_side_loss(batch_idx, model, dataset, mapping_tensors, criterion_set,
     if side_out is None:
         return zero, zero, zero
 
-    logits_dict, recon_table, _, _ = side_out
+    logits_dict, recon_table = side_out.logits_dict, side_out.recon_table
     inputs = [t[batch_idx].to(device, non_blocking=False) for t in dataset.stacked_fields]
 
     recon_loss = torch.tensor(0.0, device=device)

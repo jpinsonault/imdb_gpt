@@ -168,7 +168,8 @@ class HybridSetReconLogger:
         outputs = model(movie_indices=movie_indices_t)
         if "movie" not in outputs:
             return []
-        logits_dict, recon_table, _, _ = outputs["movie"]
+        side = outputs["movie"]
+        logits_dict, recon_table = side.logits_dict, side.recon_table
 
         lines = []
 
@@ -281,7 +282,8 @@ class HybridSetReconLogger:
         outputs = model(person_indices=person_indices_t)
         if "person" not in outputs:
             return []
-        logits_dict, recon_table, _, _ = outputs["person"]
+        side = outputs["person"]
+        logits_dict, recon_table = side.logits_dict, side.recon_table
 
         lines = []
 
