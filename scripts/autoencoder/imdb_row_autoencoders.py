@@ -150,18 +150,23 @@ class TitlesAutoencoder(RowAutoencoder):
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             c = conn.cursor()
             c.execute("PRAGMA cache_size = -100000;") 
+            limit_clause = ""
+            params = ()
+            if self.config.movie_limit is not None:
+                limit_clause = "LIMIT ?"
+                params = (self.config.movie_limit,)
             c.execute(
                 f"""
-                SELECT 
+                SELECT
                     {movie_select_clause(alias='t', genre_alias='g')}
                 {movie_from_join()}
-                WHERE 
+                WHERE
                     {movie_where_clause()}
                 {movie_group_by()}
                 {movie_having()}
-                LIMIT ?
+                {limit_clause}
                 """,
-                (self.config.movie_limit,)
+                params,
             )
             for row in c:
                 yield map_movie_row(row)

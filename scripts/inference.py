@@ -40,10 +40,12 @@ class HybridSearchEngine:
         logging.info("Initializing HybridSearchEngine on %s", self.device)
 
         cache_path = ensure_hybrid_cache(self.cfg)
-        cache_path = Path(cache_path)
 
-        self.movie_ds = HybridSetDataset(str(cache_path), self.cfg)
-        self.person_ds = PersonHybridSetDataset(str(cache_path), self.cfg)
+        logging.info("Loading hybrid cache from %s...", cache_path)
+        cache_data = torch.load(str(cache_path), map_location="cpu")
+
+        self.movie_ds = HybridSetDataset(cache_data, self.cfg)
+        self.person_ds = PersonHybridSetDataset(cache_data, self.cfg)
 
         self.num_movies = len(self.movie_ds)
         self.num_people = self.movie_ds.num_people

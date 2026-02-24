@@ -265,8 +265,11 @@ def main():
 
     cache_path = ensure_hybrid_cache(cfg)
 
-    movie_ds = HybridSetDataset(str(cache_path), cfg)
-    person_ds = PersonHybridSetDataset(str(cache_path), cfg)
+    logging.info("Loading hybrid cache from %s...", cache_path)
+    cache_data = torch.load(str(cache_path), map_location="cpu")
+
+    movie_ds = HybridSetDataset(cache_data, cfg)
+    person_ds = PersonHybridSetDataset(cache_data, cfg)
 
     movie_loader = DataLoader(
         movie_ds,

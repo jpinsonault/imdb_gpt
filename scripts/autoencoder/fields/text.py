@@ -221,13 +221,21 @@ class _TextEncoder(nn.Module):
     def __init__(self, vocab: int, max_len: int, ch: int, latent_dim: int):
         super().__init__()
         self.emb = nn.Embedding(vocab, ch)
-        self.conv = nn.Conv1d(ch, ch * 2, kernel_size=5, stride=2, padding=2)
+        self.pos_emb = nn.Embedding(max_len, ch)
+        self.conv1 = nn.Conv1d(ch, ch * 2, kernel_size=5, stride=2, padding=2)
+        self.conv2 = nn.Conv1d(ch * 2, ch * 2, kernel_size=3, stride=1, padding=1)
+        self.norm = nn.LayerNorm(ch * 2)
         self.out = nn.Linear((max_len // 2) * (ch * 2), latent_dim)
 
     def forward(self, x):
-        x = self.emb(x)
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        x = self.emb(x) + self.pos_emb(positions)
         x = x.transpose(1, 2)
-        x = F.gelu(self.conv(x))
+        x = F.gelu(self.conv1(x))
+        residual = x
+        x = F.gelu(self.conv2(x)) + residual
+        x = x.transpose(1, 2)
+        x = self.norm(x)
         x = x.flatten(1)
         return self.out(x)
 

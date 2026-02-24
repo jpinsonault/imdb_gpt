@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 @dataclass
 class ProjectConfig:
@@ -22,7 +22,7 @@ class ProjectConfig:
     latent_dim: int = 64
     log_interval: int = 50
     save_interval: int = 500
-    movie_limit: int = 100000000000  # SQL LIMIT; effectively "no limit"
+    movie_limit: Optional[int] = None
 
     # -- LR schedule (shared by both training scripts) --
     lr_schedule: str = "cosine"

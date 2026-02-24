@@ -183,3 +183,4 @@ user_prefs.db
 nlp.py
 numeric_rep_bench_report.aux
 numeric_rep_bench_report.out
+latents_viewer.html

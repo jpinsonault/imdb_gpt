@@ -8,10 +8,9 @@ from scripts.autoencoder.row_autoencoder import _apply_field_state
 
 
 class HybridSetDataset(Dataset):
-    def __init__(self, cache_path, cfg):
+    def __init__(self, data, cfg):
         super().__init__()
-        logging.info(f"Loading movie hybrid dataset from {cache_path}...")
-        data = torch.load(cache_path, map_location="cpu")
+        logging.info("Initializing movie hybrid dataset...")
 
         self.stacked_fields = data["stacked_fields"]
         self.heads_padded = data["heads_padded"]
@@ -49,10 +48,9 @@ class HybridSetDataset(Dataset):
 
 
 class PersonHybridSetDataset(Dataset):
-    def __init__(self, cache_path, cfg):
+    def __init__(self, data, cfg):
         super().__init__()
-        logging.info(f"Loading person hybrid dataset from {cache_path}...")
-        data = torch.load(cache_path, map_location="cpu")
+        logging.info("Initializing person hybrid dataset...")
 
         self.stacked_fields = data["person_stacked_fields"]
         self.heads_padded = data["person_heads_padded"]
