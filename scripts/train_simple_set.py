@@ -162,6 +162,15 @@ def save_checkpoint(model_dir, model, optimizer, scheduler, epoch, global_step, 
         logging.error(f"Failed to save training state: {e}")
 
 
+def _require_field_index(fields, name: str) -> int:
+    """Find field index by name, raising KeyError if not found."""
+    for i, f in enumerate(fields):
+        if f.name == name:
+            return i
+    available = [f.name for f in fields]
+    raise KeyError(f"Required field '{name}' not found. Available: {available}")
+
+
 def _count_module_params(module: nn.Module):
     total = 0
     trainable = 0
@@ -303,18 +312,9 @@ def main():
     )
     model.to(device)
 
-    # Find field indices for search encoder training
-    movie_title_field_idx = None
-    for i, f in enumerate(movie_ds.fields):
-        if f.name == "primaryTitle":
-            movie_title_field_idx = i
-            break
-
-    person_name_field_idx = None
-    for i, f in enumerate(person_ds.fields):
-        if f.name == "primaryName":
-            person_name_field_idx = i
-            break
+    # Find field indices for search encoder training (validated — fails loudly if missing)
+    movie_title_field_idx = _require_field_index(movie_ds.fields, "primaryTitle")
+    person_name_field_idx = _require_field_index(person_ds.fields, "primaryName")
 
     emb_params = list(model.movie_embeddings.parameters()) + list(model.person_embeddings.parameters())
     emb_param_ids = {id(p) for p in emb_params}
@@ -434,16 +434,16 @@ def main():
                 break
 
             try:
-                batch_movie_idx = next(movie_iter)
+                movie_batch = next(movie_iter)
             except StopIteration:
-                batch_movie_idx = None
+                movie_batch = None
 
             try:
-                batch_person_idx = next(person_iter)
+                person_batch = next(person_iter)
             except StopIteration:
-                batch_person_idx = None
+                person_batch = None
 
-            if batch_movie_idx is None and batch_person_idx is None:
+            if movie_batch is None and person_batch is None:
                 continue
 
             model.train()
@@ -458,19 +458,19 @@ def main():
                 person_set_loss = torch.tensor(0.0, device=device)
                 person_recon_loss = torch.tensor(0.0, device=device)
 
-                if batch_movie_idx is not None:
+                if movie_batch is not None:
                     movie_set_loss, movie_recon_loss, movie_loss_total = compute_side_loss(
-                        batch_movie_idx, model, movie_ds, movie_mapping_tensors,
+                        movie_batch, model, movie_ds, movie_mapping_tensors,
                         criterion_set, cfg, device, "movie",
-                        movie_indices=batch_movie_idx.to(device).long(),
+                        movie_indices=movie_batch.to(device).long(),
                     )
                     total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
 
-                if batch_person_idx is not None:
+                if person_batch is not None:
                     person_set_loss, person_recon_loss, person_loss_total = compute_side_loss(
-                        batch_person_idx, model, person_ds, person_mapping_tensors,
+                        person_batch, model, person_ds, person_mapping_tensors,
                         criterion_set, cfg, device, "person",
-                        person_indices=batch_person_idx.to(device).long(),
+                        person_indices=person_batch.to(device).long(),
                     )
                     total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
 
@@ -482,13 +482,13 @@ def main():
                     se_movie_idx = None
                     se_person_idx = None
 
-                    if batch_movie_idx is not None and movie_title_field_idx is not None and model.movie_title_encoder is not None:
-                        se_movie_idx = batch_movie_idx.to(device, non_blocking=False).long()
-                        movie_title_tokens = movie_ds.stacked_fields[movie_title_field_idx][batch_movie_idx].to(device, non_blocking=False)
+                    if movie_batch is not None and model.movie_title_encoder is not None:
+                        se_movie_idx = movie_batch.to(device, non_blocking=False).long()
+                        movie_title_tokens = movie_ds.stacked_fields[movie_title_field_idx][movie_batch].to(device, non_blocking=False)
 
-                    if batch_person_idx is not None and person_name_field_idx is not None and model.person_name_encoder is not None:
-                        se_person_idx = batch_person_idx.to(device, non_blocking=False).long()
-                        person_name_tokens = person_ds.stacked_fields[person_name_field_idx][batch_person_idx].to(device, non_blocking=False)
+                    if person_batch is not None and model.person_name_encoder is not None:
+                        se_person_idx = person_batch.to(device, non_blocking=False).long()
+                        person_name_tokens = person_ds.stacked_fields[person_name_field_idx][person_batch].to(device, non_blocking=False)
 
                     search_loss = model.compute_search_encoder_loss(
                         se_movie_idx, movie_title_tokens, se_person_idx, person_name_tokens,

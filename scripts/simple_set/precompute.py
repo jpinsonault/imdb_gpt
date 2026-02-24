@@ -175,12 +175,12 @@ def _build_head_vocab_mappings(head_populations, id_to_global_idx, total_items):
         mappings[head] = mapping_tensor
 
         if local_vocab_size > 0:
-            l2g = torch.full((local_vocab_size,), -1, dtype=torch.long)
+            local_to_global_map = torch.full((local_vocab_size,), -1, dtype=torch.long)
             valid_mask = mapping_tensor != -1
             global_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
             local_indices = mapping_tensor[global_indices]
-            l2g[local_indices] = global_indices
-            local_to_global[head] = l2g
+            local_to_global_map[local_indices] = global_indices
+            local_to_global[head] = local_to_global_map
 
     return vocab_sizes, mappings, local_to_global
 
@@ -289,6 +289,29 @@ def _fetch_person_metadata(cur, sorted_nconsts):
 
 
 # ---------------------------------------------------------------------------
+# Phase 7: Filter person edges to final movie set
+# ---------------------------------------------------------------------------
+
+def _restrict_to_final_movies(person_data, final_tconsts):
+    """Filter person_data to only include edges to movies in final_tconsts.
+
+    Returns (person_data_final, person_head_populations_final).
+    """
+    final_set = set(final_tconsts)
+    person_data_final = defaultdict(lambda: defaultdict(set))
+    populations_final = defaultdict(set)
+
+    for nconst, head_dict in person_data.items():
+        for head, tconsts in head_dict.items():
+            for t in tconsts:
+                if t in final_set:
+                    person_data_final[nconst][head].add(t)
+                    populations_final[head].add(t)
+
+    return person_data_final, populations_final
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -304,16 +327,23 @@ def build_hybrid_cache(cfg: ProjectConfig):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    movie_data, person_data, movie_head_pops, person_head_pops = (
+    movie_data, person_data, movie_head_populations, person_head_populations = (
         _fetch_and_bucket_edges(cur, cfg)
     )
 
-    # Filter to movies that have both cast and director edges
+    # Filter to movies that have edges for all required heads (data completeness)
+    for h in cfg.hybrid_set_required_heads:
+        if h not in cfg.hybrid_set_heads:
+            raise ValueError(
+                f"Required head '{h}' not in hybrid_set_heads config. "
+                f"Available: {list(cfg.hybrid_set_heads.keys())}"
+            )
+    required = cfg.hybrid_set_required_heads
     potential_tconsts = sorted(
         t for t, heads in movie_data.items()
-        if heads.get("cast") and heads.get("director")
+        if all(heads.get(h) for h in required)
     )
-    logging.info(f"Movie filtering: {len(potential_tconsts)} movies with cast + director.")
+    logging.info(f"Movie filtering: {len(potential_tconsts)} movies with {' + '.join(required)}.")
 
     # Phase 3: Global index mappings
     final_tconsts, fetched_rows, tconst_to_idx, sorted_nconsts, nconst_to_idx = (
@@ -325,7 +355,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # Phase 4a: Movie-to-people head vocabularies
     logging.info("Building movie-to-people head vocabularies...")
     head_vocab_sizes, head_mappings, head_local_to_global = (
-        _build_head_vocab_mappings(movie_head_pops, nconst_to_idx, num_people)
+        _build_head_vocab_mappings(movie_head_populations, nconst_to_idx, num_people)
     )
 
     # Phase 5a: Stack movie fields and head targets
@@ -342,18 +372,11 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # Phase 6a: Person names
     idx_to_person_name = _fetch_person_names(cur, sorted_nconsts, nconst_to_idx)
 
-    # Restrict person_data to final movies only
+    # Restrict person_data to only include edges to movies in the final set
     logging.info("Building person-centric movie heads...")
-    final_tconsts_set = set(final_tconsts)
-    person_data_final = defaultdict(lambda: defaultdict(set))
-    person_head_pops_final = defaultdict(set)
-
-    for nconst, head_dict in person_data.items():
-        for head, tconsts in head_dict.items():
-            for t in tconsts:
-                if t in final_tconsts_set:
-                    person_data_final[nconst][head].add(t)
-                    person_head_pops_final[head].add(t)
+    person_data_final, person_head_populations_final = (
+        _restrict_to_final_movies(person_data, final_tconsts)
+    )
 
     # Phase 6b: Person metadata
     fetched_people_rows = _fetch_person_metadata(cur, sorted_nconsts)
@@ -372,7 +395,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     # Phase 4b: Person-to-movie head vocabularies
     logging.info("Building person-to-movie head vocabularies...")
     person_head_vocab_sizes, person_head_mappings, person_head_local_to_global = (
-        _build_head_vocab_mappings(person_head_pops_final, tconst_to_idx, num_movies)
+        _build_head_vocab_mappings(person_head_populations_final, tconst_to_idx, num_movies)
     )
 
     conn.close()

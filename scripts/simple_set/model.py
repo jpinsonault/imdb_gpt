@@ -42,9 +42,9 @@ class SetHead(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.out_proj = nn.Linear(self.hidden_dim, item_dim)
 
-        self.use_res = self.in_dim == item_dim
-        if self.use_res:
-            self.res_scale = nn.Parameter(torch.tensor(0.1))
+        self.can_skip_connect = self.in_dim == item_dim
+        if self.can_skip_connect:
+            self.skip_scale = nn.Parameter(torch.tensor(0.1))
 
         bottleneck_dim = int(film_bottleneck_dim)
         if bottleneck_dim <= 0:
@@ -109,8 +109,8 @@ class SetHead(nn.Module):
         x = self.drop(x)
         q = self.out_proj(x)
 
-        if self.use_res:
-            q = q + self.res_scale * z
+        if self.can_skip_connect:
+            q = q + self.skip_scale * z
 
         q = F.normalize(q, p=2, dim=-1)
 
@@ -192,28 +192,28 @@ class HybridSetModel(nn.Module):
 
         for name, _ in heads_config.items():
             movie_vocab_size = int(movie_head_vocab_sizes.get(name, 0))
-            movie_l2g_map = movie_head_local_to_global.get(name)
-            if movie_vocab_size > 0 and movie_l2g_map is not None:
+            movie_local_to_global = movie_head_local_to_global.get(name)
+            if movie_vocab_size > 0 and movie_local_to_global is not None:
                 self.movie_heads[name] = SetHead(
                     in_dim=self.movie_dim,
                     item_dim=self.person_dim,
                     vocab_size=movie_vocab_size,
                     hidden_dim=hidden_dim,
-                    local_to_global=movie_l2g_map,
+                    local_to_global=movie_local_to_global,
                     dropout=dropout,
                     init_scale=logit_scale,
                     film_bottleneck_dim=film_bottleneck_dim,
                 )
 
             person_vocab_size = int(person_head_vocab_sizes.get(name, 0))
-            person_l2g_map = person_head_local_to_global.get(name)
-            if person_vocab_size > 0 and person_l2g_map is not None:
+            person_local_to_global = person_head_local_to_global.get(name)
+            if person_vocab_size > 0 and person_local_to_global is not None:
                 self.person_heads[name] = SetHead(
                     in_dim=self.person_dim,
                     item_dim=self.movie_dim,
                     vocab_size=person_vocab_size,
                     hidden_dim=hidden_dim,
-                    local_to_global=person_l2g_map,
+                    local_to_global=person_local_to_global,
                     dropout=dropout,
                     init_scale=logit_scale,
                     film_bottleneck_dim=film_bottleneck_dim,
@@ -238,62 +238,62 @@ class HybridSetModel(nn.Module):
         film_reg_total = None
 
         if movie_indices is not None:
-            idx = movie_indices.to(self.movie_embeddings.weight.device, non_blocking=True).long()
-            z = self.movie_embeddings(idx)
-            z = F.normalize(z, p=2, dim=-1)
+            movie_idx = movie_indices.to(self.movie_embeddings.weight.device, non_blocking=True).long()
+            movie_emb = self.movie_embeddings(movie_idx)
+            movie_emb = F.normalize(movie_emb, p=2, dim=-1)
 
             if self.training and self.noise_std > 0:
-                z = z + torch.randn_like(z) * self.noise_std
-                z = F.normalize(z, p=2, dim=-1)
+                movie_emb = movie_emb + torch.randn_like(movie_emb) * self.noise_std
+                movie_emb = F.normalize(movie_emb, p=2, dim=-1)
 
-            recon_table = self.movie_field_decoder(z)
+            recon_table = self.movie_field_decoder(movie_emb)
 
             people_weight = self.person_embeddings.weight
 
             logits_dict = {}
-            film_reg = None
+            movie_film_reg = None
             for name, head_module in self.movie_heads.items():
-                logits = head_module(z, people_weight, film_scale=film_scale)
+                logits = head_module(movie_emb, people_weight, film_scale=film_scale)
                 logits_dict[name] = logits
                 if head_module.last_reg is not None:
-                    if film_reg is None:
-                        film_reg = head_module.last_reg
+                    if movie_film_reg is None:
+                        movie_film_reg = head_module.last_reg
                     else:
-                        film_reg = film_reg + head_module.last_reg
+                        movie_film_reg = movie_film_reg + head_module.last_reg
 
-            outputs["movie"] = SideOutput(logits_dict, recon_table, z, idx)
+            outputs["movie"] = SideOutput(logits_dict, recon_table, movie_emb, movie_idx)
 
-            if film_reg is not None:
-                film_reg_total = film_reg if film_reg_total is None else film_reg_total + film_reg
+            if movie_film_reg is not None:
+                film_reg_total = movie_film_reg if film_reg_total is None else film_reg_total + movie_film_reg
 
         if person_indices is not None:
-            idx_p = person_indices.to(self.person_embeddings.weight.device, non_blocking=True).long()
-            z_p = self.person_embeddings(idx_p)
-            z_p = F.normalize(z_p, p=2, dim=-1)
+            person_idx = person_indices.to(self.person_embeddings.weight.device, non_blocking=True).long()
+            person_emb = self.person_embeddings(person_idx)
+            person_emb = F.normalize(person_emb, p=2, dim=-1)
 
             if self.training and self.noise_std > 0:
-                z_p = z_p + torch.randn_like(z_p) * self.noise_std
-                z_p = F.normalize(z_p, p=2, dim=-1)
+                person_emb = person_emb + torch.randn_like(person_emb) * self.noise_std
+                person_emb = F.normalize(person_emb, p=2, dim=-1)
 
-            recon_person = self.person_field_decoder(z_p)
+            recon_person = self.person_field_decoder(person_emb)
 
             movie_weight = self.movie_embeddings.weight
 
             logits_person = {}
-            film_reg_p = None
+            person_film_reg = None
             for name, head_module in self.person_heads.items():
-                logits = head_module(z_p, movie_weight, film_scale=film_scale)
+                logits = head_module(person_emb, movie_weight, film_scale=film_scale)
                 logits_person[name] = logits
                 if head_module.last_reg is not None:
-                    if film_reg_p is None:
-                        film_reg_p = head_module.last_reg
+                    if person_film_reg is None:
+                        person_film_reg = head_module.last_reg
                     else:
-                        film_reg_p = film_reg_p + head_module.last_reg
+                        person_film_reg = person_film_reg + head_module.last_reg
 
-            outputs["person"] = SideOutput(logits_person, recon_person, z_p, idx_p)
+            outputs["person"] = SideOutput(logits_person, recon_person, person_emb, person_idx)
 
-            if film_reg_p is not None:
-                film_reg_total = film_reg_total + film_reg_p if film_reg_total is not None else film_reg_p
+            if person_film_reg is not None:
+                film_reg_total = film_reg_total + person_film_reg if film_reg_total is not None else person_film_reg
 
         if film_reg_total is not None:
             outputs["film_reg"] = film_reg_total

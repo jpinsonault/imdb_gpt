@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 @dataclass
 class ProjectConfig:
@@ -90,6 +90,7 @@ class ProjectConfig:
     })
 
     # -- Data filtering --
+    hybrid_set_required_heads: List[str] = field(default_factory=lambda: ["cast", "director"])
     hybrid_set_min_person_frequency: int = 3  # min movie appearances to include a person
 
     # -- Reconstruction display --

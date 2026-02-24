@@ -100,12 +100,12 @@ class TitlesAutoencoder(RowAutoencoder):
                 GROUP BY pr.tconst
             )
             """
-            mx_pc = cur.execute(q_pc).fetchone()
-            mx_pc_val = mx_pc[0] if mx_pc and mx_pc[0] else 50
+            max_count_row = cur.execute(q_pc).fetchone()
+            max_people_count = max_count_row[0] if max_count_row and max_count_row[0] else 50
 
             # Use the same upper bound for each per-head count.
             for head_name in self.config.hybrid_set_heads:
-                self._manual_inject_digits(f"{head_name}Count", 0, mx_pc_val)
+                self._manual_inject_digits(f"{head_name}Count", 0, max_people_count)
 
             # 3. CATEGORICAL: Genres
             logging.info("[Titles] Accumulating Genres...")
@@ -235,9 +235,9 @@ class PeopleAutoencoder(RowAutoencoder):
                 GROUP BY pr.nconst
             )
             """
-            mx_tc = cur.execute(q_tc).fetchone()
-            if mx_tc and mx_tc[0]:
-                max_titles = mx_tc[0]
+            max_count_row = cur.execute(q_tc).fetchone()
+            if max_count_row and max_count_row[0]:
+                max_titles = max_count_row[0]
             else:
                 max_titles = 200
 

@@ -51,6 +51,28 @@ class HybridSearchEngine:
         logging.info("Loaded movie dataset with %d items", self.num_movies)
         logging.info("Loaded person dataset with %d items", self.num_people)
 
+        missing = self._load_model_checkpoint()
+
+        self.movie_field_idx = {f.name: i for i, f in enumerate(self.movie_ds.fields)}
+        self.person_field_idx = {f.name: i for i, f in enumerate(self.person_ds.fields)}
+
+        self.movie_title_field = self._require_text_field(self.movie_ds.fields, "primaryTitle")
+        self.person_name_field = self._require_text_field(self.person_ds.fields, "primaryName")
+
+        self._decode_movie_metadata()
+        self._decode_person_metadata()
+
+        self.db_path = self.cfg.db_path
+
+        self._detect_search_encoders(missing)
+        logging.info("HybridSearchEngine ready")
+
+    def _load_model_checkpoint(self) -> List[str]:
+        """Create model, load checkpoint weights, and build normalized embedding tables.
+
+        Returns the list of missing keys from the checkpoint (used to detect
+        whether optional modules like search encoders were actually trained).
+        """
         self.model = HybridSetModel(
             movie_fields=self.movie_ds.fields,
             person_fields=self.person_ds.fields,
@@ -102,17 +124,10 @@ class HybridSearchEngine:
                 dim=-1,
             )
 
-        self.movie_field_idx = {f.name: i for i, f in enumerate(self.movie_ds.fields)}
-        self.person_field_idx = {f.name: i for i, f in enumerate(self.person_ds.fields)}
+        return missing
 
-        self.movie_title_field = self._find_text_field(self.movie_ds.fields, "primaryTitle")
-        self.person_name_field = self._find_text_field(self.person_ds.fields, "primaryName")
-
-        if self.movie_title_field is None:
-            raise RuntimeError("No TextField named 'primaryTitle' found in movie fields")
-        if self.person_name_field is None:
-            raise RuntimeError("No TextField named 'primaryName' found in person fields")
-
+    def _decode_movie_metadata(self):
+        """Decode movie titles and tconst IDs from the dataset for search."""
         logging.info("Decoding movie titles and IDs for search")
         self.movie_titles: List[str] = []
         self.movie_titles_lower: List[str] = []
@@ -130,10 +145,11 @@ class HybridSearchEngine:
             digits_str = tconst_field.render_ground_truth(tconst_tokens.cpu())
             tconst = self._digits_to_id(digits_str, "tt")
             self.movie_tconst.append(tconst)
-            if tconst:
-                if tconst not in self.tconst_to_index:
-                    self.tconst_to_index[tconst] = idx
+            if tconst and tconst not in self.tconst_to_index:
+                self.tconst_to_index[tconst] = idx
 
+    def _decode_person_metadata(self):
+        """Decode person names and nconst IDs from the dataset for search."""
         logging.info("Decoding person names and IDs for search")
         self.person_names: List[str] = []
         self.person_names_lower: List[str] = []
@@ -151,22 +167,18 @@ class HybridSearchEngine:
             digits_str = nconst_field.render_ground_truth(nconst_tokens.cpu())
             nconst = self._digits_to_id(digits_str, "nm")
             self.person_nconst.append(nconst)
-            if nconst:
-                if nconst not in self.nconst_to_index:
-                    self.nconst_to_index[nconst] = idx
+            if nconst and nconst not in self.nconst_to_index:
+                self.nconst_to_index[nconst] = idx
 
-        self.db_path = self.cfg.db_path
-
-        # Detect whether search encoders were loaded (not just randomly initialized)
+    def _detect_search_encoders(self, missing_keys: List[str]):
+        """Check whether search encoder weights were loaded (not just randomly initialized)."""
         self.has_movie_search_encoder = (
             self.model.movie_title_encoder is not None
-            and not missing  # encoder keys were present in checkpoint
-            or (self.model.movie_title_encoder is not None
-                and not any("movie_title_encoder" in k for k in missing))
+            and not any("movie_title_encoder" in k for k in missing_keys)
         )
         self.has_person_search_encoder = (
             self.model.person_name_encoder is not None
-            and not any("person_name_encoder" in k for k in missing)
+            and not any("person_name_encoder" in k for k in missing_keys)
         )
 
         if self.has_movie_search_encoder:
@@ -179,13 +191,14 @@ class HybridSearchEngine:
         else:
             logging.info("No trained person name encoder — falling back to string search")
 
-        logging.info("HybridSearchEngine ready")
-
-    def _find_text_field(self, fields, name: str) -> Optional[TextField]:
+    @staticmethod
+    def _require_text_field(fields, name: str) -> TextField:
+        """Find a TextField by name, raising if not found."""
         for f in fields:
             if isinstance(f, TextField) and f.name == name:
                 return f
-        return None
+        available = [f.name for f in fields]
+        raise RuntimeError(f"No TextField named '{name}' found. Available: {available}")
 
     @staticmethod
     def _digits_to_id(s: str, prefix: str) -> str:
@@ -527,13 +540,13 @@ class HybridSearchEngine:
             head_list = _collect(use_threshold=False)
         return head_list
 
-    def _decode_head_predictions(self, logits_dict, head_l2g, db_relations, id_key,
+    def _decode_head_predictions(self, logits_dict, head_local_to_global, db_relations, id_key,
                                  recon_counts, num_items, item_render_fn, threshold, max_items):
         pred_heads: Dict[str, List[Dict[str, Any]]] = {}
         for head, logits in logits_dict.items():
             probs_t = torch.sigmoid(logits[0])
             probs = probs_t.cpu().numpy()
-            local_to_global = head_l2g.get(head)
+            local_to_global = head_local_to_global.get(head)
             if local_to_global is None or local_to_global.numel() == 0:
                 continue
 
