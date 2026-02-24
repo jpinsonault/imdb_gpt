@@ -16,7 +16,7 @@ from .config import TaskSpec, RepConfig
 
 def build_scalar_fields(task: TaskSpec, cfg: RepConfig, train_x: torch.Tensor) -> List[ScalarField]:
     fields: List[ScalarField] = []
-    scaling = cfg.params.get("scaling", ScalarFieldScaling.STANDARDIZE)
+    scaling = cfg.params["scaling"]
     for i in range(task.arity):
         f = ScalarField(name=f"x{i}", scaling=scaling, optional=False)
         for v in train_x[:, i].detach().cpu().tolist():
@@ -39,7 +39,7 @@ def encode_scalar_batch(fields: List[ScalarField], x: torch.Tensor) -> torch.Ten
 
 def build_digit_fields(task: TaskSpec, cfg: RepConfig, train_x: torch.Tensor) -> List[NumericDigitCategoryField]:
     base = int(cfg.params["base"])
-    frac = int(cfg.params.get("fraction_digits", 0))
+    frac = int(cfg.params["fraction_digits"])
     fields: List[NumericDigitCategoryField] = []
     for i in range(task.arity):
         f = NumericDigitCategoryField(

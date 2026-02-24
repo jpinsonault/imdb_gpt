@@ -63,6 +63,8 @@ class ProjectConfig:
         "writer": 8,
     })
 
+    hybrid_set_w_search_encoder: float = 0.1
+
     hybrid_set_focal_alpha: float = 0.25
     hybrid_set_focal_gamma: float = 2.0
 
@@ -70,6 +72,14 @@ class ProjectConfig:
     hybrid_set_person_count_loss_weight: float = 0.1
 
     hybrid_set_film_bottleneck_dim: int = 128
+
+    hybrid_set_noise_std: float = 0.0  # Gaussian noise injection for information bottleneck (0 = disabled; try 0.05-0.2)
+
+    hybrid_set_decoder_num_layers: int = 3
+    hybrid_set_decoder_num_heads: int = 4
+    hybrid_set_decoder_ff_multiplier: int = 4
+    hybrid_set_decoder_dropout: float = 0.1
+    hybrid_set_decoder_norm_first: bool = True
 
     hybrid_set_recon_num_samples: int = 3
     hybrid_set_recon_table_width: int = 80

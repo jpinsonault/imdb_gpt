@@ -34,6 +34,8 @@ class TransformerFieldDecoder(nn.Module):
         num_layers: int = 2,
         num_heads: int = 4,
         ff_dim: int | None = None,
+        dropout: float = 0.1,
+        norm_first: bool = False,
     ):
         super().__init__()
         self.fields = fields
@@ -45,17 +47,20 @@ class TransformerFieldDecoder(nn.Module):
 
         d_ff = int(ff_dim) if ff_dim is not None else self.latent_dim * 4
 
-        # [REVERTED] standard setup
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.latent_dim,
             nhead=num_heads,
             dim_feedforward=d_ff,
+            dropout=dropout,
+            norm_first=norm_first,
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
         )
+
+        self.final_norm = nn.LayerNorm(self.latent_dim) if norm_first else None
 
         self.heads = nn.ModuleList(
             [f.build_decoder(self.latent_dim) for f in self.fields]
@@ -76,6 +81,8 @@ class TransformerFieldDecoder(nn.Module):
         x = x + z.unsqueeze(1)
 
         h = self.transformer(x)
+        if self.final_norm is not None:
+            h = self.final_norm(h)
         field_h = h[:, 1:, :]
 
         outs: List[torch.Tensor] = []
@@ -114,6 +121,8 @@ class TransformerFieldDecoder(nn.Module):
                         x = x + z_in.unsqueeze(1)
 
                         h = self.transformer(x)
+                        if self.final_norm is not None:
+                            h = self.final_norm(h)
                         token_i = h[:, 1 + idx, :]
 
                         y = self.heads[idx](token_i)
@@ -498,7 +507,9 @@ class RowAutoencoder:
         self.stats_accumulated = False
 
         self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
         )
 
     def _get_cache_path(self) -> Path:
@@ -632,6 +643,8 @@ class RowAutoencoder:
             self.latent_dim,
             num_layers=2,
             num_heads=4,
+            dropout=0.1,
+            norm_first=False,
         ).to(self.device)
 
         class _AE(nn.Module):

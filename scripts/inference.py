@@ -40,7 +40,11 @@ class HybridSearchEngine:
         self.cfg = cfg or project_config
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available()
+                else "mps" if torch.backends.mps.is_available()
+                else "cpu"
+            )
         else:
             self.device = torch.device(device)
 
@@ -74,6 +78,12 @@ class HybridSearchEngine:
             dropout=self.cfg.hybrid_set_dropout,
             logit_scale=self.cfg.hybrid_set_logit_scale,
             film_bottleneck_dim=self.cfg.hybrid_set_film_bottleneck_dim,
+            noise_std=getattr(self.cfg, 'hybrid_set_noise_std', 0.0),
+            decoder_num_layers=getattr(self.cfg, 'hybrid_set_decoder_num_layers', 2),
+            decoder_num_heads=getattr(self.cfg, 'hybrid_set_decoder_num_heads', 4),
+            decoder_ff_multiplier=getattr(self.cfg, 'hybrid_set_decoder_ff_multiplier', 4),
+            decoder_dropout=getattr(self.cfg, 'hybrid_set_decoder_dropout', 0.1),
+            decoder_norm_first=getattr(self.cfg, 'hybrid_set_decoder_norm_first', False),
         )
 
         ckpt_path = Path(self.cfg.model_dir) / "hybrid_set_state.pt"
@@ -83,7 +93,11 @@ class HybridSearchEngine:
         logging.info("Loading HybridSetModel weights from %s", ckpt_path)
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         state = checkpoint.get("model_state_dict", checkpoint)
-        self.model.load_state_dict(state)
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing:
+            logging.info("Missing keys in checkpoint (new params): %s", missing)
+        if unexpected:
+            logging.warning("Unexpected keys in checkpoint: %s", unexpected)
         self.model.to(self.device)
         self.model.eval()
 
@@ -153,6 +167,29 @@ class HybridSearchEngine:
                     self.nconst_to_index[nconst] = idx
 
         self.db_path = self.cfg.db_path
+
+        # Detect whether search encoders were loaded (not just randomly initialized)
+        self.has_movie_search_encoder = (
+            self.model.movie_title_encoder is not None
+            and not missing  # encoder keys were present in checkpoint
+            or (self.model.movie_title_encoder is not None
+                and not any("movie_title_encoder" in k for k in missing))
+        )
+        self.has_person_search_encoder = (
+            self.model.person_name_encoder is not None
+            and not any("person_name_encoder" in k for k in missing)
+        )
+
+        if self.has_movie_search_encoder:
+            logging.info("Movie title search encoder available — using vector search")
+        else:
+            logging.info("No trained movie title encoder — falling back to string search")
+
+        if self.has_person_search_encoder:
+            logging.info("Person name search encoder available — using vector search")
+        else:
+            logging.info("No trained person name encoder — falling back to string search")
+
         logging.info("HybridSearchEngine ready")
 
     def _find_text_field(self, fields, name: str) -> Optional[TextField]:
@@ -205,6 +242,92 @@ class HybridSearchEngine:
         base = inter / float(union)
         return 0.6 + 0.4 * base
 
+    def _tokenize_title(self, text: str) -> torch.Tensor:
+        tokens = self.movie_title_field._transform(text)
+        return tokens.unsqueeze(0).to(self.device)
+
+    def _tokenize_name(self, text: str) -> torch.Tensor:
+        tokens = self.person_name_field._transform(text)
+        return tokens.unsqueeze(0).to(self.device)
+
+    def _vector_search_movies(self, title: str, top_k: int = 50) -> List[Dict[str, Any]]:
+        tokens = self._tokenize_title(title)
+        query_vec = self.model.encode_movie_query(tokens)  # (1, dim)
+        sims = torch.mv(self.movie_embedding_table, query_vec.squeeze(0))  # (num_movies,)
+        k = min(top_k, sims.shape[0])
+        topk_vals, topk_idx = torch.topk(sims, k)
+
+        results: List[Dict[str, Any]] = []
+        for rank, (sim_val, idx) in enumerate(zip(topk_vals.cpu().tolist(), topk_idx.cpu().tolist()), start=1):
+            row = self._decode_movie_row_from_dataset(idx)
+            row["_id"] = int(idx)
+            row["_rank"] = int(rank)
+            row["_score"] = float(1.0 - sim_val)
+            results.append(row)
+        return results
+
+    def _vector_search_people(self, name: str, top_k: int = 50) -> List[Dict[str, Any]]:
+        tokens = self._tokenize_name(name)
+        query_vec = self.model.encode_person_query(tokens)  # (1, dim)
+        sims = torch.mv(self.person_embedding_table, query_vec.squeeze(0))  # (num_people,)
+        k = min(top_k, sims.shape[0])
+        topk_vals, topk_idx = torch.topk(sims, k)
+
+        results: List[Dict[str, Any]] = []
+        for rank, (sim_val, idx) in enumerate(zip(topk_vals.cpu().tolist(), topk_idx.cpu().tolist()), start=1):
+            row = self._decode_person_row_from_dataset(idx)
+            row["_id"] = int(idx)
+            row["_rank"] = int(rank)
+            row["_score"] = float(1.0 - sim_val)
+            results.append(row)
+        return results
+
+    def _string_search_movies(self, title: str, top_k: int = 50) -> List[Dict[str, Any]]:
+        q_lower = title.lower()
+        sims: List[tuple[int, float]] = []
+        for idx, t in enumerate(self.movie_titles_lower):
+            sim = self._string_similarity(q_lower, t)
+            if sim > 0.0:
+                sims.append((idx, sim))
+
+        if not sims:
+            return []
+
+        sims.sort(key=lambda x: x[1], reverse=True)
+        sims = sims[: max(1, min(int(top_k), len(sims)))]
+
+        results: List[Dict[str, Any]] = []
+        for rank, (idx, sim) in enumerate(sims, start=1):
+            row = self._decode_movie_row_from_dataset(idx)
+            row["_id"] = int(idx)
+            row["_rank"] = int(rank)
+            row["_score"] = float(1.0 - sim)
+            results.append(row)
+        return results
+
+    def _string_search_people(self, name: str, top_k: int = 50) -> List[Dict[str, Any]]:
+        q_lower = name.lower()
+        sims: List[tuple[int, float]] = []
+        for idx, t in enumerate(self.person_names_lower):
+            sim = self._string_similarity(q_lower, t)
+            if sim > 0.0:
+                sims.append((idx, sim))
+
+        if not sims:
+            return []
+
+        sims.sort(key=lambda x: x[1], reverse=True)
+        sims = sims[: max(1, min(int(top_k), len(sims)))]
+
+        results: List[Dict[str, Any]] = []
+        for rank, (idx, sim) in enumerate(sims, start=1):
+            row = self._decode_person_row_from_dataset(idx)
+            row["_id"] = int(idx)
+            row["_rank"] = int(rank)
+            row["_score"] = float(1.0 - sim)
+            results.append(row)
+        return results
+
     def _decode_movie_row_from_dataset(self, idx: int) -> Dict[str, Any]:
         row: Dict[str, Any] = {}
         for field_idx, f in enumerate(self.movie_ds.fields):
@@ -229,30 +352,15 @@ class HybridSearchEngine:
             return []
 
         t0 = time.perf_counter()
-        q_lower = title.lower()
 
-        sims: List[tuple[int, float]] = []
-        for idx, t in enumerate(self.movie_titles_lower):
-            sim = self._string_similarity(q_lower, t)
-            if sim > 0.0:
-                sims.append((idx, sim))
-
-        if not sims:
-            return []
-
-        sims.sort(key=lambda x: x[1], reverse=True)
-        sims = sims[: max(1, min(int(top_k), len(sims)))]
-
-        results: List[Dict[str, Any]] = []
-        for rank, (idx, sim) in enumerate(sims, start=1):
-            row = self._decode_movie_row_from_dataset(idx)
-            row["_id"] = int(idx)
-            row["_rank"] = int(rank)
-            row["_score"] = float(1.0 - sim)
-            results.append(row)
+        if self.has_movie_search_encoder:
+            results = self._vector_search_movies(title, top_k=top_k)
+        else:
+            results = self._string_search_movies(title, top_k=top_k)
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
-        logging.info("Movie search for '%s' returned %d hits in %.2fms", title, len(results), duration_ms)
+        method = "vector" if self.has_movie_search_encoder else "string"
+        logging.info("Movie search (%s) for '%s' returned %d hits in %.2fms", method, title, len(results), duration_ms)
         return results
 
     def search_people(self, name: str, top_k: int = 50) -> List[Dict[str, Any]]:
@@ -261,30 +369,15 @@ class HybridSearchEngine:
             return []
 
         t0 = time.perf_counter()
-        q_lower = name.lower()
 
-        sims: List[tuple[int, float]] = []
-        for idx, t in enumerate(self.person_names_lower):
-            sim = self._string_similarity(q_lower, t)
-            if sim > 0.0:
-                sims.append((idx, sim))
-
-        if not sims:
-            return []
-
-        sims.sort(key=lambda x: x[1], reverse=True)
-        sims = sims[: max(1, min(int(top_k), len(sims)))]
-
-        results: List[Dict[str, Any]] = []
-        for rank, (idx, sim) in enumerate(sims, start=1):
-            row = self._decode_person_row_from_dataset(idx)
-            row["_id"] = int(idx)
-            row["_rank"] = int(rank)
-            row["_score"] = float(1.0 - sim)
-            results.append(row)
+        if self.has_person_search_encoder:
+            results = self._vector_search_people(name, top_k=top_k)
+        else:
+            results = self._string_search_people(name, top_k=top_k)
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
-        logging.info("Person search for '%s' returned %d hits in %.2fms", name, len(results), duration_ms)
+        method = "vector" if self.has_person_search_encoder else "string"
+        logging.info("Person search (%s) for '%s' returned %d hits in %.2fms", method, name, len(results), duration_ms)
         return results
 
     def search_by_title(self, title: str, top_k: int = 50) -> List[Dict[str, Any]]:

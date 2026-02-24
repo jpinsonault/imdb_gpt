@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scripts.autoencoder.row_autoencoder import TransformerFieldDecoder
+from scripts.autoencoder.fields import TextField
 
 
 class SetHead(nn.Module):
@@ -129,6 +130,12 @@ class HybridSetModel(nn.Module):
         dropout,
         logit_scale,
         film_bottleneck_dim,
+        noise_std=0.0,
+        decoder_num_layers=2,
+        decoder_num_heads=4,
+        decoder_ff_multiplier=4,
+        decoder_dropout=0.1,
+        decoder_norm_first=False,
     ):
         super().__init__()
 
@@ -142,6 +149,7 @@ class HybridSetModel(nn.Module):
 
         self.movie_dim = int(movie_dim)
         self.person_dim = int(person_dim) if person_dim is not None else self.movie_dim
+        self.noise_std = float(noise_std)
 
         self.movie_embeddings = nn.Embedding(num_movies, self.movie_dim)
         nn.init.normal_(self.movie_embeddings.weight, std=0.02)
@@ -152,15 +160,21 @@ class HybridSetModel(nn.Module):
         self.movie_field_decoder = TransformerFieldDecoder(
             movie_fields,
             self.movie_dim,
-            num_layers=2,
-            num_heads=4,
+            num_layers=decoder_num_layers,
+            num_heads=decoder_num_heads,
+            ff_dim=self.movie_dim * decoder_ff_multiplier,
+            dropout=decoder_dropout,
+            norm_first=decoder_norm_first,
         )
 
         self.person_field_decoder = TransformerFieldDecoder(
             person_fields,
             self.person_dim,
-            num_layers=2,
-            num_heads=4,
+            num_layers=decoder_num_layers,
+            num_heads=decoder_num_heads,
+            ff_dim=self.person_dim * decoder_ff_multiplier,
+            dropout=decoder_dropout,
+            norm_first=decoder_norm_first,
         )
 
         self.movie_heads = nn.ModuleDict()
@@ -195,6 +209,20 @@ class HybridSetModel(nn.Module):
                     film_bottleneck_dim=film_bottleneck_dim,
                 )
 
+        # Search encoders: lightweight text → embedding space projections
+        self.movie_title_encoder = None
+        self.person_name_encoder = None
+
+        for f in movie_fields:
+            if isinstance(f, TextField) and f.name == "primaryTitle":
+                self.movie_title_encoder = f.build_encoder(self.movie_dim)
+                break
+
+        for f in person_fields:
+            if isinstance(f, TextField) and f.name == "primaryName":
+                self.person_name_encoder = f.build_encoder(self.person_dim)
+                break
+
     def forward(self, movie_indices=None, person_indices=None, film_scale=1.0):
         outputs = {}
         film_reg_total = None
@@ -203,6 +231,10 @@ class HybridSetModel(nn.Module):
             idx = movie_indices.to(self.movie_embeddings.weight.device, non_blocking=True).long()
             z = self.movie_embeddings(idx)
             z = F.normalize(z, p=2, dim=-1)
+
+            if self.training and self.noise_std > 0:
+                z = z + torch.randn_like(z) * self.noise_std
+                z = F.normalize(z, p=2, dim=-1)
 
             recon_table = self.movie_field_decoder(z)
 
@@ -230,6 +262,10 @@ class HybridSetModel(nn.Module):
             z_p = self.person_embeddings(idx_p)
             z_p = F.normalize(z_p, p=2, dim=-1)
 
+            if self.training and self.noise_std > 0:
+                z_p = z_p + torch.randn_like(z_p) * self.noise_std
+                z_p = F.normalize(z_p, p=2, dim=-1)
+
             recon_person = self.person_field_decoder(z_p)
 
             _ = self.movie_embeddings.weight
@@ -249,9 +285,50 @@ class HybridSetModel(nn.Module):
             outputs["person"] = (logits_person, recon_person, z_p, idx_p)
 
             if film_reg_p is not None:
-                film_reg_total = film_reg_p if film_reg_total is not None else film_reg_p
+                film_reg_total = film_reg_total + film_reg_p if film_reg_total is not None else film_reg_p
 
         if film_reg_total is not None:
             outputs["film_reg"] = film_reg_total
 
         return outputs
+
+    def compute_search_encoder_loss(self, movie_indices, movie_title_tokens, person_indices, person_name_tokens):
+        """Cosine loss between encoder output and (stop-gradient) embedding lookup."""
+        loss = torch.tensor(0.0, device=self.movie_embeddings.weight.device)
+        n = 0
+
+        if self.movie_title_encoder is not None and movie_indices is not None and movie_title_tokens is not None:
+            enc = self.movie_title_encoder(movie_title_tokens)
+            enc = F.normalize(enc, p=2, dim=-1)
+            with torch.no_grad():
+                target = F.normalize(self.movie_embeddings(movie_indices), p=2, dim=-1)
+            loss = loss + (1.0 - (enc * target).sum(dim=-1)).mean()
+            n += 1
+
+        if self.person_name_encoder is not None and person_indices is not None and person_name_tokens is not None:
+            enc = self.person_name_encoder(person_name_tokens)
+            enc = F.normalize(enc, p=2, dim=-1)
+            with torch.no_grad():
+                target = F.normalize(self.person_embeddings(person_indices), p=2, dim=-1)
+            loss = loss + (1.0 - (enc * target).sum(dim=-1)).mean()
+            n += 1
+
+        if n > 0:
+            loss = loss / n
+        return loss
+
+    @torch.no_grad()
+    def encode_movie_query(self, title_tokens):
+        """Encode tokenized title → L2-normalized vector in movie embedding space."""
+        if self.movie_title_encoder is None:
+            raise RuntimeError("No movie title encoder available")
+        enc = self.movie_title_encoder(title_tokens)
+        return F.normalize(enc, p=2, dim=-1)
+
+    @torch.no_grad()
+    def encode_person_query(self, name_tokens):
+        """Encode tokenized name → L2-normalized vector in person embedding space."""
+        if self.person_name_encoder is None:
+            raise RuntimeError("No person name encoder available")
+        enc = self.person_name_encoder(name_tokens)
+        return F.normalize(enc, p=2, dim=-1)

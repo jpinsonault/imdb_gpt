@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from dataclasses import asdict
 
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -138,6 +139,13 @@ def print_param_summary(model: nn.Module):
     movie_emb_params, movie_emb_trainable = _count_module_params(model.movie_embeddings)
     person_emb_params, person_emb_trainable = _count_module_params(model.person_embeddings)
 
+    movie_enc_params, movie_enc_trainable = (0, 0)
+    person_enc_params, person_enc_trainable = (0, 0)
+    if model.movie_title_encoder is not None:
+        movie_enc_params, movie_enc_trainable = _count_module_params(model.movie_title_encoder)
+    if model.person_name_encoder is not None:
+        person_enc_params, person_enc_trainable = _count_module_params(model.person_name_encoder)
+
     print("\n" + "=" * 50)
     print("Parameter summary by component")
     print("-" * 50)
@@ -150,6 +158,10 @@ def print_param_summary(model: nn.Module):
     print(f"  movie_heads           total={movie_head_params:10d}  trainable={movie_head_trainable:10d}")
     print(f"  person_heads          total={person_head_params:10d}  trainable={person_head_trainable:10d}")
 
+    print("\nSearch encoders:")
+    print(f"  movie_title_encoder   total={movie_enc_params:10d}  trainable={movie_enc_trainable:10d}")
+    print(f"  person_name_encoder   total={person_enc_params:10d}  trainable={person_enc_trainable:10d}")
+
     print("\nEmbedding tables:")
     print(f"  movie_embeddings      total={movie_emb_params:10d}  trainable={movie_emb_trainable:10d}")
     print(f"  person_embeddings     total={person_emb_params:10d}  trainable={person_emb_trainable:10d}")
@@ -159,6 +171,8 @@ def print_param_summary(model: nn.Module):
         + person_field_params
         + movie_head_params
         + person_head_params
+        + movie_enc_params
+        + person_enc_params
         + movie_emb_params
         + person_emb_params
     )
@@ -167,6 +181,8 @@ def print_param_summary(model: nn.Module):
         + person_field_trainable
         + movie_head_trainable
         + person_head_trainable
+        + movie_enc_trainable
+        + person_enc_trainable
         + movie_emb_trainable
         + person_emb_trainable
     )
@@ -182,12 +198,15 @@ def print_param_summary(model: nn.Module):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-resume", action="store_true", help="Start fresh")
+    parser.add_argument("--epochs", type=int, default=None, help="Override number of epochs")
     args = parser.parse_args()
 
     cfg = project_config
     ensure_dirs(cfg)
     if args.no_resume:
         cfg.refresh_cache = False
+    if args.epochs is not None:
+        cfg.hybrid_set_epochs = args.epochs
 
     cache_path = ensure_hybrid_cache(cfg)
 
@@ -207,7 +226,11 @@ def main():
         drop_last=False,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
     model = HybridSetModel(
         movie_fields=movie_ds.fields,
@@ -225,8 +248,27 @@ def main():
         dropout=cfg.hybrid_set_dropout,
         logit_scale=cfg.hybrid_set_logit_scale,
         film_bottleneck_dim=cfg.hybrid_set_film_bottleneck_dim,
+        noise_std=cfg.hybrid_set_noise_std,
+        decoder_num_layers=cfg.hybrid_set_decoder_num_layers,
+        decoder_num_heads=cfg.hybrid_set_decoder_num_heads,
+        decoder_ff_multiplier=cfg.hybrid_set_decoder_ff_multiplier,
+        decoder_dropout=cfg.hybrid_set_decoder_dropout,
+        decoder_norm_first=cfg.hybrid_set_decoder_norm_first,
     )
     model.to(device)
+
+    # Find field indices for search encoder training
+    movie_title_field_idx = None
+    for i, f in enumerate(movie_ds.fields):
+        if f.name == "primaryTitle":
+            movie_title_field_idx = i
+            break
+
+    person_name_field_idx = None
+    for i, f in enumerate(person_ds.fields):
+        if f.name == "primaryName":
+            person_name_field_idx = i
+            break
 
     emb_params = list(model.movie_embeddings.parameters()) + list(model.person_embeddings.parameters())
     emb_param_ids = {id(p) for p in emb_params}
@@ -271,7 +313,9 @@ def main():
         for name, t in person_ds.head_mappings.items():
             person_mapping_tensors[name] = t.to(device)
 
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else torch.amp.GradScaler("cpu")
+    # AMP (float16 + GradScaler) only on CUDA; MPS and CPU run float32
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
     run_logger = RunLogger(cfg.tensorboard_dir, "hybrid_set", cfg)
     recon_logger = HybridSetReconLogger(
         movie_ds,
@@ -310,7 +354,11 @@ def main():
     if ckpt_path.exists() and not args.no_resume:
         try:
             c = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(c["model_state_dict"])
+            missing, unexpected = model.load_state_dict(c["model_state_dict"], strict=False)
+            if missing:
+                logging.info("Missing keys in checkpoint (new params): %s", missing)
+            if unexpected:
+                logging.warning("Unexpected keys in checkpoint: %s", unexpected)
             start_epoch = c.get("epoch", 0)
             global_step = c.get("global_step", 0)
 
@@ -355,7 +403,8 @@ def main():
             model.train()
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(device_type=device.type):
+            amp_ctx = torch.amp.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()
+            with amp_ctx:
                 total_loss = None
 
                 movie_set_loss = torch.tensor(0.0, device=device)
@@ -364,13 +413,13 @@ def main():
                 person_recon_loss = torch.tensor(0.0, device=device)
 
                 if batch_movie_idx is not None:
-                    idx_m = batch_movie_idx.to(device, non_blocking=True).long()
+                    idx_m = batch_movie_idx.to(device).long()
                     outputs_m = model(movie_indices=idx_m)
                     movie_out = outputs_m.get("movie")
                     if movie_out is not None:
                         logits_dict_m, recon_table_m, _, _ = movie_out
                         movie_inputs = [
-                            t[batch_movie_idx].to(device, non_blocking=True)
+                            t[batch_movie_idx].to(device)
                             for t in movie_ds.stacked_fields
                         ]
 
@@ -383,7 +432,7 @@ def main():
                             if mapping is None or padded is None:
                                 continue
                             raw_padded = padded[batch_movie_idx]
-                            raw_padded = raw_padded.to(device, non_blocking=True)
+                            raw_padded = raw_padded.to(device, non_blocking=False)
 
                             mask = raw_padded != -1
                             rows, cols = torch.nonzero(mask, as_tuple=True)
@@ -409,13 +458,13 @@ def main():
                         total_loss = movie_loss_total if total_loss is None else total_loss + movie_loss_total
 
                 if batch_person_idx is not None:
-                    idx_p = batch_person_idx.to(device, non_blocking=True).long()
+                    idx_p = batch_person_idx.to(device, non_blocking=False).long()
                     outputs_p = model(person_indices=idx_p)
                     person_out = outputs_p.get("person")
                     if person_out is not None:
                         logits_dict_p, recon_table_p, _, _ = person_out
                         person_inputs = [
-                            t[batch_person_idx].to(device, non_blocking=True)
+                            t[batch_person_idx].to(device, non_blocking=False)
                             for t in person_ds.stacked_fields
                         ]
 
@@ -428,7 +477,7 @@ def main():
                             if mapping is None or padded is None:
                                 continue
                             raw_padded = padded[batch_person_idx]
-                            raw_padded = raw_padded.to(device, non_blocking=True)
+                            raw_padded = raw_padded.to(device, non_blocking=False)
 
                             mask = raw_padded != -1
                             rows, cols = torch.nonzero(mask, as_tuple=True)
@@ -453,12 +502,41 @@ def main():
 
                         total_loss = person_loss_total if total_loss is None else total_loss + person_loss_total
 
+                # Search encoder loss
+                search_loss = torch.tensor(0.0, device=device)
+                if cfg.hybrid_set_w_search_encoder > 0 and (model.movie_title_encoder is not None or model.person_name_encoder is not None):
+                    movie_title_tokens = None
+                    person_name_tokens = None
+                    se_movie_idx = None
+                    se_person_idx = None
+
+                    if batch_movie_idx is not None and movie_title_field_idx is not None and model.movie_title_encoder is not None:
+                        se_movie_idx = batch_movie_idx.to(device, non_blocking=False).long()
+                        movie_title_tokens = movie_ds.stacked_fields[movie_title_field_idx][batch_movie_idx].to(device, non_blocking=False)
+
+                    if batch_person_idx is not None and person_name_field_idx is not None and model.person_name_encoder is not None:
+                        se_person_idx = batch_person_idx.to(device, non_blocking=False).long()
+                        person_name_tokens = person_ds.stacked_fields[person_name_field_idx][batch_person_idx].to(device, non_blocking=False)
+
+                    search_loss = model.compute_search_encoder_loss(
+                        se_movie_idx, movie_title_tokens, se_person_idx, person_name_tokens,
+                    )
+                    search_loss_weighted = cfg.hybrid_set_w_search_encoder * search_loss
+                    total_loss = search_loss_weighted if total_loss is None else total_loss + search_loss_weighted
+
                 if total_loss is None:
                     continue
 
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             if sched:
                 sched.step()
 
@@ -468,6 +546,7 @@ def main():
                 run_logger.add_scalar("loss/movie_recon", movie_recon_loss.item(), global_step)
                 run_logger.add_scalar("loss/person_set", person_set_loss.item(), global_step)
                 run_logger.add_scalar("loss/person_recon", person_recon_loss.item(), global_step)
+                run_logger.add_scalar("loss/search_encoder", search_loss.item(), global_step)
                 run_logger.add_scalar("opt/lr", optimizer.param_groups[0]["lr"], global_step)
                 run_logger.tick()
 
