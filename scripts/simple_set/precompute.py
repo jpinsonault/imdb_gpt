@@ -20,10 +20,7 @@ from scripts.autoencoder.row_autoencoder import _field_to_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- KNOBS ---
-MIN_PERSON_FREQUENCY = 3    # A person must appear in at least this many movies
 PADDING_IDX = -1            # Value used to pad the dense tensors
-# -------------
 
 
 def _map_category_to_head(category: str, cfg: ProjectConfig) -> str | None:
@@ -68,7 +65,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
 
     logging.info("Filtering and bucketing...")
     person_counts = Counter(r[1] for r in raw_rows)
-    valid_people = {n for n, c in person_counts.items() if c >= MIN_PERSON_FREQUENCY}
+    valid_people = {n for n, c in person_counts.items() if c >= cfg.hybrid_set_min_person_frequency}
 
     movie_data = defaultdict(lambda: defaultdict(set))
     person_data = defaultdict(lambda: defaultdict(set))

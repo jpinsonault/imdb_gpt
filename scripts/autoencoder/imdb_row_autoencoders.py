@@ -109,14 +109,8 @@ class TitlesAutoencoder(RowAutoencoder):
 
             # 3. CATEGORICAL: Genres
             logging.info("[Titles] Accumulating Genres...")
-            # Query strictly on existence.
-            q_genres = f"""
-            SELECT DISTINCT g.genre 
-            FROM title_genres g
-            WHERE g.tconst IN (SELECT tconst FROM titles t WHERE {where_sql} LIMIT 50000)
-            """
-            # Optimization: We limit the inner subquery sample. 
-            # It is highly unlikely a genre appears only in the tail of the dataset.
+            # Only 28 distinct genres in IMDB — just scan the small genre table directly
+            q_genres = "SELECT DISTINCT genre FROM title_genres"
             for (genre,) in cur.execute(q_genres):
                 self.get_field("genres").accumulate_stats([genre])
 

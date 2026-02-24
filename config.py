@@ -100,6 +100,7 @@ class ProjectConfig:
     hybrid_set_film_bottleneck_dim: int = 128
 
     hybrid_set_noise_std: float = 0.0  # Gaussian noise injection for information bottleneck (0 = disabled; try 0.05-0.2)
+    hybrid_set_min_person_frequency: int = 3  # Person must appear in at least this many movies to be included
 
     hybrid_set_decoder_num_layers: int = 3
     hybrid_set_decoder_num_heads: int = 4

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from tqdm import tqdm
 from config import project_config
-from scripts.sql_filters import movie_where_clause
+from scripts.sql_filters import movie_where_clause, people_where_clause
 
 # --------------------------------------------------------------------------- #
 # Helpers & Setup
@@ -80,14 +80,14 @@ def create_valid_filters(conn: sqlite3.Connection):
 
     print("[3/5] Pre-filtering Valid People...")
     conn.execute("DROP TABLE IF EXISTS temp_valid_people")
-    
-    # Filter people by birthYear criteria
-    conn.execute("""
+
+    # Use the centralized people filter (allows NULL birthYear since it's optional)
+    people_filter = people_where_clause()
+    conn.execute(f"""
         CREATE TEMPORARY TABLE temp_valid_people AS
         SELECT nconst
         FROM people p
-        WHERE p.birthYear IS NOT NULL 
-          AND p.birthYear >= 1800
+        WHERE {people_filter}
     """)
     conn.execute("CREATE INDEX idx_tvp_nconst ON temp_valid_people(nconst)")
     
