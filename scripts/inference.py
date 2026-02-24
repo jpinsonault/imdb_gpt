@@ -24,17 +24,6 @@ from scripts.sql_filters import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def _map_category_to_head(category: str) -> Optional[str]:
-    s = (category or "").lower().strip()
-    if s in ("actor", "actress", "self"):
-        return "cast"
-    if s == "director":
-        return "director"
-    if s == "writer":
-        return "writer"
-    return None
-
-
 class HybridSearchEngine:
     def __init__(self, device: Optional[str] = None, cfg: Optional[ProjectConfig] = None):
         self.cfg = cfg or project_config
@@ -433,7 +422,7 @@ class HybridSearchEngine:
         return map_person_row(r)
 
     def _db_fetch_movie_people(self, tconst: str) -> Dict[str, List[Dict[str, Any]]]:
-        by_head: Dict[str, List[Dict[str, Any]]] = {"cast": [], "director": [], "writer": []}
+        by_head: Dict[str, List[Dict[str, Any]]] = {h: [] for h in self.cfg.hybrid_set_heads}
         if not tconst:
             return by_head
         with self._db_connection() as conn:
@@ -450,7 +439,7 @@ class HybridSearchEngine:
             )
             rows = c.fetchall()
         for nconst, category, ordering, name in rows:
-            head = _map_category_to_head(category)
+            head = self.cfg.hybrid_set_category_to_head.get((category or "").lower().strip())
             if head is None:
                 continue
             person_idx = self.nconst_to_index.get(nconst)
@@ -468,7 +457,7 @@ class HybridSearchEngine:
         return by_head
 
     def _db_fetch_person_movies(self, nconst: str) -> Dict[str, List[Dict[str, Any]]]:
-        by_head: Dict[str, List[Dict[str, Any]]] = {"cast": [], "director": [], "writer": []}
+        by_head: Dict[str, List[Dict[str, Any]]] = {h: [] for h in self.cfg.hybrid_set_heads}
         if not nconst:
             return by_head
         with self._db_connection() as conn:
@@ -485,7 +474,7 @@ class HybridSearchEngine:
             )
             rows = c.fetchall()
         for tconst, category, ordering, title, year in rows:
-            head = _map_category_to_head(category)
+            head = self.cfg.hybrid_set_category_to_head.get((category or "").lower().strip())
             if head is None:
                 continue
             movie_idx = self.tconst_to_index.get(tconst)

@@ -26,15 +26,8 @@ PADDING_IDX = -1            # Value used to pad the dense tensors
 # -------------
 
 
-def _map_category_to_head(category: str) -> str | None:
-    category = (category or "").lower().strip()
-    if category in ("actor", "actress", "self"):
-        return "cast"
-    if category == "director":
-        return "director"
-    if category == "writer":
-        return "writer"
-    return None
+def _map_category_to_head(category: str, cfg: ProjectConfig) -> str | None:
+    return cfg.hybrid_set_category_to_head.get((category or "").lower().strip())
 
 
 def build_hybrid_cache(cfg: ProjectConfig):
@@ -85,7 +78,7 @@ def build_hybrid_cache(cfg: ProjectConfig):
     for tconst, nconst, category in raw_rows:
         if nconst not in valid_people:
             continue
-        head = _map_category_to_head(category)
+        head = _map_category_to_head(category, cfg)
         if head is None:
             continue
         movie_data[tconst][head].add(nconst)
@@ -179,13 +172,8 @@ def build_hybrid_cache(cfg: ProjectConfig):
         row_dict = fetched_rows[tconst]
 
         heads_data = movie_data[tconst]
-        cast_count = len(heads_data.get("cast", []))
-        director_count = len(heads_data.get("director", []))
-        writer_count = len(heads_data.get("writer", []))
-
-        row_dict["castCount"] = cast_count
-        row_dict["directorCount"] = director_count
-        row_dict["writerCount"] = writer_count
+        for head_name in cfg.hybrid_set_heads:
+            row_dict[f"{head_name}Count"] = len(heads_data.get(head_name, []))
 
         for i, field in enumerate(mov_ae.fields):
             val = row_dict.get(field.name)
@@ -274,14 +262,9 @@ def build_hybrid_cache(cfg: ProjectConfig):
         base_row = fetched_people_rows.get(nconst, {})
         heads_data = person_data_final.get(nconst, {})
 
-        cast_count = len(heads_data.get("cast", []))
-        director_count = len(heads_data.get("director", []))
-        writer_count = len(heads_data.get("writer", []))
-
         row_dict = dict(base_row)
-        row_dict["castCount"] = cast_count
-        row_dict["directorCount"] = director_count
-        row_dict["writerCount"] = writer_count
+        for head_name in cfg.hybrid_set_heads:
+            row_dict[f"{head_name}Count"] = len(heads_data.get(head_name, []))
 
         for i, field in enumerate(people_ae.fields):
             val = row_dict.get(field.name)

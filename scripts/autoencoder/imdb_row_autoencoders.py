@@ -33,7 +33,7 @@ from .row_autoencoder import RowAutoencoder
 
 class TitlesAutoencoder(RowAutoencoder):
     def build_fields(self) -> list[BaseField]:
-        return [
+        fields = [
             NumericDigitCategoryField("tconst", strip_nonnumeric=True),
             TextField("primaryTitle", max_length=32),
             NumericDigitCategoryField("startYear"),
@@ -41,10 +41,10 @@ class TitlesAutoencoder(RowAutoencoder):
             NumericDigitCategoryField("averageRating", fraction_digits=1),
             NumericDigitCategoryField("numVotes"),
             MultiCategoryField("genres"),
-            NumericDigitCategoryField("castCount"),
-            NumericDigitCategoryField("directorCount"),
-            NumericDigitCategoryField("writerCount"),
         ]
+        for head_name in self.config.hybrid_set_heads:
+            fields.append(NumericDigitCategoryField(f"{head_name}Count"))
+        return fields
 
     def accumulate_stats(self):
         """
@@ -104,9 +104,8 @@ class TitlesAutoencoder(RowAutoencoder):
             mx_pc_val = mx_pc[0] if mx_pc and mx_pc[0] else 50
 
             # Use the same upper bound for each per-head count.
-            self._manual_inject_digits("castCount", 0, mx_pc_val)
-            self._manual_inject_digits("directorCount", 0, mx_pc_val)
-            self._manual_inject_digits("writerCount", 0, mx_pc_val)
+            for head_name in self.config.hybrid_set_heads:
+                self._manual_inject_digits(f"{head_name}Count", 0, mx_pc_val)
 
             # 3. CATEGORICAL: Genres
             logging.info("[Titles] Accumulating Genres...")
@@ -195,16 +194,16 @@ class TitlesAutoencoder(RowAutoencoder):
 
 class PeopleAutoencoder(RowAutoencoder):
     def build_fields(self) -> List[BaseField]:
-        return [
+        fields = [
             NumericDigitCategoryField("nconst", strip_nonnumeric=True),
             TextField("primaryName", max_length=32),
-            NumericDigitCategoryField("birthYear"),
+            NumericDigitCategoryField("birthYear", optional=True),
             NumericDigitCategoryField("deathYear"),
             MultiCategoryField("professions"),
-            NumericDigitCategoryField("castCount"),
-            NumericDigitCategoryField("directorCount"),
-            NumericDigitCategoryField("writerCount"),
         ]
+        for head_name in self.config.hybrid_set_heads:
+            fields.append(NumericDigitCategoryField(f"{head_name}Count"))
+        return fields
 
     def accumulate_stats(self):
         if self.config.use_cache and self._load_cache():
@@ -248,9 +247,8 @@ class PeopleAutoencoder(RowAutoencoder):
             else:
                 max_titles = 200
 
-            self._manual_inject_digits("castCount", 0, max_titles)
-            self._manual_inject_digits("directorCount", 0, max_titles)
-            self._manual_inject_digits("writerCount", 0, max_titles)
+            for head_name in self.config.hybrid_set_heads:
+                self._manual_inject_digits(f"{head_name}Count", 0, max_titles)
 
             # 3. Professions
             logging.info("[People] Accumulating Professions...")

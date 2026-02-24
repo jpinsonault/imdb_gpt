@@ -157,7 +157,7 @@ def load_raw_title_principals(db_path, file_path):
             if row['characters']:
                 try:
                     _test = simplejson.loads(row['characters'])  # just to ensure it's valid JSON
-                except:
+                except (ValueError, simplejson.JSONDecodeError):
                     row['characters'] = None
 
             cursor.execute("""

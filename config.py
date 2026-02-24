@@ -51,16 +51,42 @@ class ProjectConfig:
     hybrid_set_recon_interval: int = 200
     hybrid_set_dropout: float = 0.1
 
+    hybrid_set_category_to_head: Dict[str, str] = field(default_factory=lambda: {
+        "actor": "cast",
+        "actress": "cast",
+        "self": "cast",
+        "director": "director",
+        "writer": "writer",
+        "producer": "producer",
+        "cinematographer": "cinematographer",
+        "composer": "composer",
+        "editor": "editor",
+        "production_designer": "production_designer",
+        "casting_director": "casting_director",
+    })
+
     hybrid_set_heads: Dict[str, float] = field(default_factory=lambda: {
         "cast": 1.0,
         "director": 0.5,
         "writer": 0.5,
+        "producer": 0.3,
+        "cinematographer": 0.3,
+        "composer": 0.3,
+        "editor": 0.3,
+        "production_designer": 0.2,
+        "casting_director": 0.2,
     })
 
     hybrid_set_head_groups: Dict[str, int] = field(default_factory=lambda: {
         "cast": 20,
         "director": 4,
         "writer": 8,
+        "producer": 4,
+        "cinematographer": 4,
+        "composer": 4,
+        "editor": 4,
+        "production_designer": 2,
+        "casting_director": 2,
     })
 
     hybrid_set_w_search_encoder: float = 0.1

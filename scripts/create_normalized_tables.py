@@ -279,7 +279,7 @@ def populate_principals_and_characters(conn):
                             INSERT OR IGNORE INTO principal_characters (tconst, ordering, nconst, character)
                             VALUES (?, ?, ?, ?);
                         """, (tconst, ordering, nconst, c))
-        except:
+        except (ValueError, simplejson.JSONDecodeError):
             # Malformed JSON, skip
             pass
 
